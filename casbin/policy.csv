@@ -1,0 +1,55 @@
+# ---- RBAC: which table.column a role may read ------------------------
+# keyMatch semantics: "inventory.*" matches any column of inventory;
+# a bare "employees.name" is an exact match.
+
+p, warehouse_worker, inventory.*, read
+p, warehouse_worker, shipments.*, read
+p, warehouse_worker, safety_incidents.*, read
+
+# hr_staff gets named columns only — salary is deliberately absent.
+p, hr_staff, employees.id, read
+p, hr_staff, employees.name, read
+p, hr_staff, employees.dept, read
+p, hr_staff, employees.start_date, read
+p, hr_staff, leave_requests.*, read
+p, hr_staff, trainings.*, read
+
+p, finance_analyst, budgets.*, read
+p, finance_analyst, expenses.*, read
+p, finance_analyst, invoices.*, read
+
+# ---- Role hierarchy ---------------------------------------------------
+# hr_manager inherits everything hr_staff has, plus salary.
+g, hr_manager, hr_staff
+p, hr_manager, employees.salary, read
+
+# ---- Payroll: self-service salary (policy stage 1) --------------------
+# The master relented: workers may read their OWN payslip. Salary lives in
+# its own table (payroll) because p2 row filters are table-scoped — putting
+# a self-only filter on `employees` would clamp ALL employees queries to
+# one row. Every base role inherits `employee`.
+g, warehouse_worker, employee
+g, hr_staff, employee
+g, finance_analyst, employee
+p, employee, payroll.*, read
+p2, employee, payroll, employee_id = '{employee_id}'
+
+# ---- Payroll: manager scope (policy stage 2) ---------------------------
+# Managers additionally see their subordinates' payslips. Same-table row
+# scopes OR together (union), so hr_manager sees self + team, not the
+# intersection of the two filters.
+g, hr_manager, payroll_manager
+p, payroll_manager, payroll.*, read
+p2, payroll_manager, payroll, employee_id IN ({self_and_subordinate_ids})
+
+# ---- ABAC row filters (p2) ---------------------------------------------
+# Applied by sql_gate.py as WHERE predicates ANDed into every SELECT that
+# touches the table. {placeholders} are bound from the worker's attributes
+# (worker_attributes.json) at query time. Missing attribute => deny.
+# Multiple p2 rows for the SAME table are OR-combined (union of scopes).
+
+p2, warehouse_worker, inventory, warehouse_id = '{site}'
+p2, warehouse_worker, shipments, warehouse_id = '{site}'
+p2, hr_staff, employees, dept = '{dept}'
+p2, hr_staff, leave_requests, dept = '{dept}'
+p2, finance_analyst, expenses, dept = '{dept}'

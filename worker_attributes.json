@@ -1,0 +1,23 @@
+{
+  "alice": {
+    "role": "warehouse_worker",
+    "site": "SG-01",
+    "employee_id": 6
+  },
+  "bob": {
+    "role": "hr_staff",
+    "dept": "engineering",
+    "employee_id": 1
+  },
+  "carol": {
+    "role": "hr_manager",
+    "dept": "engineering",
+    "employee_id": 2,
+    "self_and_subordinate_ids": "1, 2, 3"
+  },
+  "dave": {
+    "role": "finance_analyst",
+    "dept": "logistics",
+    "employee_id": 7
+  }
+}

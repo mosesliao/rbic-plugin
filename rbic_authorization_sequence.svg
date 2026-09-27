@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="690" viewBox="0 0 680 690" role="img">
+<title>Authorization sequence for a worker question</title>
+<desc>UML sequence diagram: a worker's natural-language question flows through the chatbot to the LLM, which produces candidate SQL. The SQL gate parses it, checks RBAC per column with Casbin, then either injects row filters and executes against read-only SQLite (allow path) or raises AccessDenied and the chatbot returns a fixed deny message from code (deny path).</desc>
+<style>
+.t{font:400 14px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#1f1f1f}
+.ts{font:400 12px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#5f5f5f}
+.th{font:500 14px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#1f1f1f}
+.box{fill:#f5f5f4;stroke:#9a9a96;stroke-width:0.5}
+.arr{stroke:#5f5f5f;stroke-width:1.5;fill:none}
+.leader{stroke:#9a9a96;stroke-width:0.5;stroke-dasharray:4 4;fill:none}
+.c-blue > rect{fill:#e6f1fb;stroke:#378add;stroke-width:0.5}
+.c-blue > text{fill:#0c447c}
+</style>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#5f5f5f" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="0" y="0" width="680" height="690" fill="#ffffff"/>
+
+<line x1="78" y1="70" x2="78" y2="668" class="leader"/>
+<line x1="182" y1="70" x2="182" y2="668" class="leader"/>
+<line x1="286" y1="70" x2="286" y2="668" class="leader"/>
+<line x1="390" y1="70" x2="390" y2="668" class="leader"/>
+<line x1="494" y1="70" x2="494" y2="668" class="leader"/>
+<line x1="598" y1="70" x2="598" y2="668" class="leader"/>
+
+<g><rect x="30" y="32" width="96" height="38" rx="4" class="box"/><text x="78" y="55" class="th" text-anchor="middle">Worker</text></g>
+<g><rect x="134" y="32" width="96" height="38" rx="4" class="box"/><text x="182" y="55" class="th" text-anchor="middle">chatbot.py</text></g>
+<g><rect x="238" y="32" width="96" height="38" rx="4" class="box"/><text x="286" y="48" class="th" text-anchor="middle">Claude</text><text x="286" y="63" class="ts" text-anchor="middle">untrusted LLM</text></g>
+<g class="c-blue"><rect x="342" y="32" width="96" height="38" rx="4"/><text x="390" y="48" class="th" text-anchor="middle">SQL gate</text><text x="390" y="63" class="ts" text-anchor="middle">PEP</text></g>
+<g class="c-blue"><rect x="446" y="32" width="96" height="38" rx="4"/><text x="494" y="48" class="th" text-anchor="middle">Casbin</text><text x="494" y="63" class="ts" text-anchor="middle">PDP</text></g>
+<g><rect x="550" y="32" width="96" height="38" rx="4" class="box"/><text x="598" y="48" class="th" text-anchor="middle">SQLite</text><text x="598" y="63" class="ts" text-anchor="middle">read-only</text></g>
+
+<text x="130" y="94" class="ts" text-anchor="middle">question</text>
+<line x1="78" y1="100" x2="182" y2="100" class="arr" marker-end="url(#arrow)"/>
+<text x="234" y="124" class="ts" text-anchor="middle">question + schema</text>
+<line x1="182" y1="130" x2="286" y2="130" class="arr" marker-end="url(#arrow)"/>
+<text x="234" y="154" class="ts" text-anchor="middle">candidate SQL</text>
+<line x1="286" y1="160" x2="182" y2="160" class="arr" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+<text x="235" y="184" class="ts" text-anchor="middle">authorize(sql)</text>
+<line x1="182" y1="190" x2="390" y2="190" class="arr" marker-end="url(#arrow)"/>
+<text x="396" y="210" class="ts">parse + qualify</text>
+<path d="M390 216 H434 V228 H394" class="arr" fill="none" marker-end="url(#arrow)"/>
+<text x="442" y="250" class="ts" text-anchor="middle">enforce() ×N</text>
+<line x1="390" y1="256" x2="494" y2="256" class="arr" marker-end="url(#arrow)"/>
+<text x="442" y="278" class="ts" text-anchor="middle">allow / deny</text>
+<line x1="494" y1="284" x2="390" y2="284" class="arr" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+
+<rect x="48" y="302" width="600" height="356" fill="none" stroke="#9a9a96" stroke-width="0.5"/>
+<g><rect x="48" y="302" width="36" height="17" class="box"/><text x="66" y="314" class="ts" text-anchor="middle">alt</text></g>
+<g><rect x="92" y="303" width="150" height="15" class="box"/><text x="167" y="314" class="ts" text-anchor="middle">[all columns allowed]</text></g>
+
+<text x="396" y="334" class="ts">p2 row filters</text>
+<path d="M390 340 H434 V352 H394" class="arr" fill="none" marker-end="url(#arrow)"/>
+<text x="235" y="372" class="ts" text-anchor="middle">safe SQL</text>
+<line x1="390" y1="378" x2="182" y2="378" class="arr" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+<text x="390" y="400" class="ts" text-anchor="middle">execute (read-only)</text>
+<line x1="182" y1="406" x2="598" y2="406" class="arr" marker-end="url(#arrow)"/>
+<text x="390" y="428" class="ts" text-anchor="middle">permitted rows</text>
+<line x1="598" y1="434" x2="182" y2="434" class="arr" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+<text x="234" y="456" class="ts" text-anchor="middle">rows JSON</text>
+<line x1="182" y1="462" x2="286" y2="462" class="arr" marker-end="url(#arrow)"/>
+<text x="234" y="484" class="ts" text-anchor="middle">answer</text>
+<line x1="286" y1="490" x2="182" y2="490" class="arr" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+<text x="130" y="512" class="ts" text-anchor="middle">answer</text>
+<line x1="182" y1="518" x2="78" y2="518" class="arr" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+
+<line x1="48" y1="536" x2="648" y2="536" class="leader"/>
+<g><rect x="92" y="544" width="150" height="15" class="box"/><text x="167" y="555" class="ts" text-anchor="middle">[any check fails]</text></g>
+
+<text x="286" y="578" class="ts" text-anchor="middle">AccessDenied</text>
+<line x1="390" y1="584" x2="182" y2="584" class="arr" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+<text x="188" y="600" class="ts">roll back turn</text>
+<path d="M182 606 H226 V618 H186" class="arr" fill="none" marker-end="url(#arrow)"/>
+<text x="130" y="638" class="ts" text-anchor="middle">deny message</text>
+<line x1="182" y1="644" x2="78" y2="644" class="arr" marker-end="url(#arrow)"/>
+</svg>

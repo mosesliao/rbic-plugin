@@ -1,0 +1,69 @@
+{
+  "inventory": {
+    "id": "int",
+    "sku": "text",
+    "qty": "int",
+    "warehouse_id": "text"
+  },
+  "shipments": {
+    "id": "int",
+    "warehouse_id": "text",
+    "destination": "text",
+    "eta": "date",
+    "status": "text"
+  },
+  "safety_incidents": {
+    "id": "int",
+    "warehouse_id": "text",
+    "severity": "text",
+    "reported_at": "timestamp",
+    "description": "text"
+  },
+  "payroll": {
+    "id": "int",
+    "employee_id": "int",
+    "salary": "numeric",
+    "effective_date": "date"
+  },
+  "employees": {
+    "id": "int",
+    "name": "text",
+    "dept": "text",
+    "start_date": "date",
+    "salary": "numeric"
+  },
+  "leave_requests": {
+    "id": "int",
+    "employee_id": "int",
+    "dept": "text",
+    "start_date": "date",
+    "end_date": "date",
+    "status": "text"
+  },
+  "trainings": {
+    "id": "int",
+    "title": "text",
+    "dept": "text",
+    "date": "date"
+  },
+  "budgets": {
+    "id": "int",
+    "dept": "text",
+    "fiscal_year": "int",
+    "amount": "numeric"
+  },
+  "expenses": {
+    "id": "int",
+    "dept": "text",
+    "amount": "numeric",
+    "submitted_by": "text",
+    "status": "text"
+  },
+  "invoices": {
+    "id": "int",
+    "vendor": "text",
+    "amount": "numeric",
+    "due_date": "date",
+    "status": "text"
+  }
+}
