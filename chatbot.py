@@ -42,16 +42,17 @@ RUN_SQL_TOOL = {
 }
 
 
-def allowed_schema(gate: SQLGate, role: str) -> dict:
+def allowed_schema(gate: SQLGate, role: str, enforcer=None) -> dict:
     """Subset of the schema this role may read.
 
     Shown to the LLM so it doesn't write doomed queries — purely UX.
     The gate still enforces every query regardless of what the model saw.
     """
+    enforcer = enforcer or gate.enforcer
     out = {}
     for table, cols in gate.schema.items():
         allowed = [
-            c for c in cols if gate.enforcer.enforce(role, f"{table}.{c}", "read")
+            c for c in cols if enforcer.enforce(role, f"{table}.{c}", "read")
         ]
         if allowed:
             out[table] = allowed
@@ -117,18 +118,45 @@ def complete_turn(client, gate, username, system_prompt, history) -> str:
     return "Sorry, I couldn't complete that request — please rephrase."
 
 
-def run_chatbot(username: str):
+POLICY_RESET_NOTICE = "(Access policy was updated — conversation reset.)"
+
+
+def refresh_session(gate, username, history, seen_version):
+    """Pick up live policy changes before a turn.
+
+    Returns (role, system_prompt, version, reset). On a policy change the
+    history is cleared: rows fetched under the old policy must not linger
+    in the model's context after a revocation. While the gate is in its
+    fail-closed (broken) state the history is cleared too, so the model
+    can't answer from rows fetched before the failed reload. The role is
+    re-read every turn because the master can reassign it on the fly.
+    """
+    gate.refresh()
+    snap = gate.snapshot  # one consistent view of version/attributes/policy
+    version = snap.version
+    reset = version != seen_version
+    if reset or snap.broken:
+        history.clear()
+    worker = snap.attributes.get(username)
+    role = worker.get("role") if isinstance(worker, dict) else None
+    if not isinstance(role, str):
+        role = None
+    schema = allowed_schema(gate, role, snap.enforcer) if role else {}
+    return role, build_system_prompt(role, schema), version, reset
+
+
+def run_chatbot(username: str, client=None, gate=None, input_fn=input):
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    gate = SQLGate(dialect="sqlite")
+    gate = gate or SQLGate(dialect="sqlite")
     worker = gate.attributes.get(username)
     if worker is None:
         sys.exit(f"Unknown worker {username!r} — add them to worker_attributes.json")
     role = worker["role"]
 
-    client = anthropic.Anthropic()
-    system_prompt = build_system_prompt(role, allowed_schema(gate, role))
+    client = client or anthropic.Anthropic()
+    seen_version = gate.policy_version
     history = []
 
     print(f"\n=== Worker Chatbot | user: {username} | role: {role} ===")
@@ -136,7 +164,7 @@ def run_chatbot(username: str):
 
     while True:
         try:
-            user_input = input("You: ").strip()
+            user_input = input_fn("You: ").strip()
         except EOFError:
             break
         if user_input.lower() == "exit":
@@ -144,9 +172,17 @@ def run_chatbot(username: str):
         if not user_input:
             continue
 
+        role, system_prompt, seen_version, reset = refresh_session(
+            gate, username, history, seen_version
+        )
+        if reset:
+            print(POLICY_RESET_NOTICE)
+
         history.append({"role": "user", "content": user_input})
         checkpoint = len(history)
         try:
+            if role is None:
+                raise AccessDenied("worker no longer exists")
             reply = complete_turn(client, gate, username, system_prompt, history)
         except AccessDenied:
             # Roll back any dangling tool_use turns, then answer from CODE —

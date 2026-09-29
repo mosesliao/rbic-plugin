@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 company.db
+policy_changes.jsonl
+.policy.lock

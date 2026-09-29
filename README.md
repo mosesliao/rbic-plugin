@@ -95,6 +95,7 @@ Type `exit` to quit.
 | bob   | hr_staff         | employees (no salary), leave, trainings — **engineering only** |
 | carol | hr_manager       | everything bob sees **plus salaries**                   |
 | dave  | finance_analyst  | budgets, invoices, expenses — **logistics expenses only** |
+| master | master          | **no data** — manages policy via `master_bot.py`        |
 
 ### Things to try
 
@@ -153,6 +154,85 @@ anything not listed there is denied automatically.
 
 ---
 
+## Master chatbot (change access policy by chatting)
+
+The master user can inspect and change access policy in plain English:
+
+```bash
+python master_bot.py master
+```
+
+Only users whose record in `worker_attributes.json` has `"role": "master"`
+can start it (`python master_bot.py bob` exits with an error). The master
+bot has no data tools: it can't query the business database.
+
+Example requests:
+
+```
+You: what can bob see?                   → describes bob's role, columns and row filters
+You: let hr_staff see salaries           → proposes  p, hr_staff, employees.salary, read
+You: dave should only see unpaid invoices→ proposes  p2, finance_analyst, invoices, status = 'unpaid'
+You: move dave to hr_staff               → proposes a role change in worker_attributes.json
+You: undo that                           → proposes reverting the last applied change
+```
+
+**The model only proposes; you confirm.** After each reply, the code (not
+the model) prints every proposed change: a plain-English effect summary
+(including WARNINGs, e.g. "row filter removed: ALL rows visible") and a
+unified diff of the real file. Then it asks `Apply change <id>? [yes/no]`.
+Only the literal `yes` writes the file. Anything else discards the change.
+There is no "apply" tool for the model to call.
+
+**Changes are live.** The SQL gate checks the policy files' timestamps on
+every query and hot-reloads them, so workers pick up changes on their next
+question. A worker session whose policy changed clears its conversation
+history (`(Access policy was updated — conversation reset.)`) so rows fetched
+under the old policy don't linger in the model's context. If a reload fails
+(e.g. a hand-edited policy.csv is malformed or has an unsafe row filter),
+every query is denied and worker conversation history is cleared until the
+file is fixed.
+
+**Guard rails** (enforced in `policy_admin.py`, not by the model):
+- tables/columns must exist in `db_schema.json`; role names are validated;
+  duplicate rules and inheritance cycles are rejected
+- the `master` role can't be granted, inherited, or assigned, and master
+  users' records can't be edited through the bot
+- row filters may only reference their own table's columns: no subqueries,
+  table references or unsafe functions (a subquery would bypass the
+  column check). Commas are allowed only inside parentheses (Casbin's CSV
+  format has no quoting)
+- row filters must be plain printable ASCII with no SQL comments, and be
+  made only of comparisons of a column with a value (`=`, `<>`, `<`, `>`,
+  `IN`, `IS`, `LIKE`, `BETWEEN`) joined by AND/OR/NOT. Always-true or
+  non-restrictive filters (`TRUE`, `1`, `employee_id = employee_id`,
+  `... OR 1 = 1`) are rejected. A filter with no `{placeholder}` is allowed
+  but flagged: "WARNING: this filter is the same for every user (it does
+  not depend on who is asking)."
+- the SQL gate binds attribute values as literal values, never as SQL
+  text, so a value can't become a column name, operator or subquery. On
+  top of that, attribute values can't contain quotes, parentheses or
+  operators, and a value used in an unquoted placeholder (e.g.
+  `IN ({ids})`) must be a number or a comma-separated list of numbers
+- a change is refused if **any** policy input (policy.csv,
+  worker_attributes.json, db_schema.json, model.conf) changed after it was
+  proposed: "Policy changed since this was proposed — please ask again".
+  If you confirm several proposals from one reply, the later ones are
+  refused once an earlier one is applied, so ask again to get a fresh
+  proposal. Writes are atomic, and a policy.csv change must load in a
+  fresh Casbin enforcer before it replaces the live file
+- only one change is applied at a time, even across processes (lock file
+  `casbin/.policy.lock`; if a crash ever leaves it behind, the error
+  message tells you which file to delete)
+- every change is appended to `policy_changes.jsonl` (who, when, what,
+  before/after text + hashes) *before* the file is replaced, followed by
+  an `applied` or `failed: …` record, and logged as `POLICY_CHANGE` on the
+  `rbic.audit` logger. History and undo only use applied changes.
+  Comments in `policy.csv` are preserved: new rules go under
+  `# ---- Changes via master chatbot ----`. Diffs and summaries show
+  control characters escaped (e.g. `\x0c`) so nothing can hide in them
+
+---
+
 ## Project layout
 
 ```
@@ -162,6 +242,10 @@ db_schema.json           table → columns; unknown tables/columns are denied
 worker_attributes.json   demo users and their attributes
 sql_gate.py              the enforcement gate (parse → RBAC → ABAC → audit)
 chatbot.py               worker CLI (text-to-SQL loop, read-only DB access)
+master_bot.py            master CLI: propose policy changes, human confirms
+policy_admin.py          validated, atomic, audited policy/attribute editor
+policy_changes.jsonl     runtime audit log of applied changes (gitignored)
+test_master_policy.py    pytest: master bot, live policy changes, validation
 seed_db.py               creates + seeds company.db
 CLAUDE.md                architecture notes and security invariants
 ```
