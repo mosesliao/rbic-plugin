@@ -19,5 +19,8 @@
     "role": "finance_analyst",
     "dept": "logistics",
     "employee_id": 7
+  },
+  "master": {
+    "role": "master"
   }
 }
