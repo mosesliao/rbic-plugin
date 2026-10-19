@@ -42,29 +42,52 @@ RUN_SQL_TOOL = {
 }
 
 
-def allowed_schema(gate: SQLGate, role: str) -> dict:
-    """Subset of the schema this role may read.
+def allowed_schema(gate: SQLGate, username: str, snapshot=None) -> dict:
+    """Subset of the schema this worker may read through plain grants,
+    after precedence (user deny > user allow > role deny > role allow),
+    so a denied column is never advertised.
 
     Shown to the LLM so it doesn't write doomed queries — purely UX.
     The gate still enforces every query regardless of what the model saw.
     """
+    snapshot = snapshot or gate.snapshot
+    return snapshot.effective_columns(username, gate.schema)
+
+
+def scoped_schema(gate: SQLGate, username: str, snapshot=None) -> dict:
+    """table -> [[columns], ...] of the worker's scoped grants (4-field p2
+    rows, role- or user-level): columns readable only for certain rows and
+    only together, minus any column a deny takes away.
+
+    UX only, like allowed_schema; the filter itself is not shown.
+    """
+    snapshot = snapshot or gate.snapshot
     out = {}
-    for table, cols in gate.schema.items():
-        allowed = [
-            c for c in cols if gate.enforcer.enforce(role, f"{table}.{c}", "read")
-        ]
-        if allowed:
-            out[table] = allowed
+    for table, grants in snapshot.scoped_columns(username).items():
+        if table not in gate.schema:
+            continue
+        out[table] = [list(cols) for _, cols in grants]
     return out
 
 
-def build_system_prompt(role: str, schema: dict) -> str:
+def build_system_prompt(role: str, schema: dict, scoped: dict = None) -> str:
     tables = "\n".join(f"- {t}({', '.join(cols)})" for t, cols in schema.items())
+    scoped_lines = "\n".join(
+        f"- {t}({', '.join(cols)})"
+        for t, grants in (scoped or {}).items() for cols in grants)
+    if scoped_lines:
+        scoped_lines = f"""
+Row-limited scopes. Each line below lists columns of a table you may read
+only for a limited set of rows (the limit is applied automatically). A query
+that uses any column of such a table beyond its regular list above must use
+ONLY the columns of one of these lines, nothing else from that table:
+{scoped_lines}
+"""
     return f"""You are a company data assistant for a {role}.
 
 Answer the worker's questions using the run_sql tool against these tables:
 {tables}
-
+{scoped_lines}
 Rules:
 - Emit a single SQLite SELECT per tool call. No other statement types.
 - Only reference the tables and columns listed above.
@@ -117,18 +140,44 @@ def complete_turn(client, gate, username, system_prompt, history) -> str:
     return "Sorry, I couldn't complete that request — please rephrase."
 
 
-def run_chatbot(username: str):
+POLICY_RESET_NOTICE = "(Access policy was updated — conversation reset.)"
+
+
+def refresh_session(gate, username, history, seen_version):
+    """Pick up live policy changes before a turn.
+
+    Returns (role, system_prompt, version, reset). On a policy change the
+    history is cleared: rows fetched under the old policy must not linger
+    in the model's context after a revocation. While the gate is in its
+    fail-closed (broken) state the history is cleared too, so the model
+    can't answer from rows fetched before the failed reload. The role is
+    re-read every turn because the master can reassign it on the fly.
+    """
+    gate.refresh()
+    snap = gate.snapshot  # one consistent view of version/attributes/policy
+    version = snap.version
+    reset = version != seen_version
+    if reset or snap.broken:
+        history.clear()
+    subj = snap.subjects_for(username)
+    role = subj.role if subj else None
+    schema = allowed_schema(gate, username, snap) if subj else {}
+    scoped = scoped_schema(gate, username, snap) if subj else {}
+    return role, build_system_prompt(role, schema, scoped), version, reset
+
+
+def run_chatbot(username: str, client=None, gate=None, input_fn=input):
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    gate = SQLGate(dialect="sqlite")
+    gate = gate or SQLGate(dialect="sqlite")
     worker = gate.attributes.get(username)
     if worker is None:
         sys.exit(f"Unknown worker {username!r} — add them to worker_attributes.json")
     role = worker["role"]
 
-    client = anthropic.Anthropic()
-    system_prompt = build_system_prompt(role, allowed_schema(gate, role))
+    client = client or anthropic.Anthropic()
+    seen_version = gate.policy_version
     history = []
 
     print(f"\n=== Worker Chatbot | user: {username} | role: {role} ===")
@@ -136,7 +185,7 @@ def run_chatbot(username: str):
 
     while True:
         try:
-            user_input = input("You: ").strip()
+            user_input = input_fn("You: ").strip()
         except EOFError:
             break
         if user_input.lower() == "exit":
@@ -144,9 +193,17 @@ def run_chatbot(username: str):
         if not user_input:
             continue
 
+        role, system_prompt, seen_version, reset = refresh_session(
+            gate, username, history, seen_version
+        )
+        if reset:
+            print(POLICY_RESET_NOTICE)
+
         history.append({"role": "user", "content": user_input})
         checkpoint = len(history)
         try:
+            if role is None:
+                raise AccessDenied("worker no longer exists")
             reply = complete_turn(client, gate, username, system_prompt, history)
         except AccessDenied:
             # Roll back any dangling tool_use turns, then answer from CODE —

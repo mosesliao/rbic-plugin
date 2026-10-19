@@ -53,3 +53,6 @@ p2, warehouse_worker, shipments, warehouse_id = '{site}'
 p2, hr_staff, employees, dept = '{dept}'
 p2, hr_staff, leave_requests, dept = '{dept}'
 p2, finance_analyst, expenses, dept = '{dept}'
+
+# ---- Changes via master chatbot ----
+p2, warehouse_worker, employees, id = '{employee_id}', id|name|salary
