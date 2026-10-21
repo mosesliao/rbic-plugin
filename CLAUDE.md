@@ -443,3 +443,5 @@ LLM model for text-to-SQL / summarization: `claude-sonnet-4-6`.
 - **Gate test suite**: `test_salary_policy_evolution.py` is the start — fold
   in the `sql_gate.py` demo cases and mock-client chatbot tests, and grow the
   suite with every new SQL construct admitted past the parser (invariant #2)
+- **Plugin roadmap**: see `docs/plugin-plan.md` (core package → Open WebUI
+  plugin with SSO → onboarding toolkit; Chainlit and master web UI deferred)
