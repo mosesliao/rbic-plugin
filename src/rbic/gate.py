@@ -825,8 +825,8 @@ def compile_snapshot(version: int, enforcer: casbin.Enforcer, attributes,
     malformed rule arity, a model.conf without p3/p4, a user subject that
     is not a known non-master worker, a g row whose parent is a user
     subject, or a row filter compile_row_filter rejects, an invalid
-    worker email, or two workers sharing an email. PolicyAdmin runs this
-    same function on every proposed policy.
+    worker email, or two workers sharing an email. Called by
+    load_snapshot, the loader the gate and PolicyAdmin share.
 
     `fingerprint` identifies the exact file bytes the snapshot was built
     from (the gate always passes it; PolicyAdmin's dry-run snapshots don't
@@ -1018,6 +1018,28 @@ def check_policy_bytes(data: bytes) -> None:
                              f" (expected one of {sorted(KNOWN_PTYPES)})")
 
 
+def load_snapshot(model_bytes: bytes, policy_bytes: bytes,
+                  attributes_bytes: bytes, schema: dict, *, dialect: str,
+                  version: int = 0, sig=None) -> PolicySnapshot:
+    """THE policy loader: file bytes -> validated PolicySnapshot.
+
+    The gate builds every snapshot with it, and PolicyAdmin validates
+    every proposal (and re-validates at apply time) with it, so the admin
+    can never write a policy the gate would refuse. Raises on anything the
+    gate refuses to serve: a lone CR or unknown ptype (check_policy_bytes),
+    a policy Casbin can't load, attributes that aren't JSON, and
+    everything compile_snapshot refuses (arity, user subjects, master,
+    unsafe filters, invalid or duplicate emails).
+    """
+    check_policy_bytes(policy_bytes)
+    enforcer = load_enforcer(model_bytes, policy_bytes)
+    attributes = json.loads(attributes_bytes)
+    return compile_snapshot(
+        version, enforcer, attributes, schema, dialect=dialect, sig=sig,
+        fingerprint=policy_fingerprint(model_bytes, policy_bytes,
+                                       attributes_bytes))
+
+
 def _read_bytes(path) -> bytes:
     with open(path, "rb") as f:
         return f.read()
@@ -1138,16 +1160,10 @@ class SQLGate:
         # Each file is read exactly once; the bytes parsed are the bytes
         # fingerprinted. (_maybe_reload re-stats afterwards, so files that
         # change mid-load fail the reload.)
-        model_bytes = _read_bytes(self.model_path)
-        policy_bytes = _read_bytes(self.policy_path)
-        attributes_bytes = _read_bytes(self.attributes_path)
-        check_policy_bytes(policy_bytes)
-        enforcer = load_enforcer(model_bytes, policy_bytes)
-        attributes = json.loads(attributes_bytes)
-        return compile_snapshot(
-            version, enforcer, attributes, self.schema, dialect=self.dialect,
-            sig=sig, fingerprint=policy_fingerprint(model_bytes, policy_bytes,
-                                                    attributes_bytes))
+        return load_snapshot(
+            _read_bytes(self.model_path), _read_bytes(self.policy_path),
+            _read_bytes(self.attributes_path), self.schema,
+            dialect=self.dialect, version=version, sig=sig)
 
     def _maybe_reload(self) -> PolicySnapshot:
         """Return the current snapshot, rebuilding it if a policy file changed.

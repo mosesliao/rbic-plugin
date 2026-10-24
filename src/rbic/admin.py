@@ -23,7 +23,11 @@ Fail-closed rules:
   SQL comments, or a non-predicate / always-true shape      -> reject
 - ANY input file (policy, attributes, schema, model)
   changed since the proposal                                -> reject
-- resulting policy.csv doesn't load in the SQL gate         -> reject
+- the resulting files (policy.csv + worker_attributes.json)
+  don't load with the SQL gate's own loader (gate.load_snapshot:
+  bytes-based Casbin load, lone CR / unknown ptype refusal,
+  compile_snapshot, email and user-subject checks), checked for
+  every proposal and again under the lock in apply()          -> reject
 
 apply() is serialized across processes with a lock file next to
 policy.csv, and the changelog record ("applying") is written BEFORE the
@@ -55,8 +59,8 @@ from .gate import (
     PTYPE_ALLOW_COLUMNS, PTYPE_ALLOW_ROWS, PTYPE_DENY_COLUMNS, PTYPE_DENY_ROWS,
     SCOPE_COLUMN_SEP, STATIC_FILTER_WARNING, USER_PREFIX, FilterError,
     MissingAttribute, PolicySnapshot, bind_row_filter, compile_row_filter,
-    compile_snapshot, is_user_subject, parse_scope_columns, subjects_for,
-    user_subject,
+    compile_snapshot, is_user_subject, load_enforcer, load_snapshot,
+    parse_scope_columns, subjects_for, user_subject,
 )
 
 
@@ -141,6 +145,11 @@ def _read(path: str) -> str:
         return f.read()
 
 
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def _newline(text: str) -> str:
     return "\r\n" if "\r\n" in text else "\n"
 
@@ -166,6 +175,9 @@ def _proposal(method):
     def wrapper(self, *args, **kwargs):
         before = self._input_hashes()
         change = method(self, *args, **kwargs)
+        # Whatever the method checked, the files it would produce must
+        # load in the gate exactly as the gate loads them.
+        self._check_gate_loads(change)
         if self._input_hashes() != before:
             raise ValueError(STALE_MESSAGE + ".")
         change.input_hashes = before
@@ -285,15 +297,36 @@ class PolicyAdmin:
             os.remove(path)
 
     def _enforcer(self, policy_text: Optional[str] = None) -> casbin.Enforcer:
-        if policy_text is None:
-            return casbin.Enforcer(self.model_path, self.policy_path)
-        fd, tmp = tempfile.mkstemp(suffix=".csv")
+        """Casbin enforcer over policy.csv (or `policy_text`), loaded from
+        bytes exactly as the gate loads it."""
+        policy = (_read_bytes(self.policy_path) if policy_text is None
+                  else policy_text.encode("utf-8"))
+        return load_enforcer(_read_bytes(self.model_path), policy)
+
+    def _after_state(self, change: "Change") -> tuple:
+        """(policy bytes, attributes bytes) once `change` is applied; the
+        file it doesn't touch is read from disk."""
+        after = change.after_text.encode("utf-8")
+        target = self._managed_path(change.target)
+        if target == self.policy_path:
+            return after, _read_bytes(self.attributes_path)
+        return _read_bytes(self.policy_path), after
+
+    def _check_gate_loads(self, change: "Change") -> None:
+        """Refuse a change whose resulting files the SQL gate would refuse
+        to load (the gate would then deny everyone): the same
+        gate.load_snapshot the gate runs on every reload, in every
+        supported dialect."""
+        policy, attributes = self._after_state(change)
+        model = _read_bytes(self.model_path)
+        schema = self.schema()
         try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                f.write(policy_text)
-            return casbin.Enforcer(self.model_path, tmp)
-        finally:
-            os.remove(tmp)
+            for dialect in FILTER_DIALECTS:
+                load_snapshot(model, policy, attributes, schema,
+                              dialect=dialect)
+        except Exception as err:  # noqa: BLE001 - anything the gate refuses
+            raise ValueError(f"The resulting policy would not load in the SQL "
+                             f"gate: {type(err).__name__}: {err}") from None
 
     def _snapshot(self, e: casbin.Enforcer, attrs=None, schema=None,
                   what="The current policy.csv") -> PolicySnapshot:
@@ -1657,9 +1690,13 @@ class PolicyAdmin:
                 f.write(change.after_text)
                 f.flush()
                 os.fsync(f.fileno())
+            # Same loader as the gate, over the exact bytes about to go
+            # live (the input-hash check above pinned every other file).
+            self._check_gate_loads(change)
             if target == self.policy_path:
                 self._check_no_master_in_policy(
-                    casbin.Enforcer(self.model_path, tmp))
+                    load_enforcer(_read_bytes(self.model_path),
+                                  change.after_text.encode("utf-8")))
             else:
                 self._check_master_intact(attrs, json.loads(change.after_text))
             # The audit record goes down BEFORE the file changes, so a live
