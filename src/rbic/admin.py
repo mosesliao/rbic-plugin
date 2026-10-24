@@ -79,6 +79,15 @@ INT_RE = re.compile(r"[0-9]{1,18}\Z", re.ASCII)
 INT_LIST_RE = re.compile(r"[0-9]{1,18}(\s*,\s*[0-9]{1,18})*\Z", re.ASCII)
 
 STALE_MESSAGE = "Policy changed since this was proposed — please ask again"
+# Attributes that identify WHO a worker is (hosts map a signed-in user to a
+# worker by them). Owned by HR / the identity provider: no admin path may
+# change them, or a master could take over another worker's identity.
+IDENTITY_ATTRIBUTES = ("email",)
+IDENTITY_ATTRIBUTE_MESSAGE = (
+    "The {key} attribute is identity-critical (it decides which signed-in "
+    "person is this worker) and is owned by HR / the identity provider; it "
+    "cannot be changed through the chatbot.")
+_ABSENT = object()
 LOCK_NAME = ".policy.lock"
 CHANGELOG_FILE = "policy_changes.jsonl"
 LOCK_TIMEOUT_S = 10.0
@@ -295,7 +304,7 @@ class PolicyAdmin:
         schema = self.schema() if schema is None else schema
         try:
             for dialect in FILTER_DIALECTS:
-                snap = compile_snapshot(0, e, attrs, schema, dialect)
+                snap = compile_snapshot(0, e, attrs, schema, dialect=dialect)
         except ValueError as err:
             raise ValueError(f"{what} would not load in the SQL gate: "
                              f"{err}") from None
@@ -620,8 +629,8 @@ class PolicyAdmin:
             raise ValueError("Filter template must be a non-empty string.")
         template = template.strip()
         for dialect in FILTER_DIALECTS:
-            compiled = compile_row_filter(table, template, schema, dialect,
-                                          strict=True)
+            compiled = compile_row_filter(table, template, schema,
+                                          dialect=dialect, strict=True)
         return template, compiled
 
     @staticmethod
@@ -673,7 +682,8 @@ class PolicyAdmin:
         for table, t in templates:
             for dialect in FILTER_DIALECTS:
                 try:
-                    rf = compile_row_filter(table, t, schema, dialect)
+                    rf = compile_row_filter(table, t, schema,
+                                            dialect=dialect)
                     bind_row_filter(rf, record, table)
                 except MissingAttribute:
                     break  # the gate denies these queries outright
@@ -1468,13 +1478,26 @@ class PolicyAdmin:
         changed = sorted(u for u in set(before) | set(after)
                          if before.get(u) != after.get(u))
         for user in changed:
+            old_record = before.get(user)
             record = after.get(user)
+            # Identity attributes never change here, in either direction
+            # (forward change or undo of an older changelog entry).
+            for key in IDENTITY_ATTRIBUTES:
+                old_value = (old_record.get(key, _ABSENT)
+                             if isinstance(old_record, dict) else _ABSENT)
+                new_value = (record.get(key, _ABSENT)
+                             if isinstance(record, dict) else _ABSENT)
+                if old_value != new_value:
+                    raise ValueError(f"{user}: "
+                                     + IDENTITY_ATTRIBUTE_MESSAGE.format(key=key))
             if record is None:
                 continue
             if not USER_RE.fullmatch(user) or not isinstance(record, dict):
                 raise ValueError(f"Invalid user record {user!r}.")
             for key, value in record.items():
-                if key == "role":
+                # role is checked by assign_role; identity attributes are
+                # unchanged (above) and validated by the gate's loader.
+                if key == "role" or key in IDENTITY_ATTRIBUTES:
                     continue
                 if not ATTR_KEY_RE.fullmatch(key):
                     raise ValueError(f"Invalid attribute name {user}.{key!r}.")
@@ -1530,6 +1553,8 @@ class PolicyAdmin:
                              "letters, digits, underscores.")
         if key == "role":
             raise ValueError("Use assign_role to change a user's role.")
+        if key in IDENTITY_ATTRIBUTES:
+            raise ValueError(IDENTITY_ATTRIBUTE_MESSAGE.format(key=key))
         if isinstance(value, bool) or not isinstance(value, (str, int)):
             raise ValueError("Attribute value must be a string or integer.")
         if isinstance(value, str) and not ATTR_VALUE_RE.fullmatch(value):

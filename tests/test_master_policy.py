@@ -482,7 +482,7 @@ def test_r1_shipped_filters_render_equivalently(env):
 def test_r1_placeholder_must_stand_alone(template, demo_template):
     schema = json.loads((demo_template / "db_schema.json").read_text())
     with pytest.raises(FilterError):
-        compile_row_filter("employees", template, schema)
+        compile_row_filter("employees", template, schema, dialect="postgres")
 
 
 # ---- R2. a reload mid-request can't mix old RBAC with new row filters -------

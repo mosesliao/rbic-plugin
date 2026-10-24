@@ -1,22 +1,26 @@
 {
   "alice": {
     "role": "warehouse_worker",
+    "email": "alice@example.test",
     "site": "SG-01",
     "employee_id": 6
   },
   "bob": {
     "role": "hr_staff",
+    "email": "bob@example.test",
     "dept": "engineering",
     "employee_id": 1
   },
   "carol": {
     "role": "hr_manager",
+    "email": "carol@example.test",
     "dept": "engineering",
     "employee_id": 2,
     "self_and_subordinate_ids": "1, 2, 3"
   },
   "dave": {
     "role": "finance_analyst",
+    "email": "dave@example.test",
     "dept": "logistics",
     "employee_id": 7
   },

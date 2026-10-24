@@ -79,6 +79,8 @@ stage of that request uses only it.
 """
 
 import argparse
+import hashlib
+import io
 import json
 import logging
 import os
@@ -90,6 +92,8 @@ from typing import NoReturn, Optional
 
 import casbin
 import sqlglot
+from casbin.model import Model
+from casbin.persist.adapter import Adapter, load_policy_line
 from casbin.util import key_match
 from sqlglot import exp
 from sqlglot.errors import SqlglotError
@@ -332,9 +336,8 @@ def _check_predicates(node) -> None:
                 "comparisons can be always true).")
 
 
-def compile_row_filter(table: str, template, schema: dict,
-                       dialect: str = "postgres", strict: bool = False
-                       ) -> RowFilter:
+def compile_row_filter(table: str, template, schema: dict, *, dialect: str,
+                       strict: bool = False) -> RowFilter:
     """Parse and validate a p2 template; raise FilterError if unsafe.
 
     Always enforced (also by the gate on every policy load): valid SQL
@@ -344,6 +347,9 @@ def compile_row_filter(table: str, template, schema: dict,
 
     strict=True adds the master-bot authoring rules: printable ASCII only,
     no SQL comments, and a predicate-only structure with no tautologies.
+
+    `dialect` is required: the same template can parse differently in
+    different dialects, so the caller states the one it will execute in.
     """
     if not isinstance(template, str) or not template.strip():
         raise FilterError("Filter template must be a non-empty string.")
@@ -576,6 +582,9 @@ class PolicySnapshot:
     allow_grants: tuple = ()   # ((sub, obj), ...) p rows with act = read
     deny_grants: tuple = ()    # ((sub, obj), ...) p3 rows with act = read
     schema: dict = field(default_factory=dict)  # table -> columns (db_schema)
+    # sha256 of the model/policy/attributes bytes this snapshot was built
+    # from ("" for PolicyAdmin's dry-run snapshots).
+    fingerprint: str = ""
 
     # -- subjects -----------------------------------------------------------
 
@@ -811,19 +820,25 @@ class PolicySnapshot:
 
 
 def compile_snapshot(version: int, enforcer: casbin.Enforcer, attributes,
-                     schema: dict, dialect: str = "postgres",
-                     sig=None) -> PolicySnapshot:
+                     schema: dict, *, dialect: str, sig=None,
+                     fingerprint: str = "") -> PolicySnapshot:
     """Validate a loaded policy + attributes and build the snapshot.
 
     Raises ValueError on anything the gate refuses to serve (fail closed):
     malformed rule arity, a model.conf without p3/p4, a user subject that
     is not a known non-master worker, a g row whose parent is a user
-    subject, or a row filter compile_row_filter rejects. PolicyAdmin runs
-    this same function on every proposed policy.
+    subject, or a row filter compile_row_filter rejects, an invalid
+    worker email, or two workers sharing an email. PolicyAdmin runs this
+    same function on every proposed policy.
+
+    `fingerprint` identifies the exact file bytes the snapshot was built
+    from (the gate always passes it; PolicyAdmin's dry-run snapshots don't
+    need one).
     """
     if not isinstance(attributes, dict) or not all(
             isinstance(r, dict) for r in attributes.values()):
         raise ValueError("worker attributes must map username -> object")
+    check_worker_emails(attributes)
     for ptype in (PTYPE_DENY_COLUMNS, PTYPE_DENY_ROWS):
         if ptype not in enforcer.model.model["p"]:
             raise ValueError(f"model.conf does not define {ptype} (deny rules)")
@@ -882,7 +897,8 @@ def compile_snapshot(version: int, enforcer: casbin.Enforcer, attributes,
             check_subject(sub, rule)
             check_no_master(rule, sub, table)
             try:
-                rf = compile_row_filter(table, template, schema, dialect)
+                rf = compile_row_filter(table, template, schema,
+                                        dialect=dialect)
                 if len(rule) == 4:
                     rf = replace(rf, columns=parse_scope_columns(
                         table, rule[3], schema))
@@ -895,10 +911,96 @@ def compile_snapshot(version: int, enforcer: casbin.Enforcer, attributes,
         allow_grants=tuple(grants[PTYPE_ALLOW_COLUMNS]),
         deny_grants=tuple(grants[PTYPE_DENY_COLUMNS]),
         schema={t: list(cols) for t, cols in schema.items()},
+        fingerprint=fingerprint,
     )
 
 
+# A deliberately conservative address shape (ASCII only, no quoting, no IP
+# literals): an identity key must compare reliably after casefolding.
+EMAIL_RE = re.compile(
+    r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+", re.ASCII)
+EMAIL_MAX_LEN = 254
+
+
+def normalize_email(value) -> Optional[str]:
+    """Casefolded, stripped form of an email used as an identity key, or
+    None if `value` is not a string."""
+    if not isinstance(value, str):
+        return None
+    return value.strip().casefold()
+
+
+def check_worker_emails(attributes: dict) -> None:
+    """`email` is optional per worker; when present it must be a string of
+    conservative address shape, and casefolded emails must be unique. An
+    email is an identity key (hosts map a signed-in user to a worker by
+    it), so an invalid or shared one fails the whole load (deny everyone)
+    rather than letting one sign-in resolve to the wrong worker."""
+    seen: dict = {}
+    for username, record in attributes.items():
+        if "email" not in record:
+            continue
+        value = record["email"]
+        if (not isinstance(value, str) or len(value) > EMAIL_MAX_LEN
+                or not EMAIL_RE.fullmatch(value)):
+            raise ValueError(f"worker {username!r} has an invalid email "
+                             "(expected a plain ASCII address like "
+                             "name@example.com)")
+        key = normalize_email(value)
+        if key in seen:
+            raise ValueError(f"workers {seen[key]!r} and {username!r} share "
+                             "the same email (emails must be unique)")
+        seen[key] = username
+
+
+def policy_fingerprint(model_bytes: bytes, policy_bytes: bytes,
+                       attributes_bytes: bytes) -> str:
+    """sha256 over the exact bytes of model.conf, policy.csv and
+    worker_attributes.json (length-prefixed, so no two different file
+    triples share a fingerprint by concatenation)."""
+    h = hashlib.sha256(b"rbic-policy-fingerprint-v1\0")
+    for label, data in ((b"model", model_bytes), (b"policy", policy_bytes),
+                        (b"attributes", attributes_bytes)):
+        h.update(label + b"\0" + str(len(data)).encode("ascii") + b"\0")
+        h.update(data)
+    return h.hexdigest()
+
+
+class _BytesPolicyAdapter(Adapter):
+    """Loads policy lines from bytes exactly as Casbin's FileAdapter loads
+    them from a file (LF-separated, UTF-8, each line stripped), so the gate
+    parses the very bytes it fingerprints instead of re-reading the file."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def load_policy(self, model):
+        for raw in self._data.split(b"\n"):
+            load_policy_line(raw.decode().strip(), model)
+
+    def save_policy(self, model):
+        raise NotImplementedError("the gate never writes policy")
+
+
+def load_enforcer(model_bytes: bytes, policy_bytes: bytes) -> casbin.Enforcer:
+    """A Casbin enforcer built from file bytes, equivalent to
+    casbin.Enforcer(model_path, policy_path) over files with those bytes
+    (the model is decoded as UTF-8 with universal newlines, as open() in
+    text mode does)."""
+    text = io.TextIOWrapper(io.BytesIO(model_bytes), encoding="utf-8").read()
+    model = Model()
+    model.load_model_from_text(text)
+    return casbin.Enforcer(model, _BytesPolicyAdapter(policy_bytes))
+
+
 def check_policy_ptypes(policy_path: str) -> None:
+    """check_policy_bytes over a policy file."""
+    with open(policy_path, "rb") as f:
+        check_policy_bytes(f.read())
+
+
+def check_policy_bytes(data: bytes) -> None:
     """Refuse policy lines with an unknown ptype: Casbin's adapter silently
     drops them, which could hide a mistyped deny rule.
 
@@ -906,18 +1008,22 @@ def check_policy_ptypes(policy_path: str) -> None:
     refused: an editor shows it as a line break, Casbin does not, so
     "# note\\rp3, ..." would look like a deny while being a comment.
     """
-    with open(policy_path, "rb") as f:
-        for n, raw in enumerate(f.read().split(b"\n"), 1):
-            if b"\r" in raw.rstrip(b"\r") or raw.count(b"\r") > 1:
-                raise ValueError(f"policy line {n}: contains a lone carriage "
-                                 "return (use LF or CRLF line endings)")
-            text = raw.decode("utf-8", errors="replace").strip()
-            if not text or text.startswith("#"):
-                continue
-            ptype = text.split(",", 1)[0].strip()
-            if ptype not in KNOWN_PTYPES:
-                raise ValueError(f"policy line {n}: unknown rule type {ptype!r}"
-                                 f" (expected one of {sorted(KNOWN_PTYPES)})")
+    for n, raw in enumerate(data.split(b"\n"), 1):
+        if b"\r" in raw.rstrip(b"\r") or raw.count(b"\r") > 1:
+            raise ValueError(f"policy line {n}: contains a lone carriage "
+                             "return (use LF or CRLF line endings)")
+        text = raw.decode("utf-8", errors="replace").strip()
+        if not text or text.startswith("#"):
+            continue
+        ptype = text.split(",", 1)[0].strip()
+        if ptype not in KNOWN_PTYPES:
+            raise ValueError(f"policy line {n}: unknown rule type {ptype!r}"
+                             f" (expected one of {sorted(KNOWN_PTYPES)})")
+
+
+def _read_bytes(path) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
 
 
 class _TableRef:
@@ -986,6 +1092,11 @@ class SQLGate:
         """Pick up policy/attribute file changes now; return policy_version."""
         return self._maybe_reload().version
 
+    def refreshed_snapshot(self) -> PolicySnapshot:
+        """Pick up file changes now and return the resulting snapshot (the
+        one consistent view a caller should use for a whole request)."""
+        return self._maybe_reload()
+
     @property
     def snapshot(self) -> PolicySnapshot:
         return self._snapshot
@@ -993,6 +1104,14 @@ class SQLGate:
     @property
     def policy_version(self) -> int:
         return self._snapshot.version
+
+    @property
+    def fingerprint(self) -> str:
+        """sha256 of the model.conf, policy.csv and worker_attributes.json
+        bytes the current snapshot was built from. Stable across restarts
+        and processes (unlike policy_version). A broken snapshot keeps the
+        fingerprint of the last good load; check `broken` too."""
+        return self._snapshot.fingerprint
 
     @property
     def enforcer(self) -> casbin.Enforcer:
@@ -1019,12 +1138,19 @@ class SQLGate:
         return tuple(sig)
 
     def _build_snapshot(self, version: int, sig) -> PolicySnapshot:
-        check_policy_ptypes(self.policy_path)
-        enforcer = casbin.Enforcer(self.model_path, self.policy_path)
-        with open(self.attributes_path) as f:
-            attributes = json.load(f)
-        return compile_snapshot(version, enforcer, attributes, self.schema,
-                                self.dialect, sig)
+        # Each file is read exactly once; the bytes parsed are the bytes
+        # fingerprinted. (_maybe_reload re-stats afterwards, so files that
+        # change mid-load fail the reload.)
+        model_bytes = _read_bytes(self.model_path)
+        policy_bytes = _read_bytes(self.policy_path)
+        attributes_bytes = _read_bytes(self.attributes_path)
+        check_policy_bytes(policy_bytes)
+        enforcer = load_enforcer(model_bytes, policy_bytes)
+        attributes = json.loads(attributes_bytes)
+        return compile_snapshot(
+            version, enforcer, attributes, self.schema, dialect=self.dialect,
+            sig=sig, fingerprint=policy_fingerprint(model_bytes, policy_bytes,
+                                                    attributes_bytes))
 
     def _maybe_reload(self) -> PolicySnapshot:
         """Return the current snapshot, rebuilding it if a policy file changed.

@@ -147,7 +147,8 @@ TOOLS = [
     _tool("propose_set_attribute", "Propose setting a user attribute used by "
                                    "row filters (e.g. dept, site).",
           username=USER,
-          key=("string", "Attribute name (not 'role')."),
+          key=("string", "Attribute name (not 'role' or 'email'; email is "
+                         "identity-critical and owned by HR/IdP)."),
           value=("string", "New value.")),
     _tool("propose_undo", "Propose reverting the most recently applied change."),
 ]
