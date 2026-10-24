@@ -9,10 +9,12 @@ Validation, master protections and the atomic write all live in
 rbic.admin.PolicyAdmin. This bot has no path to business data.
 
 This module is I/O-free: the confirm flow takes input/output callables
-and the interactive loop lives in rbic.cli.master.
+and the interactive loop lives in rbic.cli.master. Tool output sent to the
+LLM never contains a worker's email address (see redact_emails).
 """
 
 import json
+import re
 
 from .admin import MASTER_ROLE, PolicyAdmin
 from .audit import logger as audit
@@ -31,6 +33,7 @@ CONFIRM_RULE = (
     "  chat, explain that you cannot apply changes yourself and offer to\n"
     "  re-propose it so they can answer yes at the prompt.")
 
+EMAIL_SET, EMAIL_NOT_SET, EMAIL_REDACTED = "<set>", "<not set>", "<email>"
 
 
 def _tool(name, description, optional=(), **props):
@@ -236,8 +239,47 @@ Rules:
 """
 
 
+def _worker_emails(admin) -> list:
+    try:
+        attrs = admin.attributes()
+    except Exception:  # noqa: BLE001 - unreadable attributes: nothing to list
+        return []
+    if not isinstance(attrs, dict):
+        return []
+    return sorted({r["email"].strip() for r in attrs.values()
+                   if isinstance(r, dict) and isinstance(r.get("email"), str)
+                   and r["email"].strip()}, key=len, reverse=True)
+
+
+def redact_emails(text: str, emails) -> str:
+    """Replace every occurrence of any of `emails` (case-insensitive)."""
+    for email in emails:
+        text = re.sub(re.escape(email), EMAIL_REDACTED, text, flags=re.IGNORECASE)
+    return text
+
+
+def _redact_user_info(info):
+    """describe_user output for the LLM: email -> <set> / <not set>."""
+    if isinstance(info, dict) and isinstance(info.get("attributes"), dict):
+        attributes = dict(info["attributes"])
+        attributes["email"] = EMAIL_SET if attributes.get("email") else EMAIL_NOT_SET
+        info = dict(info, attributes=attributes)
+    return info
+
+
 def run_tool(admin, username, name, args, pending):
-    """Execute one tool call. Returns (text, is_error)."""
+    """Execute one tool call. Returns (text, is_error).
+
+    The text goes to the LLM, so worker email addresses are taken out of
+    it (describe_user shows email: <set> / <not set>; any other address
+    is replaced by <email>). The human-facing diff shown by
+    confirm_pending is unaffected.
+    """
+    text, is_error = _run_tool(admin, username, name, args, pending)
+    return redact_emails(text, _worker_emails(admin)), is_error
+
+
+def _run_tool(admin, username, name, args, pending):
     if name not in DISPATCH:
         return f"Unknown tool {name!r}.", True
     method, params = DISPATCH[name]
@@ -254,7 +296,10 @@ def run_tool(admin, username, name, args, pending):
             pending[change.id] = change
             return (f"Proposed change {change.id}:\n{change.description}\n"
                     f"{AWAITING}"), False
-        return json.dumps(getattr(admin, method)(**values), default=str), False
+        result = getattr(admin, method)(**values)
+        if name == "describe_user":
+            result = _redact_user_info(result)
+        return json.dumps(result, default=str), False
     except Exception as err:  # noqa: BLE001 - report to the model, never crash
         return str(err) or type(err).__name__, True
 
@@ -342,8 +387,9 @@ def confirm_pending(admin, username, pending, history, input_fn, output):
                     admin.apply(change, actor=username)  # re-checks actor is master
                 except (ValueError, OSError) as err:
                     output(f"Change {change_id} was NOT applied: {err}")
+                    reason = redact_emails(str(err), _worker_emails(admin))
                     add_user_text(history, f"[Code note] Change {change_id} "
-                                           f"could NOT be applied: {err}")
+                                           f"could NOT be applied: {reason}")
                     continue
                 output(f"Change {change_id} APPLIED. Workers see it on their "
                        "next question.")

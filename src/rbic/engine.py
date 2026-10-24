@@ -30,7 +30,7 @@ from .audit import logger
 from .config import DEFAULT_MODEL, ConfigError, EngineConfig, resolve_config
 from .gate import (
     DENY_MESSAGE, MASTER_ROLE, AccessDenied, PolicySnapshot, SQLGate,
-    is_user_subject, normalize_email,
+    is_user_subject,
 )
 from .history import (DEFAULT_MAX_CHARS, DEFAULT_MAX_MESSAGES, normalize_turn,
                       sanitize_history)
@@ -423,10 +423,10 @@ class RBICEngine:
         # c. who is asking
         worker, role, why = self._resolve(identity, snap)
         if worker is None:
-            email = normalize_email(getattr(identity, "email", None))
-            logger.warning(
-                "IDENTITY_DENY provider=%s subject=%s email_sha256=%s reason=%s",
-                provider, subject, _digest(email)[:16] if email else "-", why)
+            # provider + subject (the host's user id) only: no email, and no
+            # hash of one (a low-entropy address is easy to recover from it).
+            logger.warning("IDENTITY_DENY provider=%s subject=%s reason=%s",
+                           provider, subject, why)
             return AskResult(DENY_MESSAGE, True, f"identity: {why}", None, None)
 
         # d. untrusted host history -> text-only turns ending with the user

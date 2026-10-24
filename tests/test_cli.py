@@ -129,6 +129,16 @@ def test_master_cli_refuses_non_master(env):
     assert "not a master user" in str(exc.value.code)
 
 
+def test_master_cli_tool_results_carry_no_email(env):
+    _, client = run_master(env, ["who is carol?", "exit"], [
+        master_tool_use("describe_user", {"username": "carol"}),
+        master_end_turn("Carol is an HR manager."),
+    ])
+    sent = json.dumps(client.calls[1]["messages"], default=str)
+    assert "carol@example.test" not in sent
+    assert "<set>" in sent
+
+
 # ---- rbic-gate-demo ----------------------------------------------------------
 
 def test_gate_demo_outcomes(demo_config):

@@ -208,3 +208,89 @@ def test_fingerprint_changes_with_any_input(demo_config):
 
 def test_fingerprint_parts_are_unambiguous():
     assert policy_fingerprint(b"ab", b"c", b"") != policy_fingerprint(b"a", b"bc", b"")
+
+
+# ---- no email-derived data in audit logs or master LLM context -----------------
+
+def test_identity_deny_logs_provider_and_subject_only(demo_config, caplog):
+    import hashlib
+    from rbic import RBICEngine
+    engine = RBICEngine(demo_config, client=object())
+    email = "Mallory.Unknown@Example.test"
+    logging.disable(logging.NOTSET)
+    try:
+        with caplog.at_level(logging.INFO, logger="rbic.audit"):
+            result = engine.ask(Identity("openwebui", "sub-123", email),
+                                [{"role": "user", "content": "hi"}])
+    finally:
+        logging.disable(logging.CRITICAL)
+    assert result.denied
+    lines = [r.getMessage() for r in caplog.records]
+    deny = [line for line in lines if line.startswith("IDENTITY_DENY")]
+    assert deny == ["IDENTITY_DENY provider='openwebui' subject='sub-123' "
+                    "reason=unmapped identity"]
+    text = "\n".join(lines).casefold()
+    assert "mallory" not in text and "example.test" not in text
+    for form in (email, email.casefold(), email.strip().casefold()):
+        digest = hashlib.sha256(form.encode()).hexdigest()
+        assert digest[:12] not in text
+
+
+def _master_tool(cfg, name, args):
+    from rbic import master
+    admin = PolicyAdmin.from_config(cfg)
+    return master.run_tool(admin, "master", name, args, {})
+
+
+def test_master_describe_user_hides_email(demo_config):
+    text, is_error = _master_tool(demo_config, "describe_user",
+                                  {"username": "carol"})
+    assert not is_error
+    info = json.loads(text)
+    assert info["attributes"]["email"] == "<set>"
+    assert info["attributes"]["dept"] == "engineering"
+    assert "carol@example.test" not in text and "@" not in text
+
+
+def test_master_describe_user_without_email(demo_config):
+    attrs = read_attrs(demo_config)
+    del attrs["dave"]["email"]
+    write_attrs(demo_config, attrs)
+    info = json.loads(_master_tool(demo_config, "describe_user",
+                                   {"username": "dave"})[0])
+    assert info["attributes"]["email"] == "<not set>"
+    master_info = json.loads(_master_tool(demo_config, "describe_user",
+                                          {"username": "master"})[0])
+    assert master_info["attributes"]["email"] == "<not set>"
+
+
+@pytest.mark.parametrize("name, args", [
+    ("list_roles", {}), ("list_tables", {}), ("show_history", {}),
+    ("describe_role", {"role": "hr_staff"}),
+    ("describe_user", {"username": "alice"}),
+    ("propose_assign_role", {"username": "bob", "role": "hr_manager"}),
+    ("propose_set_attribute", {"username": "bob", "key": "email",
+                               "value": "x@example.test"}),
+    ("describe_user", {"username": "nobody"}),
+])
+def test_no_master_tool_output_carries_an_email(demo_config, name, args):
+    text, _ = _master_tool(demo_config, name, args)
+    for worker in ("alice", "bob", "carol", "dave"):
+        assert f"{worker}@example.test" not in text.casefold()
+
+
+def test_redact_emails_is_case_insensitive():
+    from rbic.master import redact_emails
+    assert redact_emails("mail Bob@Example.TEST or bob@example.test now",
+                         ["bob@example.test"]) == "mail <email> or <email> now"
+
+
+def test_human_diff_may_still_show_email(demo_config):
+    change = PolicyAdmin.from_config(demo_config).propose_assign_role(
+        "bob", "hr_manager", actor="master")
+    from rbic import master
+    text, _ = master.run_tool(PolicyAdmin.from_config(demo_config), "master",
+                              "propose_assign_role",
+                              {"username": "bob", "role": "hr_manager"}, {})
+    assert "bob@example.test" not in text
+    assert "bob@example.test" in change.after_text  # the file itself is intact
