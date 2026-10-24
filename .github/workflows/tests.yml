@@ -21,9 +21,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+          cache-dependency-path: pyproject.toml
+      - name: Install package
+        run: pip install -e ".[test]"
       - name: Run tests
         run: python -m pytest -q
       - name: Gate demo smoke test
-        run: python sql_gate.py
+        run: rbic-gate-demo --config-dir examples/demo

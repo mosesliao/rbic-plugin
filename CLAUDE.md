@@ -57,34 +57,52 @@ LLM never generates (and can never be talked out of) the deny message.
 project/
 ├── .env                    # ANTHROPIC_API_KEY — never commit
 ├── CLAUDE.md               # this file
-├── casbin/
-│   ├── model.conf          # RBAC model + p2 (ABAC filter) definition
-│   └── policy.csv          # p (grants), g (hierarchy), p2 (row filters)
-├── db_schema.json          # table → columns; the qualify/deny reference
-├── worker_attributes.json  # username → {role, dept/site…}; IdP/HRIS stand-in
-├── sql_gate.py             # the PEP: parse → RBAC → ABAC → safe SQL
-├── chatbot.py              # worker CLI: NL → text-to-SQL → gate → answer
-├── master_bot.py           # master CLI: NL → proposed policy change → human yes/no
-├── policy_admin.py         # validated, atomic, audited policy/attribute editor
-├── policy_changes.jsonl    # runtime audit log of applied changes (gitignored)
-├── seed_db.py              # creates + seeds company.db (demo data)
-├── company.db              # seeded SQLite demo DB (regenerate anytime)
-├── test_salary_policy_evolution.py  # pytest: policy stages 0→1→2
-├── test_master_policy.py   # pytest: master bot, hot reload, validation, undo
-├── test_scoped_grants.py   # pytest: 4-field p2 scoped grants
-├── test_user_overrides.py  # pytest: per-user rules, deny rules, precedence
-├── test_gate_review_fixes.py  # pytest: security-review regressions (both dialects)
-└── requirements.txt        # anthropic, python-dotenv, casbin, sqlglot, pytest
+├── pyproject.toml          # rbic-plugin: deps, entry points (hatchling, src layout)
+├── src/rbic/
+│   ├── __init__.py         # __version__, SQLGate, AccessDenied, DENY_MESSAGE, PolicyAdmin
+│   ├── config.py           # EngineConfig / resolve_config: args > RBIC_* env > defaults
+│   ├── gate.py             # the PEP: parse → RBAC → ABAC → safe SQL (+ demo())
+│   ├── engine.py           # worker chatbot: NL → text-to-SQL → gate → answer
+│   ├── master.py           # master chatbot: NL → proposed policy change → human yes/no
+│   ├── admin.py            # validated, atomic, audited policy/attribute editor
+│   └── demo/seed.py        # creates + seeds the demo company.db
+├── examples/demo/          # demo config dir (not in the wheel)
+│   ├── casbin/
+│   │   ├── model.conf      # RBAC model + p2 (ABAC filter) definition
+│   │   └── policy.csv      # p (grants), g (hierarchy), p2 (row filters)
+│   ├── db_schema.json      # table → columns; the qualify/deny reference
+│   ├── worker_attributes.json  # username → {role, dept/site…}; IdP/HRIS stand-in
+│   ├── company.db          # seeded SQLite demo DB (generated, gitignored)
+│   └── policy_changes.jsonl  # runtime audit log of applied changes (gitignored)
+├── tests/
+│   ├── conftest.py         # copies examples/demo + seeded DB into tmp_path
+│   ├── test_config.py      # pytest: config precedence, refusals, cwd independence
+│   ├── test_salary_policy_evolution.py  # pytest: policy stages 0→1→2
+│   ├── test_master_policy.py   # pytest: master bot, hot reload, validation, undo
+│   ├── test_master_confirm.py  # pytest: master yes/no confirmation flow
+│   ├── test_scoped_grants.py   # pytest: 4-field p2 scoped grants
+│   ├── test_user_overrides.py  # pytest: per-user rules, deny rules, precedence
+│   └── test_gate_review_fixes.py  # pytest: security-review regressions (both dialects)
+└── scripts/demo/           # drive.py + record.ps1: re-record docs/master-bot-demo.gif
 ```
+
+The config directory has a fixed layout (`casbin/model.conf`,
+`casbin/policy.csv`, `db_schema.json`, `worker_attributes.json`; db
+defaults to `<config_dir>/company.db`). There is no default config dir and
+no cwd fallback: pass `--config-dir` or set `RBIC_CONFIG_DIR`
+(`RBIC_DB_PATH`, `RBIC_MODEL`, `RBIC_DIALECT` likewise). `SQLGate` and
+`PolicyAdmin` take explicit paths (or `.from_config(cfg)`); the gate's
+`dialect` is a required keyword argument.
 
 Run:
 ```bash
-python sql_gate.py        # gate demo cases (no API key needed)
-python seed_db.py         # (re)create the demo database
-pytest -q                 # policy-evolution + invariant tests
-python chatbot.py alice   # chat as a worker (needs ANTHROPIC_API_KEY)
-python chatbot.py bob     # hr_staff — try asking for salaries
-python master_bot.py master  # master user: change policy by chatting
+pip install -e ".[test]"
+rbic-gate-demo --config-dir examples/demo   # gate demo cases (no API key needed)
+rbic-seed --config-dir examples/demo        # (re)create the demo database
+python -m pytest -q                         # all tests (work on tmp copies)
+rbic-chat --config-dir examples/demo alice  # chat as a worker (needs ANTHROPIC_API_KEY)
+rbic-chat --config-dir examples/demo bob    # hr_staff — try asking for salaries
+rbic-master --config-dir examples/demo master  # master user: change policy by chatting
 ```
 
 ### chatbot.py flow
@@ -122,7 +140,7 @@ python master_bot.py master  # master user: change policy by chatting
   `TokenError`) is converted to a DENY — every `SqlglotError` is caught.
 
 ### master_bot.py flow
-- `python master_bot.py master` refuses to start unless the user's role is
+- `rbic-master --config-dir <dir> master` refuses to start unless the user's role is
   `master`. `master` is not a Casbin role and has no data grants or data tools.
 - Tools: list_roles, list_tables, describe_role, describe_user, show_history,
   propose_grant, propose_revoke, propose_deny, propose_remove_deny,
@@ -423,7 +441,7 @@ reintroduce prompt-level enforcement as the primary control.
 ANTHROPIC_API_KEY=sk-ant-api03-your-key-here
 ```
 
-Install: `pip install -r requirements.txt`
+Install: `pip install -e ".[test]"`
 
 LLM model for text-to-SQL / summarization: `claude-sonnet-4-6`.
 

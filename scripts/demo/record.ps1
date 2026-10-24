@@ -2,23 +2,25 @@
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\demo\record.ps1
 #
-# Needs: Windows Terminal (wt.exe), ffmpeg on PATH, python with
-# requirements.txt installed, and ANTHROPIC_API_KEY in .env (real API calls,
+# Needs: Windows Terminal (wt.exe), ffmpeg on PATH, python with the package
+# installed (pip install -e .), a seeded examples/demo/company.db
+# (rbic-seed --config-dir examples/demo), and ANTHROPIC_API_KEY in .env (real API calls,
 # roughly 10 model requests per take). Leave the desktop alone while it runs:
 # it captures the screen region of the new Windows Terminal window.
 #
 # What it does:
-#   1. backs up casbin/policy.csv, worker_attributes.json, policy_changes.jsonl
-#   2. sets casbin/policy.csv to the committed version (git HEAD), so alice
+#   1. backs up examples/demo/casbin/policy.csv, worker_attributes.json and
+#      policy_changes.jsonl
+#   2. sets examples/demo/casbin/policy.csv to the committed version (git HEAD), so alice
 #      starts without any personal grant
 #   3. opens a Windows Terminal window split horizontally: top pane runs
-#      scripts/demo/drive.py master (master_bot.py), bottom pane runs
-#      scripts/demo/drive.py alice (chatbot.py); see drive.py
+#      scripts/demo/drive.py master (rbic.master), bottom pane runs
+#      scripts/demo/drive.py alice (rbic.engine); see drive.py
 #   4. records the window with ffmpeg gdigrab, then builds the GIF with a
 #      two-pass palette (palettegen / paletteuse)
 #   5. ALWAYS (finally) restores the backed-up files byte for byte, verifies
-#      their SHA-256, and removes a casbin/.policy.lock left by the run
-# casbin/model.conf is never touched.
+#      their SHA-256, and removes an examples/demo/casbin/.policy.lock left by the run
+# examples/demo/casbin/model.conf is never touched.
 
 param(
     [string]$Out = "docs\master-bot-demo.gif",
@@ -61,12 +63,13 @@ public static class DemoWin {
 "@
 [void][DemoWin]::SetProcessDPIAware()
 
-$files = @("casbin\policy.csv", "worker_attributes.json", "policy_changes.jsonl")
+$files = @("examples\demo\casbin\policy.csv", "examples\demo\worker_attributes.json",
+           "examples\demo\policy_changes.jsonl")
 $work = Join-Path $env:TEMP ("rbic-demo-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 $bak = Join-Path $work "backup"
 $sync = Join-Path $work "sync"
 New-Item -ItemType Directory -Force $bak, $sync | Out-Null
-$lock = Join-Path $proj "casbin\.policy.lock"
+$lock = Join-Path $proj "examples\demo\casbin\.policy.lock"
 $lockExisted = Test-Path $lock
 $hashes = @{}
 foreach ($f in $files) {
@@ -82,7 +85,7 @@ $title = "rbic-plugin demo"
 $raw = Join-Path $work "raw.mkv"
 try {
     # Committed policy (raw bytes from git, no PowerShell re-encoding).
-    python -c "import subprocess; open(r'casbin\policy.csv','wb').write(subprocess.check_output(['git','show','HEAD:casbin/policy.csv']))"
+    python -c "import subprocess; open(r'examples\demo\casbin\policy.csv','wb').write(subprocess.check_output(['git','show','HEAD:examples/demo/casbin/policy.csv']))"
     if ($LASTEXITCODE -ne 0) { throw "could not write HEAD policy.csv" }
 
     $drive = "python scripts/demo/drive.py"

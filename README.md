@@ -42,9 +42,13 @@ python -m venv .venv
 # macOS / Linux
 source .venv/bin/activate
 
-# 2. Install dependencies
-pip install -r requirements.txt
+# 2. Install the package (editable, with test dependencies)
+pip install -e ".[test]"
 ```
+
+Every command below takes `--config-dir` (or reads `RBIC_CONFIG_DIR`); there
+is no default configuration directory. The demo configuration lives in
+`examples/demo/`.
 
 ## Configuration
 
@@ -59,17 +63,17 @@ ANTHROPIC_API_KEY=sk-ant-api03-your-key-here
 ### 1. Seed the demo database
 
 ```bash
-python seed_db.py
+rbic-seed --config-dir examples/demo
 ```
 
-Creates `company.db` (SQLite) with 9 tables and demo rows spanning two
+Creates `examples/demo/company.db` (SQLite; `--db PATH` writes elsewhere) with 9 tables and demo rows spanning two
 warehouses (`SG-01`, `SG-02`) and two departments (`engineering`,
 `logistics`), so you can see the row filtering work.
 
 ### 2. Smoke-test the SQL gate (no API key needed)
 
 ```bash
-python sql_gate.py
+rbic-gate-demo --config-dir examples/demo
 ```
 
 Runs ~10 allow/deny cases and prints each decision, e.g. `SELECT * FROM
@@ -79,10 +83,10 @@ employees` as hr_staff is denied because the star expands to the forbidden
 ### 3. Chat as a worker
 
 ```bash
-python chatbot.py alice     # warehouse_worker, site SG-01
-python chatbot.py bob       # hr_staff, dept engineering
-python chatbot.py carol     # hr_manager (inherits hr_staff + salary access)
-python chatbot.py dave      # finance_analyst, dept logistics
+rbic-chat --config-dir examples/demo alice   # warehouse_worker, site SG-01
+rbic-chat --config-dir examples/demo bob     # hr_staff, dept engineering
+rbic-chat --config-dir examples/demo carol   # hr_manager (inherits hr_staff + salary access)
+rbic-chat --config-dir examples/demo dave    # finance_analyst, dept logistics
 ```
 
 Type `exit` to quit.
@@ -95,30 +99,30 @@ Type `exit` to quit.
 | bob   | hr_staff         | employees (no salary), leave, trainings — **engineering only** |
 | carol | hr_manager       | everything bob sees **plus salaries**                   |
 | dave  | finance_analyst  | budgets, invoices, expenses — **logistics expenses only** |
-| master | master          | **no data** — manages policy via `master_bot.py`        |
+| master | master          | **no data** — manages policy via `rbic-master`          |
 
 ### Things to try
 
 ```
-python chatbot.py bob
+rbic-chat --config-dir examples/demo bob
 You: who is on leave this month?          → answers from engineering rows only
 You: what is everyone's salary?           → "You have no access to this information, ..."
 You: what is my salary?                   → answered from bob's own payroll row only
 
-python chatbot.py carol
+rbic-chat --config-dir examples/demo carol
 You: show me my team's salaries           → self + subordinates (Bob, Erin) only
 
-python chatbot.py alice
+rbic-chat --config-dir examples/demo alice
 You: which SKUs are running low?          → SG-01 stock only; SG-02 is invisible
 You: show me the expense reports          → denied (not a warehouse topic)
 ```
 
 ### Policy as code
 
-Access rules evolve by editing `casbin/policy.csv` — no code changes. The
+Access rules evolve by editing `examples/demo/casbin/policy.csv` — no code changes. The
 shipped policy encodes a three-stage salary rollout (deny-all → workers see
 their own payslip → managers also see subordinates'), and
-`test_salary_policy_evolution.py` replays all three stages against the same
+`tests/test_salary_policy_evolution.py` replays all three stages against the same
 codebase:
 
 ```bash
@@ -159,11 +163,11 @@ anything not listed there is denied automatically.
 The master user can inspect and change access policy in plain English:
 
 ```bash
-python master_bot.py master
+rbic-master --config-dir examples/demo master
 ```
 
 Only users whose record in `worker_attributes.json` has `"role": "master"`
-can start it (`python master_bot.py bob` exits with an error). The master
+can start it (`rbic-master --config-dir examples/demo bob` exits with an error). The master
 bot has no data tools: it can't query the business database.
 
 Example requests:
@@ -235,7 +239,8 @@ file is fixed.
 
 ![Master bot (top) grants and revokes alice's access to Carol's salary while alice's worker chatbot (bottom) picks up each change](docs/master-bot-demo.gif)
 
-Top pane: `python master_bot.py master`. Bottom pane: `python chatbot.py alice`
+Top pane: `rbic-master --config-dir examples/demo master`. Bottom pane:
+`rbic-chat --config-dir examples/demo alice`
 (warehouse_worker). Everything shown is live output from the real bots, the
 SQL gate and the API. Dimmed `[gate audit]` lines are a condensed copy of
 the `rbic.audit` log.
@@ -254,7 +259,7 @@ Try it yourself in a Windows Terminal window split horizontally (or split
 an open tab with Alt+Shift+-):
 
 ```powershell
-wt -d . python master_bot.py master `; split-pane -H -d . python chatbot.py alice
+wt -d . rbic-master --config-dir examples/demo master `; split-pane -H -d . rbic-chat --config-dir examples/demo alice
 ```
 
 (The backtick escapes `;` for PowerShell. In cmd.exe, use a plain `;`.)
@@ -272,17 +277,20 @@ restores the backed-up files and checks their hashes.
 ## Project layout
 
 ```
-casbin/model.conf        Casbin model (RBAC matcher + p2 ABAC definition)
-casbin/policy.csv        grants, role hierarchy, row-filter templates
-db_schema.json           table → columns; unknown tables/columns are denied
-worker_attributes.json   demo users and their attributes
-sql_gate.py              the enforcement gate (parse → RBAC → ABAC → audit)
-chatbot.py               worker CLI (text-to-SQL loop, read-only DB access)
-master_bot.py            master CLI: propose policy changes, human confirms
-policy_admin.py          validated, atomic, audited policy/attribute editor
-policy_changes.jsonl     runtime audit log of applied changes (gitignored)
-test_master_policy.py    pytest: master bot, live policy changes, validation
-seed_db.py               creates + seeds company.db
+pyproject.toml                package metadata, dependencies, entry points
+src/rbic/gate.py              the enforcement gate (parse → RBAC → ABAC → audit)
+src/rbic/config.py            configuration resolution (args > RBIC_* env > defaults)
+src/rbic/engine.py            worker chatbot (text-to-SQL loop, read-only DB access)
+src/rbic/master.py            master chatbot: propose policy changes, human confirms
+src/rbic/admin.py             validated, atomic, audited policy/attribute editor
+src/rbic/demo/seed.py         creates + seeds the demo company.db
+examples/demo/casbin/model.conf   Casbin model (RBAC matcher + p2 ABAC definition)
+examples/demo/casbin/policy.csv   grants, role hierarchy, row-filter templates
+examples/demo/db_schema.json      table → columns; unknown tables/columns are denied
+examples/demo/worker_attributes.json  demo users and their attributes
+examples/demo/company.db      seeded demo database (generated, gitignored)
+examples/demo/policy_changes.jsonl  runtime audit log of applied changes (gitignored)
+tests/                        pytest suite (conftest.py copies examples/demo to tmp)
 CLAUDE.md                architecture notes and security invariants
 docs/master-bot-demo.gif recording of a live policy change (master + worker)
 scripts/demo/            drive.py (scripted bot driver), record.ps1 (re-record the GIF)
