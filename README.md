@@ -225,8 +225,9 @@ All policy lives in two files — no code changes needed:
     `{placeholders}` are bound from the worker's attributes at query time
 - **`worker_attributes.json`** — `username → {role, email, dept/site, …}`
   (stand-in for your IdP/HRIS). `email` is the identity key hosts sign
-  users in by: it must be a plain address and unique, or the policy fails
-  to load and everyone is denied
+  users in by: it must be a plain ASCII address and unique (compared
+  ASCII case-insensitively; a non-ASCII lookalike sign-in matches no one),
+  or the policy fails to load and everyone is denied
 
 Example — give a new `auditor` role read access to all invoices in their
 region only:
@@ -239,7 +240,8 @@ p2, auditor, invoices, region = '{region}'
 then add the worker: `"eve": { "role": "auditor", "email": "eve@example.com", "region": "APAC" }`.
 
 If you add tables/columns to the database, mirror them in `db_schema.json` —
-anything not listed there is denied automatically.
+anything not listed there is denied automatically. Like the policy files,
+it is picked up on the next request (no restart).
 
 ---
 
@@ -275,8 +277,8 @@ Only `yes` or `y` (any case) writes the file; `no` or `n` declines; anything
 else asks again; end of input (Ctrl-D / Ctrl-Z) declines. Every decision is
 logged on `rbic.audit`. There is no "apply" tool for the model to call.
 
-**Changes are live.** The SQL gate checks the policy files' timestamps on
-every query and hot-reloads them, so workers pick up changes on their next
+**Changes are live.** The SQL gate checks the policy files' (and
+db_schema.json's) timestamps on every query and hot-reloads them, so workers pick up changes on their next
 question. A worker session whose policy changed clears its conversation
 history (`(Access policy was updated — conversation reset.)`) so rows fetched
 under the old policy don't linger in the model's context. If a reload fails

@@ -70,7 +70,7 @@ project/
 ├── docs/RELEASING.md       # owner checklist: Trusted Publishing, environments, tagging
 ├── .github/workflows/
 │   ├── tests.yml           # pytest (3.10/3.11/3.12) + wheel smoke; adapters (anthropic 0.86.0)
-│   └── release.yml         # v*.*.* tag → build/test → TestPyPI → PyPI (OIDC, no tokens)
+│   └── release.yml         # v*.*.* tag on main → build/test → TestPyPI → PyPI (OIDC, SHA-pinned actions)
 ├── src/rbic/               # the library: no print/input/exit/basicConfig/dotenv here
 │   ├── __init__.py         # public API: RBICEngine, Identity, Audience, AskResult, SQLGate, ...
 │   ├── audit.py            # "rbic.audit" logger: NullHandler + configure(path) JSON lines
@@ -101,6 +101,7 @@ project/
 │   ├── test_engine.py      # pytest: RBICEngine.ask() decision order, guard, errors
 │   ├── test_history.py     # pytest: host history sanitizing
 │   ├── test_identity.py    # pytest: identity providers, email index, fingerprint, no-email logs/LLM
+│   ├── test_phase1_review_fixes.py  # pytest: Phase 1 review regressions (emails, schema reload, URI, ...)
 │   ├── test_cli.py         # pytest: rbic.cli entry points with injected I/O / fake clients
 │   ├── test_library_hygiene.py  # pytest: AST scan, import side effects, audit.configure
 │   ├── test_wheel_contents.py   # pytest: wheel = rbic/** + dist-info only
@@ -147,14 +148,25 @@ happens before the LLM is called:
 2. **One snapshot**: `gate.refreshed_snapshot()` is taken once for
    identity, system prompt and fingerprint. Broken → `DENY_MESSAGE`,
    reason `policy unavailable`, history ignored.
-3. **Identity**: the attribute provider (default `JsonAttributeProvider`:
-   casefolded email → the worker whose record has that `email`) resolves
-   against that snapshot's attributes. Unmapped, role-less, `master`, or a
+3. **Identity**: the host's `Identity` is first copied to a fresh
+   `Identity` of plain `str` fields (anything that isn't an `Identity`, or
+   whose fields can't be read → "not an Identity"). The attribute provider
+   (default `JsonAttributeProvider`: email → the worker whose record has
+   that `email`, compared with `gate.normalize_email` — ASCII whitespace
+   stripped, plain ASCII address required, ASCII-lowercased; **never
+   casefolded**, which maps lookalikes such as `ſ`/U+212A/`ß`/`ﬁ` onto
+   ASCII) resolves against that snapshot's **read-only** attributes
+   (`MappingProxyType` / tuples all the way down: a provider can't change
+   what later requests see). Unmapped, role-less, `master`, or a
    `user:` role → `DENY_MESSAGE`, audit `IDENTITY_DENY` (provider and
    subject — the host's user id — only: never the email, nor a hash of it).
 4. **History**: `sanitize_history()` keeps only plain-text user/assistant
    turns (merged, truncated, ending with the user); empty → a fixed
-   "Please type a question." (not a deny).
+   "Please type a question." (not a deny). The iterable is materialized
+   once (one that fails part-way → empty); dicts are read via `dict.get`
+   itself, other Mappings in a try; roles/contents (and the
+   conversation id) are copied to exact `str`, so str/dict subclass
+   overrides never run.
 5. **Conversation guard** (in memory, bounded LRU of 10,000
    `(worker, conversation_id)` entries → policy fingerprint + digests of
    the replies `ask()` returned under it): no id / unknown conversation →
@@ -179,12 +191,20 @@ happens before the LLM is called:
    version/fingerprint (or a broken gate) discards the answer →
    `POLICY_CHANGED_MESSAGE`, `reset=True`, guard entry dropped.
 9. **Errors**: any Anthropic error → `LLM_UNAVAILABLE_MESSAGE`, audit
-   `LLM_ERROR` (exception class only); anything else → same text,
-   `ENGINE_ERROR`.
+   `LLM_ERROR` (exception class only); anything else in the tool loop →
+   same text, `ENGINE_ERROR`. Gated SQL that fails to execute gives the
+   model only `"The query could not be executed. (<ExceptionClass>)"`
+   (`SQL_ERROR_TOOL_MESSAGE`; SQLite messages can quote values), audit
+   `SQL_ERROR` (class only).
+10. **Never raises**: `ask()` wraps the whole pipeline; any `Exception`
+   (a hostile host object, a bug) → `DENY_MESSAGE`, `denied=True`, reason
+   `engine error`, audit `ENGINE_ERROR stage=ask` (class only).
 
 `AskResult.reason` is for host logs only — hosts must never display it.
-The engine executes on SQLite read-only and refuses to build if the
-dialect isn't `sqlite` or the database is missing; the Anthropic client is
+The engine executes on SQLite read-only (`engine.readonly_uri`:
+`Path(db).resolve().as_uri() + "?mode=ro"`, never the raw path — a `#` or
+`?` in it would drop `mode=ro`, a `%` would be decoded) and refuses to
+build if the dialect isn't `sqlite` or the database is missing; the Anthropic client is
 created lazily on the first LLM call. Library code (everything outside
 `rbic.cli`) never calls `print`/`input`/`exit`/`sys.exit`/
 `logging.basicConfig` or imports `dotenv` (`test_library_hygiene.py`
@@ -195,7 +215,7 @@ logging.
 - Every module logs on the `"rbic.audit"` logger (`rbic.audit.logger`):
   `ALLOW`/`DENY` (gate), `IDENTITY_DENY`, `AUDIENCE_DENY`,
   `POLICY_UNAVAILABLE_DENY`, `POLICY_RESET`, `POLICY_CHANGED_DURING_TURN`,
-  `LLM_ERROR`/`ENGINE_ERROR` (engine), `POLICY_RELOAD[_FAILED]`,
+  `SQL_ERROR`, `LLM_ERROR`/`ENGINE_ERROR` (engine), `POLICY_RELOAD[_FAILED]`,
   `POLICY_CONFIRM`, `POLICY_CHANGE[_LOG_FAILED]` (master/admin). The line
   formats are stable.
 - **Decision: library convention.** Importing `rbic` attaches only a
@@ -242,16 +262,29 @@ logging.
 
 ### Hot reload (rbic.gate)
 - `authorize()` starts with `_maybe_reload()`: stat (mtime_ns, size, inode)
-  of policy.csv, model.conf, worker_attributes.json; on change, build a
-  complete new immutable `PolicySnapshot` (enforcer, attributes, compiled
-  row filters, version, broken reason) with `load_snapshot()` and swap it
-  in under a `threading.Lock`, then log `POLICY_RELOAD`.
-- `load_snapshot(model_bytes, policy_bytes, attributes_bytes, schema, *,
-  dialect)` is **the** loader: `check_policy_bytes` (lone CR, unknown
-  ptype), the bytes-based Casbin load (`load_enforcer`), JSON attributes,
-  `compile_snapshot` (arity, user subjects, master, unsafe filters, email
-  shape/uniqueness) and the fingerprint. PolicyAdmin validates with the
-  same function, so it can never write a policy the gate would refuse.
+  of policy.csv, model.conf, worker_attributes.json **and db_schema.json**;
+  on change, build a complete new immutable `PolicySnapshot` (enforcer,
+  attributes, schema, compiled row filters, version, broken reason) with
+  `load_snapshot()` and swap it in under a `threading.Lock`, then log
+  `POLICY_RELOAD`.
+- `load_snapshot(model_bytes, policy_bytes, attributes_bytes,
+  schema_bytes, *, dialect)` is **the** loader: `check_policy_bytes` (lone
+  CR, unknown ptype), the bytes-based Casbin load (`load_enforcer`), JSON
+  attributes and schema, `compile_snapshot` (schema shape, arity, user
+  subjects, master, unsafe filters, email shape/uniqueness) and the
+  fingerprint. PolicyAdmin validates with the same function over the same
+  files (db_schema.json included), so it can never write a policy the gate
+  would refuse.
+- The schema is part of the snapshot (`snapshot.schema`, read-only;
+  `gate.schema` is the current snapshot's): qualify, column resolution,
+  row-filter compilation and the engine's system prompt all use the
+  request's snapshot schema, never a copy taken at start-up. Editing
+  db_schema.json takes effect on the next request (no restart), and a
+  malformed one fails the reload (deny all) like any other policy file.
+- Snapshot attributes and schema are deeply read-only (`gate.freeze`:
+  `MappingProxyType` over fresh dicts, tuples for lists). Code that needs
+  different attributes writes worker_attributes.json (or goes through
+  PolicyAdmin); nothing mutates a snapshot.
 - `authorize()` grabs the snapshot **once**; parse → RBAC → ABAC all use
   that snapshot (passed explicitly), so a reload mid-request can never mix
   old grants with new row filters. The gate is safe to share across
@@ -478,26 +511,30 @@ logging.
   "own payslip" coexist with "browse department directory".
 
 ### `db_schema.json`
-Single source of truth for what tables/columns exist. Dual purpose:
+Single source of truth for what tables/columns exist
+(`{table: {column: type}}`). Dual purpose:
 1. lets `sqlglot.optimizer.qualify` resolve unqualified columns and expand
    `SELECT *` into explicit columns → star queries get real column-level RBAC;
 2. any table/column not listed here is an automatic deny.
 Keep it in sync with the real database (generate it from information_schema
-in production).
+in production). It is hot-reloaded and fingerprinted with the policy files
+(see Hot reload): a schema change applies on the next request and resets
+worker conversations once.
 
 ### `worker_attributes.json`
 Demo stand-in for the IdP/HRIS. In production these attributes must come from
 the authenticated session, never from user input. `email` (optional per
 worker) is the identity key `JsonAttributeProvider` maps sign-ins by: it
-must be a plain ASCII address and unique after casefolding, or the load
-fails closed (everyone denied). The master bot can never change an email
+must be a plain ASCII address and unique after ASCII lowercasing
+(`gate.normalize_email`, the same normalization identity emails get), or
+the load fails closed (everyone denied). The master bot can never change an email
 (`propose_set_attribute` refuses it, and no other path, undo included,
 may alter one) — it is owned by HR / the IdP.
 
 **Policy fingerprint**: `gate.fingerprint` / `PolicySnapshot.fingerprint`
-is a sha256 over the exact bytes of model.conf, policy.csv and
-worker_attributes.json that the snapshot was built from (each file is
-read once; the bytes parsed are the bytes hashed). Unlike
+is a sha256 over the exact bytes of model.conf, policy.csv,
+worker_attributes.json and db_schema.json that the snapshot was built from
+(each file is read once per load; the bytes parsed are the bytes hashed). Unlike
 `policy_version` it is stable across restarts and processes.
 `compile_row_filter` and `compile_snapshot` take `dialect` as a required
 keyword.
@@ -513,7 +550,7 @@ keyword.
    parser can't fully account for must be rejected, not passed through. v1 is
    deliberately narrow (single SELECT); widen it only with tests proving the
    new construct is gated. Concretely, after `qualify` every node of the
-   tree must be in `sql_gate.SUPPORTED_NODES` and none in
+   tree must be in `rbic.gate.SUPPORTED_NODES` and none in
    `UNSUPPORTED_NODES` (`_check_constructs`): sqlglot's `TableColumn`
    (Postgres whole-row refs `e`, `(e).salary`, `to_jsonb(e)`,
    `row_to_json(e)`, `ORDER BY (e).salary` — a bare alias used as a value,
@@ -590,6 +627,18 @@ keyword.
 13. **Non-private audiences are denied.** Only `Audience.PRIVATE` is
     answered; shared/unknown channels get `AUDIENCE_DENY_MESSAGE` from code
     and the LLM is never called.
+
+### Host requirements (Phase 2 design note)
+
+- **Never paste transcripts into a user turn.** The conversation guard
+  (invariant #12) only filters *assistant* turns: earlier replies that a
+  host re-sends inside a USER turn are indistinguishable from the user's
+  own text, so they bypass the policy-change reset and rows fetched under
+  an old policy reach the model again. Open WebUI's background tasks
+  (chat title, tags, follow-up suggestions) do exactly this. Hosts must
+  route such background/task requests **away from `ask()`** (or answer
+  them without data, e.g. a fixed title) and only ever call `ask()` with
+  the real chat history, one message per turn.
 
 ---
 
