@@ -12,8 +12,15 @@ import threading
 from types import SimpleNamespace as NS
 
 import anthropic
-import httpx
 import pytest
+
+# The HTTP client the installed anthropic SDK is built on: anthropic 1.x
+# depends on httpx2, 0.86.x (the declared floor) on httpx. Neither is a
+# direct dependency of rbic, so import whichever the SDK brought along.
+try:
+    import httpx2 as httpx
+except ImportError:
+    import httpx
 
 import rbic
 from rbic import (DENY_MESSAGE, AskResult, Audience, Identity, LocalProvider,
