@@ -9,6 +9,8 @@ permissions:
   contents: read
 
 jobs:
+  # Required checks: "pytest (3.10)", "pytest (3.11)", "pytest (3.12)".
+  # Keep the job id and the matrix, or update the branch ruleset too.
   pytest:
     runs-on: ubuntu-latest
     strategy:
@@ -28,3 +30,32 @@ jobs:
         run: python -m pytest -q
       - name: Gate demo smoke test
         run: rbic-gate-demo --config-dir examples/demo
+      - name: Build sdist and wheel
+        run: python -m build --outdir dist
+      - name: Smoke-test the wheel in a fresh venv
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-venv"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install --quiet dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -c "import rbic, sys; print(rbic.__version__)"
+          "$RUNNER_TEMP/wheel-venv/bin/rbic-gate-demo" --config-dir "$GITHUB_WORKSPACE/examples/demo"
+
+  # Not a required check. Proves the declared lower bound anthropic>=0.86
+  # (the version Open WebUI pins) works with the engine.
+  adapters:
+    name: adapters (anthropic 0.86.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install anthropic 0.86.0, then the package
+        run: |
+          pip install "anthropic==0.86.0"
+          pip install -e ".[test]" "anthropic==0.86.0"
+          python -c "import anthropic; assert anthropic.__version__ == '0.86.0', anthropic.__version__; print('anthropic', anthropic.__version__)"
+      - name: Engine, identity and history tests
+        run: python -m pytest -q tests/test_engine.py tests/test_identity.py tests/test_history.py tests/test_cli.py
