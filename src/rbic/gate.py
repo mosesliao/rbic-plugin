@@ -78,6 +78,7 @@ swaps it in under a lock; authorize() takes the snapshot once and every
 stage of that request uses only it.
 """
 
+import argparse
 import json
 import logging
 import os
@@ -93,6 +94,8 @@ from casbin.util import key_match
 from sqlglot import exp
 from sqlglot.errors import SqlglotError
 from sqlglot.optimizer.qualify import qualify
+
+from .config import ConfigError, EngineConfig, resolve_config
 
 logger = logging.getLogger("rbic.audit")
 
@@ -933,13 +936,19 @@ class _TableRef:
 class SQLGate:
     def __init__(
         self,
-        model_path: str = "casbin/model.conf",
-        policy_path: str = "casbin/policy.csv",
-        schema_path: str = "db_schema.json",
-        attributes_path: str = "worker_attributes.json",
-        dialect: str = "postgres",
+        model_path,
+        policy_path,
+        schema_path,
+        attributes_path,
+        *,
+        dialect: str,
     ):
+        # No default paths or dialect: the caller (normally from_config)
+        # decides both, so nothing depends on the current directory.
         self.dialect = dialect
+        model_path, policy_path, schema_path, attributes_path = (
+            os.fspath(p) for p in (model_path, policy_path, schema_path,
+                                   attributes_path))
         with open(schema_path) as f:
             self.schema = json.load(f)
         self.model_path = model_path
@@ -948,6 +957,12 @@ class SQLGate:
         self._reload_paths = (policy_path, model_path, attributes_path)
         self._lock = threading.Lock()
         self._snapshot = self._build_snapshot(1, self._stat_signature())
+
+    @classmethod
+    def from_config(cls, cfg: EngineConfig) -> "SQLGate":
+        """Gate over an EngineConfig's policy files, in its dialect."""
+        return cls(cfg.model_path, cfg.policy_path, cfg.schema_path,
+                   cfg.attributes_path, dialect=cfg.dialect)
 
     # ------------------------------------------------------------------
     # public API
@@ -1382,9 +1397,8 @@ class SQLGate:
         raise AccessDenied(reason)
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    gate = SQLGate()
+def demo(gate: "SQLGate") -> None:
+    """Print the gate's decision for a fixed set of demo queries."""
     demos = [
         # (user, LLM-generated SQL)
         ("alice", "SELECT sku, qty FROM inventory WHERE qty < 10"),
@@ -1414,3 +1428,25 @@ if __name__ == "__main__":
         except AccessDenied as e:
             print(f"  -> DENY ({e})")
             print(f"     bot says: {DENY_MESSAGE}\n")
+
+
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="rbic-gate-demo",
+        description="Run the SQL gate over a fixed set of demo queries "
+                    "(no API key needed).")
+    parser.add_argument("--config-dir",
+                        help="policy/config directory (default: $RBIC_CONFIG_DIR)")
+    parser.add_argument("--dialect",
+                        help="SQL dialect (default: $RBIC_DIALECT or sqlite)")
+    args = parser.parse_args(argv)
+    try:
+        cfg = resolve_config(args.config_dir, dialect=args.dialect)
+    except ConfigError as err:
+        parser.error(str(err))
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    demo(SQLGate.from_config(cfg))
+
+
+if __name__ == "__main__":
+    main()

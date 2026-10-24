@@ -7,18 +7,21 @@ defense in depth. On AccessDenied the fixed DENY_MESSAGE is printed from
 code — the model never generates the refusal.
 """
 
+import argparse
 import json
 import logging
+import os
 import sqlite3
 import sys
 
 import anthropic
 from dotenv import load_dotenv
 
+from .config import DEFAULT_MODEL, ConfigError, EngineConfig, resolve_config
 from .gate import DENY_MESSAGE, AccessDenied, SQLGate
 
-MODEL = "claude-sonnet-4-6"
-DB_PATH = "company.db"
+MODEL = DEFAULT_MODEL
+EXECUTOR_DIALECT = "sqlite"
 MAX_TOOL_TURNS = 5
 MAX_ROWS_TO_MODEL = 50
 
@@ -96,9 +99,9 @@ Rules:
 """
 
 
-def execute(sql: str) -> list:
+def execute(sql: str, db_path) -> list:
     """Run gated SQL against a read-only connection (defense in depth)."""
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{os.fspath(db_path)}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
         return [dict(r) for r in conn.execute(sql).fetchall()]
@@ -106,14 +109,15 @@ def execute(sql: str) -> list:
         conn.close()
 
 
-def complete_turn(client, gate, username, system_prompt, history) -> str:
+def complete_turn(client, gate, username, system_prompt, history, *,
+                  db_path, model: str = MODEL) -> str:
     """Drive one user turn to completion, including tool round-trips.
 
     Raises AccessDenied the moment any generated SQL fails the gate.
     """
     for _ in range(MAX_TOOL_TURNS):
         response = client.messages.create(
-            model=MODEL,
+            model=model,
             max_tokens=1024,
             system=system_prompt,
             tools=[RUN_SQL_TOOL],
@@ -129,7 +133,7 @@ def complete_turn(client, gate, username, system_prompt, history) -> str:
             if block.type != "tool_use":
                 continue
             safe_sql = gate.authorize(username, block.input["sql"])  # may raise
-            rows = execute(safe_sql)
+            rows = execute(safe_sql, db_path)
             results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -166,11 +170,16 @@ def refresh_session(gate, username, history, seen_version):
     return role, build_system_prompt(role, schema, scoped), version, reset
 
 
-def run_chatbot(username: str, client=None, gate=None, input_fn=input):
+def run_chatbot(username: str, client=None, gate=None, input_fn=input, *,
+                config: EngineConfig):
+    if config.dialect != EXECUTOR_DIALECT:
+        raise ConfigError(f"The worker chatbot executes on SQLite; the gate's "
+                          f"dialect must be {EXECUTOR_DIALECT!r}, not "
+                          f"{config.dialect!r}.")
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    gate = gate or SQLGate(dialect="sqlite")
+    gate = gate or SQLGate.from_config(config)
     worker = gate.attributes.get(username)
     if worker is None:
         sys.exit(f"Unknown worker {username!r} — add them to worker_attributes.json")
@@ -204,7 +213,9 @@ def run_chatbot(username: str, client=None, gate=None, input_fn=input):
         try:
             if role is None:
                 raise AccessDenied("worker no longer exists")
-            reply = complete_turn(client, gate, username, system_prompt, history)
+            reply = complete_turn(client, gate, username, system_prompt,
+                                  history, db_path=config.db_path,
+                                  model=config.model)
         except AccessDenied:
             # Roll back any dangling tool_use turns, then answer from CODE —
             # the model does not generate the refusal.
@@ -215,5 +226,22 @@ def run_chatbot(username: str, client=None, gate=None, input_fn=input):
         print(f"\nAssistant: {reply}\n")
 
 
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="rbic-chat", description="Chat with company data as a worker.")
+    parser.add_argument("username", help="worker username (worker_attributes.json)")
+    parser.add_argument("--config-dir",
+                        help="policy/config directory (default: $RBIC_CONFIG_DIR)")
+    parser.add_argument("--db", help="SQLite database (default: $RBIC_DB_PATH "
+                                     "or <config-dir>/company.db)")
+    parser.add_argument("--model", help=f"LLM model (default: $RBIC_MODEL or {MODEL})")
+    args = parser.parse_args(argv)
+    try:
+        cfg = resolve_config(args.config_dir, db_path=args.db, model=args.model)
+        run_chatbot(args.username, config=cfg)
+    except ConfigError as err:
+        parser.error(str(err))
+
+
 if __name__ == "__main__":
-    run_chatbot(sys.argv[1] if len(sys.argv) > 1 else "alice")
+    main()

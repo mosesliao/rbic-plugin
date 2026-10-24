@@ -9,6 +9,7 @@ Validation, master protections and the atomic write all live in
 rbic.admin.PolicyAdmin. This bot has no path to business data.
 """
 
+import argparse
 import json
 import logging
 import sys
@@ -17,8 +18,9 @@ import anthropic
 from dotenv import load_dotenv
 
 from .admin import MASTER_ROLE, PolicyAdmin
+from .config import DEFAULT_MODEL, ConfigError, EngineConfig, resolve_config
 
-MODEL = "claude-sonnet-4-6"
+MODEL = DEFAULT_MODEL
 MAX_TOOL_TURNS = 8
 AWAITING = "Awaiting the human's confirmation; do not claim it is applied."
 YES = frozenset({"yes", "y"})
@@ -259,11 +261,12 @@ def run_tool(admin, username, name, args, pending):
         return str(err) or type(err).__name__, True
 
 
-def complete_turn(client, admin, username, system_prompt, history, pending) -> str:
+def complete_turn(client, admin, username, system_prompt, history, pending,
+                  model: str = MODEL) -> str:
     """Drive one master turn to completion, including tool round-trips."""
     for _ in range(MAX_TOOL_TURNS):
         response = client.messages.create(
-            model=MODEL,
+            model=model,
             max_tokens=1024,
             system=system_prompt,
             tools=TOOLS,
@@ -366,8 +369,12 @@ def require_master(admin: PolicyAdmin, username: str) -> None:
 
 
 def run_master_bot(username, client=None, input_fn=input, output=print,
-                   admin=None):
-    admin = admin or PolicyAdmin()
+                   admin=None, *, config: EngineConfig | None = None):
+    if admin is None:
+        if config is None:
+            raise ConfigError("run_master_bot needs a PolicyAdmin or an EngineConfig.")
+        admin = PolicyAdmin.from_config(config)
+    model = config.model if config is not None else MODEL
     require_master(admin, username)
     client = client or anthropic.Anthropic()
     history, pending = [], {}
@@ -388,15 +395,30 @@ def run_master_bot(username, client=None, input_fn=input, output=print,
 
         add_user_text(history, user_input)
         reply = complete_turn(client, admin, username, build_system_prompt(admin),
-                              history, pending)
+                              history, pending, model)
         output(f"\nMaster: {reply}\n")
         confirm_pending(admin, username, pending, history, input_fn, output)
 
 
-if __name__ == "__main__":
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="rbic-master",
+        description="Change access policy by chatting; every change needs "
+                    "your yes/no.")
+    parser.add_argument("username", help="master username (worker_attributes.json)")
+    parser.add_argument("--config-dir",
+                        help="policy/config directory (default: $RBIC_CONFIG_DIR)")
+    parser.add_argument("--model", help=f"LLM model (default: $RBIC_MODEL or {MODEL})")
+    args = parser.parse_args(argv)
+    try:
+        cfg = resolve_config(args.config_dir, model=args.model)
+    except ConfigError as err:
+        parser.error(str(err))
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     logging.getLogger("casbin").setLevel(logging.WARNING)  # every proposal loads policy
-    if len(sys.argv) != 2:
-        sys.exit("usage: python master_bot.py <master-username>")
-    run_master_bot(sys.argv[1])
+    run_master_bot(args.username, config=cfg)
+
+
+if __name__ == "__main__":
+    main()

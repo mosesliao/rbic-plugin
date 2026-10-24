@@ -50,6 +50,7 @@ from typing import Optional
 import casbin
 from casbin.persist.adapter import load_policy_line
 
+from .config import EngineConfig
 from .gate import (
     PTYPE_ALLOW_COLUMNS, PTYPE_ALLOW_ROWS, PTYPE_DENY_COLUMNS, PTYPE_DENY_ROWS,
     SCOPE_COLUMN_SEP, STATIC_FILTER_WARNING, USER_PREFIX, FilterError,
@@ -79,6 +80,7 @@ INT_LIST_RE = re.compile(r"[0-9]{1,18}(\s*,\s*[0-9]{1,18})*\Z", re.ASCII)
 
 STALE_MESSAGE = "Policy changed since this was proposed — please ask again"
 LOCK_NAME = ".policy.lock"
+CHANGELOG_FILE = "policy_changes.jsonl"
 LOCK_TIMEOUT_S = 10.0
 FILTER_DIALECTS = ("postgres", "sqlite")
 COLUMN_PTYPES = (PTYPE_ALLOW_COLUMNS, PTYPE_DENY_COLUMNS)
@@ -199,17 +201,28 @@ def _cols(text) -> list:
 class PolicyAdmin:
     def __init__(
         self,
-        policy_path: str = "casbin/policy.csv",
-        attributes_path: str = "worker_attributes.json",
-        schema_path: str = "db_schema.json",
-        model_path: str = "casbin/model.conf",
-        changelog_path: str = "policy_changes.jsonl",
+        policy_path,
+        attributes_path,
+        schema_path,
+        model_path,
+        changelog_path,
     ):
-        self.policy_path = policy_path
-        self.attributes_path = attributes_path
-        self.schema_path = schema_path
-        self.model_path = model_path
-        self.changelog_path = changelog_path
+        # No default paths: nothing depends on the current directory.
+        self.policy_path = os.fspath(policy_path)
+        self.attributes_path = os.fspath(attributes_path)
+        self.schema_path = os.fspath(schema_path)
+        self.model_path = os.fspath(model_path)
+        self.changelog_path = os.fspath(changelog_path)
+
+    @classmethod
+    def from_config(cls, cfg: EngineConfig,
+                    changelog_path=None) -> "PolicyAdmin":
+        """Admin over an EngineConfig's files; the changelog defaults to
+        <config_dir>/policy_changes.jsonl."""
+        if changelog_path is None:
+            changelog_path = cfg.config_dir / CHANGELOG_FILE
+        return cls(cfg.policy_path, cfg.attributes_path, cfg.schema_path,
+                   cfg.model_path, changelog_path)
 
     # ------------------------------------------------------------------
     # state loading

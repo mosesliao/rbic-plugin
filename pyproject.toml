@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rbic-plugin"
+dynamic = ["version"]
+description = "Role-gated LLM chatbot: Casbin RBAC+ABAC enforced over text-to-SQL"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.86,<2",
+    "casbin>=1.43,<2",
+    "python-dotenv>=1",
+    # The parser is the security boundary (invariant #2): one major version.
+    "sqlglot>=30.12,<31",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+# Temporary entry points; they move to rbic.cli in a later step.
+[project.scripts]
+rbic-chat = "rbic.engine:main"
+rbic-master = "rbic.master:main"
+rbic-gate-demo = "rbic.gate:main"
+rbic-seed = "rbic.demo.seed:main"
+
+[tool.hatch.version]
+path = "src/rbic/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rbic"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src/rbic", "/tests", "/examples", "/README.md", "/pyproject.toml"]
+exclude = ["company.db", "policy_changes.jsonl", ".policy.lock", ".env"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
