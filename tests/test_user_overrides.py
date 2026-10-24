@@ -11,22 +11,19 @@ Run: pytest -q
 
 import json
 import logging
-import shutil
 import sqlite3
-from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
 
-import chatbot
-import master_bot
-import seed_db
-from policy_admin import CHANGES_HEADER, PolicyAdmin
-from sql_gate import AccessDenied, SQLGate, subjects_for
+from rbic.cli import master as master_cli
+from rbic import engine as chatbot
+from rbic import master as master_bot
+from rbic.admin import CHANGES_HEADER, PolicyAdmin
+from rbic.gate import AccessDenied, SQLGate, subjects_for
 
 logging.disable(logging.CRITICAL)
 
-ROOT = Path(__file__).parent
 # The two scoped grants the tests assume (written into the temp policy;
 # the live policy.csv is read only up to the master-chatbot changes block,
 # so what has since been applied through the bot cannot affect the tests).
@@ -39,37 +36,26 @@ NAMES_Q = "SELECT name FROM employees ORDER BY id"
 ENG_NAMES = [("Bob Tan",), ("Carol Lim",), ("Erin Ng",)]
 
 
-def base_policy_text() -> str:
-    return (ROOT / "casbin" / "policy.csv").read_text(
+def base_policy_text(root) -> str:
+    return (root / "casbin" / "policy.csv").read_text(
         encoding="utf-8").split(CHANGES_HEADER)[0]
 
 
-@pytest.fixture(scope="session")
-def seeded_db(tmp_path_factory):
-    db = tmp_path_factory.mktemp("seed") / "company.db"
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(seed_db, "DB_PATH", str(db))
-        seed_db.main()
-    return db
-
-
 @pytest.fixture
-def env(tmp_path, seeded_db):
+def env(demo_dir):
+    tmp_path = demo_dir
     """tmp copies of the shipped files; policy.csv = base policy + the
     role-level scoped grant WW_LINE + the personal rule ALICE_LINE; plus a
     second warehouse worker."""
-    (tmp_path / "casbin").mkdir()
-    for rel in ("casbin/model.conf", "db_schema.json", "worker_attributes.json"):
-        shutil.copy(ROOT / rel, tmp_path / rel)
     (tmp_path / "casbin" / "policy.csv").write_text(
-        base_policy_text() + CHANGES_HEADER + "\n" + WW_LINE + "\n"
+        base_policy_text(tmp_path) + CHANGES_HEADER + "\n" + WW_LINE + "\n"
         + ALICE_LINE + "\n", encoding="utf-8", newline="\n")
-    shutil.copy(seeded_db, tmp_path / "company.db")
     attrs = json.loads((tmp_path / "worker_attributes.json").read_text())
     attrs["wes"] = {"role": "warehouse_worker", "site": "SG-02", "employee_id": 8}
     (tmp_path / "worker_attributes.json").write_text(
         json.dumps(attrs, indent=2) + "\n", encoding="utf-8")
     paths = NS(
+        root=tmp_path,
         policy=tmp_path / "casbin" / "policy.csv",
         model=tmp_path / "casbin" / "model.conf",
         schema=tmp_path / "db_schema.json",
@@ -450,16 +436,17 @@ def test_audit_log_names_level_subject_and_effect(env, caplog):
 
 # ---- parity: no deny / user rules present -> identical to the old gate -------------
 
-def test_rewritten_sql_matches_pre_user_rule_gate(tmp_path, env):
+def test_rewritten_sql_matches_pre_user_rule_gate(env):
     # Golden strings captured from the gate before per-user rules existed
     # (postgres dialect, base policy + the two role-level scoped grants).
     env.policy.write_text(
-        base_policy_text() + CHANGES_HEADER + "\n"
+        base_policy_text(env.root) + CHANGES_HEADER + "\n"
         + "p2, warehouse_worker, employees, id = 2, id|name|salary\n"
         + "p2, warehouse_worker, employees, id = '{employee_id}', id|name|salary\n",
         encoding="utf-8", newline="\n")
     gate = SQLGate(model_path=str(env.model), policy_path=str(env.policy),
-                   schema_path=str(env.schema), attributes_path=str(env.attrs))
+                   schema_path=str(env.schema), attributes_path=str(env.attrs),
+                   dialect="postgres")
     golden = {
         ("alice", "SELECT sku, qty FROM inventory WHERE qty < 10"):
             'SELECT "inventory"."sku" AS "sku", "inventory"."qty" AS "qty" FROM '
@@ -658,7 +645,7 @@ def test_role_deny_remove_and_undo(env):
         {"column": "employees.dept", "from_role": "hr_staff"}]
     assert env.admin.describe_user("carol")["denied_columns"] == {
         "employees": ["dept"]}
-    _, prompt, _, _ = chatbot.refresh_session(env.gate, "bob", [], 0)
+    _, prompt = chatbot.system_prompt_for(env.gate, "bob")
     assert "- employees(id, name, start_date)\n" in prompt
     undo(env)
     assert rows(env, "bob", "SELECT dept FROM employees")
@@ -680,7 +667,7 @@ def test_personal_deny_overrides_and_effects_say_so(env):
     apply(env, change)
     denied(env, "carol", "SELECT salary FROM employees")
     assert rows(env, "carol", NAMES_Q) == ENG_NAMES
-    _, prompt, _, _ = chatbot.refresh_session(env.gate, "carol", [], 0)
+    _, prompt = chatbot.system_prompt_for(env.gate, "carol")
     assert "- employees(id, name, dept, start_date)\n" in prompt
     # a role-level grant that a personal deny masks is reported as such
     apply(env, env.admin.propose_deny(username="bob", table="employees",
@@ -837,7 +824,7 @@ def test_master_bot_new_tools_propose_then_apply(env, name, args, line):
     client = FakeClient([tool_use(name, args), end_turn("Proposed.")])
     inputs = iter(["please", "yes", "exit"])
     out = []
-    master_bot.run_master_bot("master", client=client,
+    master_cli.run_master_bot("master", client=client,
                               input_fn=lambda _: next(inputs),
                               output=out.append, admin=env.admin)
     assert line in env.policy.read_text(encoding="utf-8")
@@ -874,7 +861,7 @@ def test_master_bot_reports_both_subjects_error_to_model(env):
         end_turn("Which one?"),
     ])
     inputs = iter(["let bob see salaries", "exit"])
-    master_bot.run_master_bot("master", client=client,
+    master_cli.run_master_bot("master", client=client,
                               input_fn=lambda _: next(inputs),
                               output=lambda *_: None, admin=env.admin)
     result = client.calls[1]["messages"][-1]["content"][0]
@@ -884,13 +871,13 @@ def test_master_bot_reports_both_subjects_error_to_model(env):
 # ---- worker chatbot prompt reflects precedence -----------------------------------------
 
 def test_worker_prompt_shows_personal_scope_and_hides_denied_columns(env):
-    role, prompt, _, _ = chatbot.refresh_session(env.gate, "alice", [], 0)
+    role, prompt = chatbot.system_prompt_for(env.gate, "alice")
     assert role == "warehouse_worker"
     assert prompt.count("- employees(id, name, salary)") == 2  # role + personal scope
     add_lines(env, "p3, user:alice, employees.salary, read")
-    _, prompt, _, _ = chatbot.refresh_session(env.gate, "alice", [], 0)
+    _, prompt = chatbot.system_prompt_for(env.gate, "alice")
     assert "- employees(id, name)\n" in prompt
     assert "employees(id, name, salary)" not in prompt
     add_lines(env, "g, user:alice, finance_analyst")
-    _, prompt, _, _ = chatbot.refresh_session(env.gate, "alice", [], 0)
+    _, prompt = chatbot.system_prompt_for(env.gate, "alice")
     assert "- invoices(id, vendor, amount, due_date, status)" in prompt

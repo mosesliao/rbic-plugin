@@ -7,3 +7,6 @@ company.db
 policy_changes.jsonl
 .policy.lock
 *.code-workspace
+build/
+dist/
+*.egg-info/

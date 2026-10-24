@@ -3,7 +3,8 @@
     python scripts/demo/drive.py master <sync_dir>   # top pane
     python scripts/demo/drive.py alice  <sync_dir>   # bottom pane
 
-Runs the REAL bot (`master_bot.py master` / `chatbot.py alice`) as a child
+Runs the REAL bot (`rbic-master master` / `rbic-chat alice`, as
+`python -m rbic.cli.master|rbic.cli.chat --config-dir examples/demo`) as a child
 process, streams its output to this console unchanged, waits for the bot's
 own input prompts ("You: ", "Apply change <id>? [yes/no]: "), then "types"
 each scripted line so it is visible, and sends it to the bot's stdin.
@@ -30,6 +31,7 @@ import threading
 import time
 
 PROJECT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CONFIG_DIR = os.path.join(PROJECT, "examples", "demo")
 WAIT_TIMEOUT = 240          # seconds for any single wait (LLM turns included)
 TYPE_DELAY = 0.035          # seconds per typed character
 READ_PAUSE = 3.0            # let the viewer read before the next action
@@ -198,7 +200,8 @@ def master_turn(bot, sync, pos, request, expected_diff_line):
 
 
 def run_master(sync):
-    bot = Bot(["master_bot.py", "master"], show_audit=False)
+    bot = Bot(["-m", "rbic.cli.master", "--config-dir", CONFIG_DIR, "master"],
+              show_audit=False)
     _, pos = bot.wait_prompt(0, r"You: ", sync)
     wait_marker(sync, "go")
     wait_marker(sync, "alice_denied_1")
@@ -219,7 +222,8 @@ def alice_turn(bot, sync, pos):
 
 
 def run_alice(sync):
-    bot = Bot(["chatbot.py", "alice"], show_audit=True)
+    bot = Bot(["-m", "rbic.cli.chat", "--config-dir", CONFIG_DIR, "alice"],
+              show_audit=True)
     _, pos = bot.wait_prompt(0, r"You: ", sync)
     wait_marker(sync, "go")
     time.sleep(1.5)

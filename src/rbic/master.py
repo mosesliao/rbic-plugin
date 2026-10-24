@@ -6,19 +6,21 @@ prints every proposed change (plain-English effect + unified diff of the
 real file) and applies it only if the human answers yes/y (case-insensitive;
 no/n declines, anything else re-asks, EOF/Ctrl-C declines).
 Validation, master protections and the atomic write all live in
-policy_admin.PolicyAdmin. This bot has no path to business data.
+rbic.admin.PolicyAdmin. This bot has no path to business data.
+
+This module is I/O-free: the confirm flow takes input/output callables
+and the interactive loop lives in rbic.cli.master. Tool output sent to the
+LLM never contains a worker's email address (see redact_emails).
 """
 
 import json
-import logging
-import sys
+import re
 
-import anthropic
-from dotenv import load_dotenv
+from .admin import MASTER_ROLE, PolicyAdmin
+from .audit import logger as audit
+from .config import DEFAULT_MODEL
 
-from policy_admin import MASTER_ROLE, PolicyAdmin
-
-MODEL = "claude-sonnet-4-6"
+MODEL = DEFAULT_MODEL
 MAX_TOOL_TURNS = 8
 AWAITING = "Awaiting the human's confirmation; do not claim it is applied."
 YES = frozenset({"yes", "y"})
@@ -31,7 +33,7 @@ CONFIRM_RULE = (
     "  chat, explain that you cannot apply changes yourself and offer to\n"
     "  re-propose it so they can answer yes at the prompt.")
 
-audit = logging.getLogger("rbic.audit")
+EMAIL_SET, EMAIL_NOT_SET, EMAIL_REDACTED = "<set>", "<not set>", "<email>"
 
 
 def _tool(name, description, optional=(), **props):
@@ -145,7 +147,8 @@ TOOLS = [
     _tool("propose_set_attribute", "Propose setting a user attribute used by "
                                    "row filters (e.g. dept, site).",
           username=USER,
-          key=("string", "Attribute name (not 'role')."),
+          key=("string", "Attribute name (not 'role' or 'email'; email is "
+                         "identity-critical and owned by HR/IdP)."),
           value=("string", "New value.")),
     _tool("propose_undo", "Propose reverting the most recently applied change."),
 ]
@@ -236,8 +239,47 @@ Rules:
 """
 
 
+def _worker_emails(admin) -> list:
+    try:
+        attrs = admin.attributes()
+    except Exception:  # noqa: BLE001 - unreadable attributes: nothing to list
+        return []
+    if not isinstance(attrs, dict):
+        return []
+    return sorted({r["email"].strip() for r in attrs.values()
+                   if isinstance(r, dict) and isinstance(r.get("email"), str)
+                   and r["email"].strip()}, key=len, reverse=True)
+
+
+def redact_emails(text: str, emails) -> str:
+    """Replace every occurrence of any of `emails` (case-insensitive)."""
+    for email in emails:
+        text = re.sub(re.escape(email), EMAIL_REDACTED, text, flags=re.IGNORECASE)
+    return text
+
+
+def _redact_user_info(info):
+    """describe_user output for the LLM: email -> <set> / <not set>."""
+    if isinstance(info, dict) and isinstance(info.get("attributes"), dict):
+        attributes = dict(info["attributes"])
+        attributes["email"] = EMAIL_SET if attributes.get("email") else EMAIL_NOT_SET
+        info = dict(info, attributes=attributes)
+    return info
+
+
 def run_tool(admin, username, name, args, pending):
-    """Execute one tool call. Returns (text, is_error)."""
+    """Execute one tool call. Returns (text, is_error).
+
+    The text goes to the LLM, so worker email addresses are taken out of
+    it (describe_user shows email: <set> / <not set>; any other address
+    is replaced by <email>). The human-facing diff shown by
+    confirm_pending is unaffected.
+    """
+    text, is_error = _run_tool(admin, username, name, args, pending)
+    return redact_emails(text, _worker_emails(admin)), is_error
+
+
+def _run_tool(admin, username, name, args, pending):
     if name not in DISPATCH:
         return f"Unknown tool {name!r}.", True
     method, params = DISPATCH[name]
@@ -254,16 +296,20 @@ def run_tool(admin, username, name, args, pending):
             pending[change.id] = change
             return (f"Proposed change {change.id}:\n{change.description}\n"
                     f"{AWAITING}"), False
-        return json.dumps(getattr(admin, method)(**values), default=str), False
+        result = getattr(admin, method)(**values)
+        if name == "describe_user":
+            result = _redact_user_info(result)
+        return json.dumps(result, default=str), False
     except Exception as err:  # noqa: BLE001 - report to the model, never crash
         return str(err) or type(err).__name__, True
 
 
-def complete_turn(client, admin, username, system_prompt, history, pending) -> str:
+def complete_turn(client, admin, username, system_prompt, history, pending,
+                  model: str = MODEL) -> str:
     """Drive one master turn to completion, including tool round-trips."""
     for _ in range(MAX_TOOL_TURNS):
         response = client.messages.create(
-            model=MODEL,
+            model=model,
             max_tokens=1024,
             system=system_prompt,
             tools=TOOLS,
@@ -341,8 +387,9 @@ def confirm_pending(admin, username, pending, history, input_fn, output):
                     admin.apply(change, actor=username)  # re-checks actor is master
                 except (ValueError, OSError) as err:
                     output(f"Change {change_id} was NOT applied: {err}")
+                    reason = redact_emails(str(err), _worker_emails(admin))
                     add_user_text(history, f"[Code note] Change {change_id} "
-                                           f"could NOT be applied: {err}")
+                                           f"could NOT be applied: {reason}")
                     continue
                 output(f"Change {change_id} APPLIED. Workers see it on their "
                        "next question.")
@@ -358,45 +405,15 @@ def confirm_pending(admin, username, pending, history, input_fn, output):
         pending.clear()
 
 
+class NotMasterError(PermissionError):
+    """The user may not use the master chatbot (not a master user)."""
+
+
 def require_master(admin: PolicyAdmin, username: str) -> None:
+    """Raise NotMasterError unless `username` is a master user. Checked
+    before the session starts and again before every turn."""
     record = admin.attributes().get(username)
-    if record is None or record.get("role") != MASTER_ROLE:
-        sys.exit(f"{username!r} is not a master user; the master chatbot "
-                 "is restricted to users with role 'master'.")
-
-
-def run_master_bot(username, client=None, input_fn=input, output=print,
-                   admin=None):
-    admin = admin or PolicyAdmin()
-    require_master(admin, username)
-    client = client or anthropic.Anthropic()
-    history, pending = [], {}
-
-    output(f"\n=== Master Chatbot | user: {username} ===")
-    output("Ask about or change access policy. Type 'exit' to quit.\n")
-
-    while True:
-        try:
-            user_input = input_fn("You: ").strip()
-        except EOFError:
-            break
-        if user_input.lower() == "exit":
-            break
-        if not user_input:
-            continue
-        require_master(admin, username)
-
-        add_user_text(history, user_input)
-        reply = complete_turn(client, admin, username, build_system_prompt(admin),
-                              history, pending)
-        output(f"\nMaster: {reply}\n")
-        confirm_pending(admin, username, pending, history, input_fn, output)
-
-
-if __name__ == "__main__":
-    load_dotenv()
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    logging.getLogger("casbin").setLevel(logging.WARNING)  # every proposal loads policy
-    if len(sys.argv) != 2:
-        sys.exit("usage: python master_bot.py <master-username>")
-    run_master_bot(sys.argv[1])
+    if not isinstance(record, dict) or record.get("role") != MASTER_ROLE:
+        raise NotMasterError(
+            f"{username!r} is not a master user; the master chatbot is "
+            "restricted to users with role 'master'.")
