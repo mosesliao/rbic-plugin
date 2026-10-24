@@ -15,12 +15,13 @@ rbic.history), and the system prompt is always built here.
 import asyncio
 import hashlib
 import json
-import os
 import sqlite3
 import threading
 from collections import OrderedDict, deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 import anthropic
@@ -52,6 +53,9 @@ POLICY_CHANGED_MESSAGE = (POLICY_RESET_NOTICE + " The access policy changed "
                           "while your question was being answered. Please "
                           "ask it again.")
 INCOMPLETE_MESSAGE = "Sorry, I couldn't complete that request — please rephrase."
+# What the MODEL gets when gated SQL fails to execute: fixed text plus the
+# exception class, never the database's message (it can quote values).
+SQL_ERROR_TOOL_MESSAGE = "The query could not be executed."
 
 # Conversation guard bounds (memory only; see _ConversationGuard).
 GUARD_MAX_CONVERSATIONS = 10_000
@@ -91,7 +95,7 @@ def allowed_schema(gate: SQLGate, username: str, snapshot=None) -> dict:
     The gate still enforces every query regardless of what the model saw.
     """
     snapshot = snapshot or gate.snapshot
-    return snapshot.effective_columns(username, gate.schema)
+    return snapshot.effective_columns(username, snapshot.schema)
 
 
 def scoped_schema(gate: SQLGate, username: str, snapshot=None) -> dict:
@@ -104,7 +108,7 @@ def scoped_schema(gate: SQLGate, username: str, snapshot=None) -> dict:
     snapshot = snapshot or gate.snapshot
     out = {}
     for table, grants in snapshot.scoped_columns(username).items():
-        if table not in gate.schema:
+        if table not in snapshot.schema:
             continue
         out[table] = [list(cols) for _, cols in grants]
     return out
@@ -154,9 +158,20 @@ def system_prompt_for(gate: SQLGate, username: str,
 # executor + tool loop
 # ---------------------------------------------------------------------------
 
+def readonly_uri(db_path) -> str:
+    """SQLite URI that opens `db_path` read-only.
+
+    Built with Path.as_uri() (absolute, percent-encoded; file:///C:/...
+    on Windows), never by pasting the raw path: a '#' or '?' in it would
+    end the path and drop ?mode=ro (SQLite then creates a new, writable
+    file), and a '%' would be decoded as an escape.
+    """
+    return Path(db_path).resolve().as_uri() + "?mode=ro"
+
+
 def execute(sql: str, db_path) -> list:
     """Run gated SQL against a read-only connection (defense in depth)."""
-    conn = sqlite3.connect(f"file:{os.fspath(db_path)}?mode=ro", uri=True)
+    conn = sqlite3.connect(readonly_uri(db_path), uri=True)
     conn.row_factory = sqlite3.Row
     try:
         return [dict(r) for r in conn.execute(sql).fetchall()]
@@ -209,11 +224,15 @@ def complete_turn(client, gate, username, system_prompt, history, *,
             try:
                 rows = execute(safe_sql, db_path)
             except sqlite3.Error as err:
+                # The message stays out of the model's context (and out of
+                # the audit log): SQLite can quote values in it.
+                logger.warning("SQL_ERROR user=%s error=%s", username,
+                               _class_name(err))
                 results.append({
                     "type": "tool_result", "tool_use_id": block.id,
                     "is_error": True,
-                    "content": f"SQL error: {type(err).__name__}: "
-                               f"{str(err)[:200]}",
+                    "content": f"{SQL_ERROR_TOOL_MESSAGE} "
+                               f"({_class_name(err)})",
                 })
                 continue
             results.append({
@@ -316,8 +335,47 @@ class _ConversationGuard:
             return len(self._entries)
 
 
+def _class_name(obj) -> str:
+    """type(obj).__name__, read so that a metaclass can't intercept it."""
+    try:
+        name = type.__dict__["__name__"].__get__(type(obj))
+    except Exception:  # noqa: BLE001
+        return "?"
+    return name if type(name) is str else "?"
+
+
+def _plain_str(value) -> Optional[str]:
+    """`value` as an exact str (a str subclass loses its overrides), or
+    None if it isn't a string."""
+    return str.__str__(value) if isinstance(value, str) else None
+
+
 def _safe_repr(value, limit: int = 200) -> str:
-    return repr(value if isinstance(value, str) else type(value).__name__)[:limit]
+    """For audit lines: a string's repr, else its class name - never a
+    host object's own __repr__."""
+    if isinstance(value, str):
+        return str.__repr__(str.__str__(value))[:limit]
+    return repr(_class_name(value))[:limit]
+
+
+def _audience_repr(audience) -> str:
+    if isinstance(audience, Audience):
+        return _safe_repr(audience.value)
+    return _safe_repr(audience)
+
+
+def _plain_identity(identity) -> Optional[Identity]:
+    """A fresh Identity of plain str (or None) fields, or None if
+    `identity` isn't an Identity or reading it fails. Providers only ever
+    see this copy, never the host's object."""
+    if not isinstance(identity, Identity):
+        return None
+    try:
+        fields = [getattr(identity, name)
+                  for name in ("provider", "subject", "email")]
+    except Exception:  # noqa: BLE001 - a hostile object maps to no one
+        return None
+    return Identity(*(_plain_str(v) for v in fields))
 
 
 class RBICEngine:
@@ -402,15 +460,34 @@ class RBICEngine:
         `messages` is the host's chat history ({"role", "content"} dicts);
         it is treated as untrusted text and never mutated. Every step that
         refuses does so before the LLM is called.
+
+        Never raises (for any Exception): whatever a host passes - objects
+        whose attributes raise, iterators that fail, str/dict subclasses -
+        the result is an AskResult. Anything unexpected is denied with
+        DENY_MESSAGE, reason "engine error", audit ENGINE_ERROR (exception
+        class only).
         """
-        provider = _safe_repr(getattr(identity, "provider", None))
-        subject = _safe_repr(getattr(identity, "subject", None))
+        try:
+            return self._ask(identity, messages,
+                             conversation_id=conversation_id,
+                             audience=audience)
+        except Exception as err:  # noqa: BLE001 - never crash the host
+            logger.error("ENGINE_ERROR stage=ask error=%s", _class_name(err))
+            return AskResult(DENY_MESSAGE, True, "engine error", None, None)
+
+    def _ask(self, identity, messages, *, conversation_id,
+             audience) -> AskResult:
+        # Host inputs become plain values first: providers, the guard and
+        # the audit lines only ever see exact str / a fresh Identity.
+        ident = _plain_identity(identity)
+        provider = _safe_repr(ident.provider if ident else None)
+        subject = _safe_repr(ident.subject if ident else None)
+        conversation_id = _plain_str(conversation_id)
 
         # a. only private one-to-one chats
         if audience is not Audience.PRIVATE:
             logger.warning("AUDIENCE_DENY provider=%s subject=%s audience=%s",
-                           provider, subject, _safe_repr(
-                               getattr(audience, "value", audience)))
+                           provider, subject, _audience_repr(audience))
             return AskResult(AUDIENCE_DENY_MESSAGE, True, "audience", None, None)
 
         # b. one snapshot for identity, prompt and fingerprint
@@ -421,7 +498,7 @@ class RBICEngine:
             return AskResult(DENY_MESSAGE, True, "policy unavailable", None, None)
 
         # c. who is asking
-        worker, role, why = self._resolve(identity, snap)
+        worker, role, why = self._resolve(ident, snap)
         if worker is None:
             # provider + subject (the host's user id) only: no email, and no
             # hash of one (a low-entropy address is easy to recover from it).
@@ -438,7 +515,7 @@ class RBICEngine:
 
         # e. conversation guard
         key = None
-        if isinstance(conversation_id, str) and \
+        if conversation_id is not None and \
                 0 < len(conversation_id) <= MAX_CONVERSATION_ID_LEN:
             key = (worker, conversation_id)
         known = self._guard.get(key) if key is not None else None
@@ -468,11 +545,11 @@ class RBICEngine:
             text, denied, reason = DENY_MESSAGE, True, str(err)
         except anthropic.AnthropicError as err:
             logger.error("LLM_ERROR user=%s error=%s", worker,
-                         type(err).__name__)
+                         _class_name(err))
             text, reason = LLM_UNAVAILABLE_MESSAGE, "llm error"
         except Exception as err:  # noqa: BLE001 - never leak, never crash the host
             logger.error("ENGINE_ERROR user=%s error=%s", worker,
-                         type(err).__name__)
+                         _class_name(err))
             text, reason = LLM_UNAVAILABLE_MESSAGE, "internal error"
         del private
 
@@ -496,18 +573,22 @@ class RBICEngine:
 
     # -- internals ----------------------------------------------------------
 
-    def _resolve(self, identity, snap: PolicySnapshot) -> tuple:
-        """(worker, role, None) or (None, None, why)."""
-        if not isinstance(identity, Identity):
+    def _resolve(self, identity: Optional[Identity],
+                 snap: PolicySnapshot) -> tuple:
+        """(worker, role, None) or (None, None, why). `identity` is the
+        plain copy from _plain_identity (None if the host's wasn't one);
+        the provider gets the snapshot's read-only attributes."""
+        if identity is None:
             return None, None, "not an Identity"
         try:
             worker = self.attribute_provider.resolve(identity, snap.attributes)
         except Exception as err:  # noqa: BLE001 - a failing provider denies
-            return None, None, f"attribute provider error {type(err).__name__}"
+            return None, None, f"attribute provider error {_class_name(err)}"
         if worker is None:
             return None, None, "unmapped identity"
-        record = snap.attributes.get(worker) if isinstance(worker, str) else None
-        if not isinstance(record, dict):
+        worker = _plain_str(worker)
+        record = snap.attributes.get(worker) if worker is not None else None
+        if not isinstance(record, Mapping):
             return None, None, "unknown worker"
         role = record.get("role")
         if not isinstance(role, str) or not role:

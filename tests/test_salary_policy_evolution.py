@@ -9,6 +9,7 @@ the payroll policy blocks — proving the progression is pure policy-file
 edits with zero code changes. Run: pytest -q
 """
 
+import json
 import logging
 import sqlite3
 
@@ -108,11 +109,16 @@ def test_dept_filter_not_weakened_by_scope_union(make_gate, rows):
     assert names == [("Bob Tan",), ("Carol Lim",), ("Erin Ng",)]
 
 
-def test_missing_scope_attribute_fails_closed(make_gate):
+def test_missing_scope_attribute_fails_closed(make_gate, demo_dir):
     # A manager without self_and_subordinate_ids must be denied outright,
     # not silently narrowed to a scope that happens to render.
+    # (Snapshot attributes are read-only: the record goes into the file.)
+    attrs_path = demo_dir / "worker_attributes.json"
+    attrs = json.loads(attrs_path.read_text(encoding="utf-8"))
+    attrs["mallory"] = {"role": "hr_manager", "dept": "engineering",
+                        "employee_id": 99}
+    attrs_path.write_text(json.dumps(attrs), encoding="utf-8")
     gate = make_gate()
-    gate.attributes["mallory"] = {"role": "hr_manager", "dept": "engineering",
-                                  "employee_id": 99}
+    assert gate.broken is None and "mallory" in gate.attributes
     with pytest.raises(AccessDenied):
         gate.authorize("mallory", PAYSLIP_Q)

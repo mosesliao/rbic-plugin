@@ -10,8 +10,9 @@ Providers return None for anything they cannot map; RBICEngine.ask()
 denies such requests before the LLM is called.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping, Optional, Protocol, runtime_checkable
+from typing import Optional, Protocol, runtime_checkable
 
 from .gate import normalize_email
 
@@ -33,28 +34,37 @@ class Identity:
 @runtime_checkable
 class AttributeProvider(Protocol):
     def resolve(self, identity: Identity,
-                attributes: Mapping[str, dict]) -> Optional[str]:
-        """The worker key in `attributes` this identity is, or None."""
+                attributes: Mapping) -> Optional[str]:
+        """The worker key in `attributes` this identity is, or None.
+
+        `attributes` is the request snapshot's read-only username ->
+        record mapping (MappingProxyType all the way down): providers
+        can't change it. RBICEngine.ask() passes a plain Identity whose
+        fields are plain str (or None)."""
 
 
 class JsonAttributeProvider:
     """Maps an identity to a worker by email.
 
     The identity's email and each worker record's `email` field are
-    compared stripped and casefolded. The gate's loader guarantees worker
-    emails are well-formed and unique (a duplicate fails the load, which
-    denies everyone), and refuses to serve a broken snapshot; uniqueness is
-    re-checked here anyway, so an ambiguous match resolves to no one. No
-    email, an empty email, or no match -> None.
+    compared through gate.normalize_email: ASCII whitespace stripped, a
+    plain ASCII address required (anything non-ASCII - a U+017F long s, a
+    Kelvin sign, a fullwidth @, a zero-width or Unicode space - matches no
+    one), then ASCII-lowercased; never casefolded, which would map such
+    lookalikes onto a real worker's address. The gate's loader guarantees
+    worker emails are well-formed and unique (a duplicate fails the load,
+    which denies everyone), and refuses to serve a broken snapshot;
+    uniqueness is re-checked here anyway, so an ambiguous match resolves
+    to no one. No email, an invalid email, or no match -> None.
     """
 
     def resolve(self, identity: Identity,
-                attributes: Mapping[str, dict]) -> Optional[str]:
+                attributes: Mapping) -> Optional[str]:
         wanted = normalize_email(getattr(identity, "email", None))
         if not wanted:
             return None
         matches = [username for username, record in attributes.items()
-                   if isinstance(record, dict)
+                   if isinstance(record, Mapping)
                    and normalize_email(record.get("email")) == wanted]
         return matches[0] if len(matches) == 1 else None
 
@@ -69,7 +79,7 @@ class LocalProvider:
     """
 
     def resolve(self, identity: Identity,
-                attributes: Mapping[str, dict]) -> Optional[str]:
+                attributes: Mapping) -> Optional[str]:
         subject = getattr(identity, "subject", None)
         if not isinstance(subject, str) or not subject:
             return None

@@ -7,6 +7,7 @@
 import argparse
 import sys
 import uuid
+from collections.abc import Mapping
 
 from ..config import ConfigError, EngineConfig, resolve_config
 from ..engine import MODEL, RBICEngine
@@ -25,7 +26,7 @@ def run_chatbot(username: str, client=None, gate=None, input_fn=input,
     engine = RBICEngine(config, gate=gate, client=client,
                         attribute_provider=LocalProvider())
     record = engine.gate.attributes.get(username)
-    if not isinstance(record, dict):
+    if not isinstance(record, Mapping):
         sys.exit(f"Unknown worker {username!r} — add them to worker_attributes.json")
     identity = Identity("local", username)
     conversation_id = uuid.uuid4().hex

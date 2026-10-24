@@ -319,7 +319,7 @@ class PolicyAdmin:
         supported dialect."""
         policy, attributes = self._after_state(change)
         model = _read_bytes(self.model_path)
-        schema = self.schema()
+        schema = _read_bytes(self.schema_path)
         try:
             for dialect in FILTER_DIALECTS:
                 load_snapshot(model, policy, attributes, schema,

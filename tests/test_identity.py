@@ -180,7 +180,8 @@ def test_fingerprint_is_sha256_of_built_bytes(demo_config):
     gate = gate_for(demo_config)
     expected = policy_fingerprint(demo_config.model_path.read_bytes(),
                                   demo_config.policy_path.read_bytes(),
-                                  demo_config.attributes_path.read_bytes())
+                                  demo_config.attributes_path.read_bytes(),
+                                  demo_config.schema_path.read_bytes())
     assert gate.fingerprint == gate.snapshot.fingerprint == expected
     assert len(expected) == 64
     # stable across instances (restarts / other processes)
@@ -207,7 +208,8 @@ def test_fingerprint_changes_with_any_input(demo_config):
 
 
 def test_fingerprint_parts_are_unambiguous():
-    assert policy_fingerprint(b"ab", b"c", b"") != policy_fingerprint(b"a", b"bc", b"")
+    assert policy_fingerprint(b"ab", b"c", b"", b"") !=         policy_fingerprint(b"a", b"bc", b"", b"")
+    assert policy_fingerprint(b"", b"", b"ab", b"c") !=         policy_fingerprint(b"", b"", b"a", b"bc")
 
 
 # ---- no email-derived data in audit logs or master LLM context -----------------

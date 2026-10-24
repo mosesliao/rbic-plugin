@@ -7,6 +7,8 @@ structured content are dropped, so nothing the host sends can pose as
 the server's system prompt or as a tool result from the database.
 """
 
+from collections.abc import Mapping
+
 ROLES = ("user", "assistant")
 DEFAULT_MAX_MESSAGES = 20
 DEFAULT_MAX_CHARS = 8000
@@ -17,6 +19,25 @@ def normalize_turn(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     """The form one turn's text takes after sanitizing: stripped and cut
     to at most max_chars characters (the beginning is kept)."""
     return text.strip()[:max_chars].strip()
+
+
+def _field(item, key):
+    """item[key] for a host message, or None. A dict is read through
+    dict.get itself (a subclass can't override what it returns, or raise);
+    another Mapping's .get may fail, which just drops the turn."""
+    if isinstance(item, dict):
+        return dict.get(item, key)
+    if isinstance(item, Mapping):
+        try:
+            return item.get(key)
+        except Exception:  # noqa: BLE001 - a hostile mapping is no turn
+            return None
+    return None
+
+
+def _plain_str(value):
+    """An exact str copy of a str (subclass overrides are gone), else None."""
+    return str.__str__(value) if isinstance(value, str) else None
 
 
 def sanitize_history(messages, *, max_messages: int = DEFAULT_MAX_MESSAGES,
@@ -32,21 +53,21 @@ def sanitize_history(messages, *, max_messages: int = DEFAULT_MAX_MESSAGES,
     - return [] unless the last turn is from the user.
 
     The input is never mutated; anything that isn't a list of dicts yields
-    [] or is skipped item by item.
+    [] or is skipped item by item. The iterable is materialized once (one
+    that fails part-way yields []); roles and contents are copied to exact
+    str, so a str subclass's overridden methods never run.
     """
-    if isinstance(messages, (str, bytes, dict)) or messages is None:
+    if isinstance(messages, (str, bytes, Mapping)) or messages is None:
         return []
     try:
         items = list(messages)
-    except TypeError:
+    except Exception:  # noqa: BLE001 - not iterable, or a failing iterator
         return []
     turns: list = []
     for item in items:
-        if not isinstance(item, dict):
-            continue
-        role, content = item.get("role"), item.get("content")
-        if not isinstance(role, str) or role not in ROLES \
-                or not isinstance(content, str):
+        role = _plain_str(_field(item, "role"))
+        content = _plain_str(_field(item, "content"))
+        if role is None or role not in ROLES or content is None:
             continue
         text = content.strip()
         if not text:
