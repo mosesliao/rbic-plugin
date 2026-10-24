@@ -644,7 +644,7 @@ def test_role_deny_remove_and_undo(env):
         {"column": "employees.dept", "from_role": "hr_staff"}]
     assert env.admin.describe_user("carol")["denied_columns"] == {
         "employees": ["dept"]}
-    _, prompt, _, _ = chatbot.refresh_session(env.gate, "bob", [], 0)
+    _, prompt = chatbot.system_prompt_for(env.gate, "bob")
     assert "- employees(id, name, start_date)\n" in prompt
     undo(env)
     assert rows(env, "bob", "SELECT dept FROM employees")
@@ -666,7 +666,7 @@ def test_personal_deny_overrides_and_effects_say_so(env):
     apply(env, change)
     denied(env, "carol", "SELECT salary FROM employees")
     assert rows(env, "carol", NAMES_Q) == ENG_NAMES
-    _, prompt, _, _ = chatbot.refresh_session(env.gate, "carol", [], 0)
+    _, prompt = chatbot.system_prompt_for(env.gate, "carol")
     assert "- employees(id, name, dept, start_date)\n" in prompt
     # a role-level grant that a personal deny masks is reported as such
     apply(env, env.admin.propose_deny(username="bob", table="employees",
@@ -870,13 +870,13 @@ def test_master_bot_reports_both_subjects_error_to_model(env):
 # ---- worker chatbot prompt reflects precedence -----------------------------------------
 
 def test_worker_prompt_shows_personal_scope_and_hides_denied_columns(env):
-    role, prompt, _, _ = chatbot.refresh_session(env.gate, "alice", [], 0)
+    role, prompt = chatbot.system_prompt_for(env.gate, "alice")
     assert role == "warehouse_worker"
     assert prompt.count("- employees(id, name, salary)") == 2  # role + personal scope
     add_lines(env, "p3, user:alice, employees.salary, read")
-    _, prompt, _, _ = chatbot.refresh_session(env.gate, "alice", [], 0)
+    _, prompt = chatbot.system_prompt_for(env.gate, "alice")
     assert "- employees(id, name)\n" in prompt
     assert "employees(id, name, salary)" not in prompt
     add_lines(env, "g, user:alice, finance_analyst")
-    _, prompt, _, _ = chatbot.refresh_session(env.gate, "alice", [], 0)
+    _, prompt = chatbot.system_prompt_for(env.gate, "alice")
     assert "- invoices(id, vendor, amount, due_date, status)" in prompt

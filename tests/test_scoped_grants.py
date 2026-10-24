@@ -423,14 +423,12 @@ def test_master_bot_scoped_grant_tool_flow(env):
 # ---- worker chatbot prompt -----------------------------------------------------------
 
 def test_worker_prompt_lists_scoped_columns_without_the_filter(env):
-    role, prompt, _, _ = chatbot.refresh_session(env.gate, "alice", [],
-                                                 env.gate.policy_version)
+    role, prompt = chatbot.system_prompt_for(env.gate, "alice")
     assert role == "warehouse_worker"
     assert "- employees(id, name, salary)" in prompt
     assert "Row-limited" in prompt
     assert "id = 2" not in prompt
     assert "- employees(id, name, dept, start_date, salary)" not in prompt
-    _, bob_prompt, _, _ = chatbot.refresh_session(env.gate, "bob", [],
-                                                  env.gate.policy_version)
+    _, bob_prompt = chatbot.system_prompt_for(env.gate, "bob")
     assert "Row-limited" not in bob_prompt
     assert "- employees(id, name, dept, start_date)\n" in bob_prompt

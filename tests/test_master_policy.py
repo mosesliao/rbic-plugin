@@ -402,11 +402,9 @@ def test_chatbot_resets_history_on_policy_change(env, monkeypatch, capsys):
     assert chatbot.POLICY_RESET_NOTICE in capsys.readouterr().out
 
 
-def test_refresh_session_no_reset_without_change(env):
-    history = [{"role": "user", "content": "hi"}]
-    role, prompt, version, reset = chatbot.refresh_session(
-        env.gate, "bob", history, env.gate.policy_version)
-    assert (role, reset, len(history)) == ("hr_staff", False, 1)
+def test_system_prompt_for_worker(env):
+    role, prompt = chatbot.system_prompt_for(env.gate, "bob")
+    assert role == "hr_staff"
     assert "- employees(id, name, dept, start_date)\n" in prompt
 
 
@@ -787,12 +785,22 @@ def test_r8_row_scope_headline_warns_when_heirs_are_widened(env):
     assert "rows of employees WIDENED to" in change.description
 
 
-def test_r8_broken_gate_clears_worker_history(env):
+def test_r8_broken_gate_ignores_worker_history(env):
+    # While the policy is broken the engine denies before the LLM: rows
+    # fetched before the failed reload can't be answered from.
+    client = FakeClient([])
+    engine = chatbot.RBICEngine(resolve_config(env.root), gate=env.gate,
+                                client=client,
+                                attribute_provider=chatbot.LocalProvider())
     history = [{"role": "user", "content": "hi"},
-               {"role": "assistant", "content": "rows..."}]
+               {"role": "assistant", "content": "rows..."},
+               {"role": "user", "content": "and?"}]
     version = env.gate.policy_version
     env.policy.write_text(env.policy.read_text(encoding="utf-8")
                           + "p, broken), line, read\n", encoding="utf-8")
-    role, prompt, new_version, reset = chatbot.refresh_session(
-        env.gate, "alice", history, version)
-    assert env.gate.broken and history == [] and new_version == version
+    result = engine.ask(chatbot.Identity("local", "alice"), history,
+                        conversation_id="c1")
+    assert env.gate.broken and env.gate.policy_version == version
+    assert (result.text, result.denied, result.reason) == (
+        DENY_MESSAGE, True, "policy unavailable")
+    assert client.calls == []
