@@ -59,10 +59,12 @@ project/
 ├── CLAUDE.md               # this file
 ├── pyproject.toml          # rbic-plugin: deps, entry points (hatchling, src layout)
 ├── src/rbic/
-│   ├── __init__.py         # __version__, SQLGate, AccessDenied, DENY_MESSAGE, PolicyAdmin
+│   ├── __init__.py         # public API: RBICEngine, Identity, Audience, AskResult, SQLGate, ...
 │   ├── config.py           # EngineConfig / resolve_config: args > RBIC_* env > defaults
 │   ├── gate.py             # the PEP: parse → RBAC → ABAC → safe SQL (+ demo())
-│   ├── engine.py           # worker chatbot: NL → text-to-SQL → gate → answer
+│   ├── engine.py           # RBICEngine.ask(): identity → history → gate'd tool loop (+ CLI)
+│   ├── identity.py         # Identity, AttributeProvider, JsonAttributeProvider, LocalProvider
+│   ├── history.py          # sanitize_history: untrusted host history → text-only turns
 │   ├── master.py           # master chatbot: NL → proposed policy change → human yes/no
 │   ├── admin.py            # validated, atomic, audited policy/attribute editor
 │   └── demo/seed.py        # creates + seeds the demo company.db
@@ -71,12 +73,15 @@ project/
 │   │   ├── model.conf      # RBAC model + p2 (ABAC filter) definition
 │   │   └── policy.csv      # p (grants), g (hierarchy), p2 (row filters)
 │   ├── db_schema.json      # table → columns; the qualify/deny reference
-│   ├── worker_attributes.json  # username → {role, dept/site…}; IdP/HRIS stand-in
+│   ├── worker_attributes.json  # username → {role, email, dept/site…}; IdP/HRIS stand-in
 │   ├── company.db          # seeded SQLite demo DB (generated, gitignored)
 │   └── policy_changes.jsonl  # runtime audit log of applied changes (gitignored)
 ├── tests/
 │   ├── conftest.py         # copies examples/demo + seeded DB into tmp_path
 │   ├── test_config.py      # pytest: config precedence, refusals, cwd independence
+│   ├── test_engine.py      # pytest: RBICEngine.ask() decision order, guard, errors
+│   ├── test_history.py     # pytest: host history sanitizing
+│   ├── test_identity.py    # pytest: identity providers, email index, fingerprint
 │   ├── test_salary_policy_evolution.py  # pytest: policy stages 0→1→2
 │   ├── test_master_policy.py   # pytest: master bot, hot reload, validation, undo
 │   ├── test_master_confirm.py  # pytest: master yes/no confirmation flow
@@ -105,7 +110,57 @@ rbic-chat --config-dir examples/demo bob    # hr_staff — try asking for salari
 rbic-master --config-dir examples/demo master  # master user: change policy by chatting
 ```
 
-### chatbot.py flow
+### RBICEngine.ask() flow (engine.py)
+`ask(identity, messages, *, conversation_id=None, audience=PRIVATE) ->
+AskResult(text, denied, reason, worker, role, reset)` is the single entry
+point for every chat host (`aask` = `asyncio.to_thread(ask)`; `reload()`
+returns the policy fingerprint). In order — every refusal is code text and
+happens before the LLM is called:
+1. **Audience**: anything but `Audience.PRIVATE` (including strings) →
+   `AUDIENCE_DENY_MESSAGE`, audit `AUDIENCE_DENY`.
+2. **One snapshot**: `gate.refreshed_snapshot()` is taken once for
+   identity, system prompt and fingerprint. Broken → `DENY_MESSAGE`,
+   reason `policy unavailable`, history ignored.
+3. **Identity**: the attribute provider (default `JsonAttributeProvider`:
+   casefolded email → the worker whose record has that `email`) resolves
+   against that snapshot's attributes. Unmapped, role-less, `master`, or a
+   `user:` role → `DENY_MESSAGE`, audit `IDENTITY_DENY` (provider, subject,
+   a sha256 prefix of the email — never the email).
+4. **History**: `sanitize_history()` keeps only plain-text user/assistant
+   turns (merged, truncated, ending with the user); empty → a fixed
+   "Please type a question." (not a deny).
+5. **Conversation guard** (in memory, bounded LRU of 10,000
+   `(worker, conversation_id)` entries → policy fingerprint + digests of
+   the replies `ask()` returned under it): no id / unknown conversation →
+   only the last user turn is sent; fingerprint changed → only the last
+   user turn, `reset=True`, reply prefixed with `POLICY_RESET_NOTICE`;
+   same fingerprint → the turns after the last assistant turn that is not
+   one of our own replies under this fingerprint (normally all of them),
+   so pre-change turns the host still holds are never resent.
+6. **System prompt** built here from the worker's role (`allowed_schema`,
+   `scoped_schema`) — never from the host.
+7. **Tool loop** on a private copy; every `run_sql` → `gate.authorize()`;
+   `AccessDenied` (or an unknown tool / malformed call) → `DENY_MESSAGE`,
+   reason = the gate's reason. Tool blocks never leave `ask()`.
+8. **Mid-turn change**: the snapshot is re-taken after the turn; a new
+   version/fingerprint (or a broken gate) discards the answer →
+   `POLICY_CHANGED_MESSAGE`, `reset=True`, guard entry dropped.
+9. **Errors**: any Anthropic error → `LLM_UNAVAILABLE_MESSAGE`, audit
+   `LLM_ERROR` (exception class only); anything else → same text,
+   `ENGINE_ERROR`.
+
+`AskResult.reason` is for host logs only — hosts must never display it.
+The engine executes on SQLite read-only and refuses to build if the
+dialect isn't `sqlite` or the database is missing; the Anthropic client is
+created lazily on the first LLM call. Library code never calls
+`print`/`input`/`sys.exit`/`logging.basicConfig`/`load_dotenv`; entry-point
+`main()`s load `.env`.
+
+### rbic-chat (CLI) flow
+- `run_chatbot` calls `engine.ask(Identity("local", username), history,
+  conversation_id=<per-session uuid>)` with `LocalProvider` (CLI only —
+  hosts serving web users must never use it), keeps a text-only history,
+  and prints `result.text`. Deny handling lives only in `ask()`.
 - The model gets a `run_sql` tool and a system prompt listing **only the
   tables/columns its role may read** (`allowed_schema()`), plus its scoped
   grants' column lists (`scoped_schema()`, flagged "row-limited", filter
@@ -114,12 +169,13 @@ rbic-master --config-dir examples/demo master  # master user: change policy by c
 - Every `run_sql` call goes through `gate.authorize()`; results are returned
   to the model as JSON (capped at `MAX_ROWS_TO_MODEL`).
 - The SQLite connection is opened **read-only** (`mode=ro`) — invariant #3.
-- On `AccessDenied`, the partial tool-use turn is rolled back from history and
-  `DENY_MESSAGE` is printed from code (invariant #4).
-- Each turn calls `refresh_session()` → `gate.refresh()`: the role is re-read
-  from `gate.attributes` and the system prompt rebuilt. If `policy_version`
-  changed, history is cleared and "(Access policy was updated — conversation
-  reset.)" is printed, so rows fetched under the old policy never linger.
+- On `AccessDenied`, the private tool-use turns are discarded and
+  `DENY_MESSAGE` is returned from code (invariant #4).
+- Each turn re-reads the policy (one snapshot) and rebuilds the system
+  prompt from the worker's current role. When the policy fingerprint
+  changed, earlier turns are dropped and the reply starts with "(Access
+  policy was updated — conversation reset.)", so rows fetched under the
+  old policy never linger; the CLI then trims its own history too.
 
 ### Hot reload (sql_gate.py)
 - `authorize()` starts with `_maybe_reload()`: stat (mtime_ns, size, inode)
@@ -348,7 +404,20 @@ in production).
 
 ### `worker_attributes.json`
 Demo stand-in for the IdP/HRIS. In production these attributes must come from
-the authenticated session, never from user input.
+the authenticated session, never from user input. `email` (optional per
+worker) is the identity key `JsonAttributeProvider` maps sign-ins by: it
+must be a plain ASCII address and unique after casefolding, or the load
+fails closed (everyone denied). The master bot can never change an email
+(`propose_set_attribute` refuses it, and no other path, undo included,
+may alter one) — it is owned by HR / the IdP.
+
+**Policy fingerprint**: `gate.fingerprint` / `PolicySnapshot.fingerprint`
+is a sha256 over the exact bytes of model.conf, policy.csv and
+worker_attributes.json that the snapshot was built from (each file is
+read once; the bytes parsed are the bytes hashed). Unlike
+`policy_version` it is stable across restarts and processes.
+`compile_row_filter` and `compile_snapshot` take `dialect` as a required
+keyword.
 
 ---
 
@@ -420,6 +489,24 @@ the authenticated session, never from user input.
     unknown user subject — denies everything (and clears worker history)
     until fixed. Policy writes are serialized by a file lock, verify all
     input hashes, and are audited before the file changes.
+11. **Identity comes only from the host's authenticated session.**
+    `ask()` resolves `Identity` (provider, subject, verified email) through
+    an `AttributeProvider` against the request's one snapshot; unmapped,
+    role-less, `master` and `user:`-role workers are denied with
+    `DENY_MESSAGE` before the LLM is called (audit `IDENTITY_DENY`).
+    Worker emails are validated and unique (else the load fails closed) and
+    can't be changed through the master bot. `LocalProvider` (subject =
+    worker key) is for the CLI and tests only.
+12. **Host history is untrusted text.** Only plain-text user/assistant
+    turns survive `sanitize_history`; the system prompt is always built
+    server-side; tool_use/tool_result blocks stay inside `ask()`; the
+    caller's message list is never mutated. Earlier turns are only sent
+    for a known conversation whose fingerprint is unchanged, and only after
+    the last assistant turn that isn't one of the engine's own replies
+    under that fingerprint.
+13. **Non-private audiences are denied.** Only `Audience.PRIVATE` is
+    answered; shared/unknown channels get `AUDIENCE_DENY_MESSAGE` from code
+    and the LLM is never called.
 
 ---
 
