@@ -9,9 +9,9 @@ import logging
 
 import pytest
 
-import master_bot
+from rbic import master as master_bot
 from test_master_policy import (  # noqa: F401 - fixtures
-    GRANT_CALL, SALARY_Q, FakeClient, end_turn, env, rows, seeded_db, sha,
+    GRANT_CALL, SALARY_Q, FakeClient, end_turn, env, rows, sha,
     tool_use,
 )
 

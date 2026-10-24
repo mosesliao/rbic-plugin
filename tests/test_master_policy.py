@@ -9,7 +9,6 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import sqlite3
 import threading
 from pathlib import Path
@@ -17,38 +16,24 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-import chatbot
-import master_bot
-import policy_admin
-import seed_db
-from policy_admin import CHANGES_HEADER, PolicyAdmin
-from sql_gate import (
+from rbic import admin as policy_admin
+from rbic import engine as chatbot
+from rbic import master as master_bot
+from rbic.admin import CHANGES_HEADER, PolicyAdmin
+from rbic.config import resolve_config
+from rbic.gate import (
     DENY_MESSAGE, STATIC_FILTER_WARNING, AccessDenied, FilterError, SQLGate,
     compile_row_filter,
 )
 
 logging.disable(logging.CRITICAL)
 
-ROOT = Path(__file__).parent
 SALARY_Q = "SELECT name, salary FROM employees"
 
 
-@pytest.fixture(scope="session")
-def seeded_db(tmp_path_factory):
-    db = tmp_path_factory.mktemp("seed") / "company.db"
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(seed_db, "DB_PATH", str(db))
-        seed_db.main()
-    return db
-
-
 @pytest.fixture
-def env(tmp_path, seeded_db):
-    (tmp_path / "casbin").mkdir()
-    for rel in ("casbin/model.conf", "casbin/policy.csv", "db_schema.json",
-                "worker_attributes.json"):
-        shutil.copy(ROOT / rel, tmp_path / rel)
-    shutil.copy(seeded_db, tmp_path / "company.db")
+def env(demo_dir):
+    tmp_path = demo_dir
     paths = NS(
         root=tmp_path,
         policy=tmp_path / "casbin" / "policy.csv",
@@ -389,7 +374,6 @@ def test_master_bot_has_no_apply_or_data_tool():
 # ---- 12. worker chatbot resets history on policy change ----------------------
 
 def test_chatbot_resets_history_on_policy_change(env, monkeypatch, capsys):
-    monkeypatch.setattr(chatbot, "DB_PATH", str(env.db))
     client = FakeClient([
         tool_use("run_sql", {"sql": "SELECT sku, qty FROM inventory"}),
         end_turn("You have PAL-4512, BOX-2210 and GLV-0031."),
@@ -406,6 +390,7 @@ def test_chatbot_resets_history_on_policy_change(env, monkeypatch, capsys):
                    lambda: revoke_then("and now?"),
                    lambda: "exit"])
     chatbot.run_chatbot("alice", client=client, gate=env.gate,
+                        config=resolve_config(env.root),
                         input_fn=lambda _: next(script)())
 
     first_turn = client.calls[1]["messages"]
@@ -494,8 +479,8 @@ def test_r1_shipped_filters_render_equivalently(env):
     "dept{dept} = 1",              # ... or into a name
     "dept = '__rbic_ph_dept__'",   # reserved sentinel text
 ])
-def test_r1_placeholder_must_stand_alone(template):
-    schema = json.loads((ROOT / "db_schema.json").read_text())
+def test_r1_placeholder_must_stand_alone(template, demo_template):
+    schema = json.loads((demo_template / "db_schema.json").read_text())
     with pytest.raises(FilterError):
         compile_row_filter("employees", template, schema)
 
@@ -781,10 +766,10 @@ def test_r7_gate_denies_instead_of_raising(env, sql):
 
 
 def test_r7_worker_chatbot_survives_tokenizer_error(env, monkeypatch, capsys):
-    monkeypatch.setattr(chatbot, "DB_PATH", str(env.db))
     client = FakeClient([tool_use("run_sql", {"sql": "SELECT 'abc FROM inventory"})])
     script = iter(["what's in stock?", "exit"])
     chatbot.run_chatbot("alice", client=client, gate=env.gate,
+                        config=resolve_config(env.root),
                         input_fn=lambda _: next(script))
     assert DENY_MESSAGE in capsys.readouterr().out
 

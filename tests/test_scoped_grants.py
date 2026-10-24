@@ -11,54 +11,39 @@ Run: pytest -q
 
 import json
 import logging
-import shutil
 import sqlite3
-from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
 
-import chatbot
-import master_bot
-import seed_db
-from policy_admin import CHANGES_HEADER, PolicyAdmin
-from sql_gate import AccessDenied, SQLGate, parse_scope_columns
+from rbic import engine as chatbot
+from rbic import master as master_bot
+from rbic.admin import CHANGES_HEADER, PolicyAdmin
+from rbic.gate import AccessDenied, SQLGate, parse_scope_columns
 
 logging.disable(logging.CRITICAL)
 
-ROOT = Path(__file__).parent
 SCOPED_LINE = "p2, warehouse_worker, employees, id = 2, id|name|salary"
 CAROL = [("Carol Lim", 112000)]
 
 
-@pytest.fixture(scope="session")
-def seeded_db(tmp_path_factory):
-    db = tmp_path_factory.mktemp("seed") / "company.db"
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(seed_db, "DB_PATH", str(db))
-        seed_db.main()
-    return db
-
-
-def base_policy_text() -> str:
+def base_policy_text(root) -> str:
     """The shipped policy.csv up to the master-chatbot changes block, so
     these tests do not depend on what has since been applied through the
     bot (e.g. the per-user rule that replaced SCOPED_LINE)."""
-    text = (ROOT / "casbin" / "policy.csv").read_text(encoding="utf-8")
+    text = (root / "casbin" / "policy.csv").read_text(encoding="utf-8")
     return text.split(CHANGES_HEADER)[0]
 
 
 @pytest.fixture
-def env(tmp_path, seeded_db):
+def env(demo_dir):
+    tmp_path = demo_dir
     """tmp copies of the shipped files; policy.csv = base policy + SCOPED_LINE."""
-    (tmp_path / "casbin").mkdir()
-    for rel in ("casbin/model.conf", "db_schema.json", "worker_attributes.json"):
-        shutil.copy(ROOT / rel, tmp_path / rel)
     (tmp_path / "casbin" / "policy.csv").write_text(
-        base_policy_text() + CHANGES_HEADER + "\n" + SCOPED_LINE + "\n",
+        base_policy_text(tmp_path) + CHANGES_HEADER + "\n" + SCOPED_LINE + "\n",
         encoding="utf-8", newline="\n")
-    shutil.copy(seeded_db, tmp_path / "company.db")
     paths = NS(
+        root=tmp_path,
         policy=tmp_path / "casbin" / "policy.csv",
         model=tmp_path / "casbin" / "model.conf",
         schema=tmp_path / "db_schema.json",
@@ -292,8 +277,8 @@ def test_malformed_scoped_grant_breaks_snapshot_until_fixed(env, line):
     assert not env.gate.broken
 
 
-def test_parse_scope_columns_keeps_order_and_rejects_junk():
-    schema = json.loads((ROOT / "db_schema.json").read_text())
+def test_parse_scope_columns_keeps_order_and_rejects_junk(demo_template):
+    schema = json.loads((demo_template / "db_schema.json").read_text())
     assert parse_scope_columns("employees", "salary|id", schema) == ("salary", "id")
     for bad in ("", "id,name", "id|", "|id", "id|Name"):
         with pytest.raises(Exception):

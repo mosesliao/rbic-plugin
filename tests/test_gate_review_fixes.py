@@ -16,49 +16,34 @@ Run: pytest -q
 
 import json
 import logging
-import shutil
 import sqlite3
-from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
 
-import seed_db
-from policy_admin import CHANGES_HEADER, PolicyAdmin
-from sql_gate import AccessDenied, SQLGate
+from rbic.admin import CHANGES_HEADER, PolicyAdmin
+from rbic.gate import AccessDenied, SQLGate
 
 logging.disable(logging.CRITICAL)
 
-ROOT = Path(__file__).parent
 WW_LINE = "p2, warehouse_worker, employees, id = '{employee_id}', id|name|salary"
 ALICE_LINE = "p2, user:alice, employees, id = 2, id|name|salary"
 DIALECTS = ("postgres", "sqlite")
 ENG_NAMES = [("Bob Tan",), ("Carol Lim",), ("Erin Ng",)]
 
 
-@pytest.fixture(scope="session")
-def seeded_db(tmp_path_factory):
-    db = tmp_path_factory.mktemp("seed") / "company.db"
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(seed_db, "DB_PATH", str(db))
-        seed_db.main()
-    return db
-
-
-def base_policy_text() -> str:
-    return (ROOT / "casbin" / "policy.csv").read_text(
+def base_policy_text(root) -> str:
+    return (root / "casbin" / "policy.csv").read_text(
         encoding="utf-8").split(CHANGES_HEADER)[0]
 
 
-def make_env(tmp_path, seeded_db, dialect):
-    (tmp_path / "casbin").mkdir()
-    for rel in ("casbin/model.conf", "db_schema.json", "worker_attributes.json"):
-        shutil.copy(ROOT / rel, tmp_path / rel)
+def make_env(tmp_path, dialect):
+    """tmp_path: a demo_dir copy; policy.csv = base policy + WW_LINE + ALICE_LINE."""
     (tmp_path / "casbin" / "policy.csv").write_text(
-        base_policy_text() + CHANGES_HEADER + "\n" + WW_LINE + "\n"
+        base_policy_text(tmp_path) + CHANGES_HEADER + "\n" + WW_LINE + "\n"
         + ALICE_LINE + "\n", encoding="utf-8", newline="\n")
-    shutil.copy(seeded_db, tmp_path / "company.db")
     paths = NS(
+        root=tmp_path,
         policy=tmp_path / "casbin" / "policy.csv",
         model=tmp_path / "casbin" / "model.conf",
         schema=tmp_path / "db_schema.json",
@@ -81,15 +66,15 @@ def make_env(tmp_path, seeded_db, dialect):
 
 
 @pytest.fixture(params=DIALECTS)
-def env(request, tmp_path, seeded_db):
+def env(request, demo_dir):
     """Gate under each dialect (authorize-only tests)."""
-    return make_env(tmp_path, seeded_db, request.param)
+    return make_env(demo_dir, request.param)
 
 
 @pytest.fixture
-def senv(tmp_path, seeded_db):
+def senv(demo_dir):
     """SQLite gate whose rewritten SQL is executed against the demo DB."""
-    return make_env(tmp_path, seeded_db, "sqlite")
+    return make_env(demo_dir, "sqlite")
 
 
 def rows(env, username, sql):
@@ -214,8 +199,8 @@ def test_ordinary_queries_still_pass(env, user, sql):
     assert env.gate.authorize(user, sql)
 
 
-def test_postgres_only_constructs_still_pass(tmp_path, seeded_db):
-    env = make_env(tmp_path, seeded_db, "postgres")
+def test_postgres_only_constructs_still_pass(demo_dir):
+    env = make_env(demo_dir, "postgres")
     for sql in ("SELECT EXTRACT(YEAR FROM start_date), start_date + INTERVAL '1 day' "
                 "FROM employees",
                 "SELECT name FROM employees e WHERE e.id = ANY(ARRAY[1, 2])",
