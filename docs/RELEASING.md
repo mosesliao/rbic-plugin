@@ -66,9 +66,11 @@ reviewer is the second gate.
    ```
 
 3. The `release` workflow runs:
-   - `build`: checks that the tag equals `v` + `rbic.__version__` (it stops
-     if they differ), runs the test suite, builds the sdist and wheel, and
-     uploads them as the `dist` artifact.
+   - `build`: checks that the tagged commit is on `origin/main` (a tag on
+     any other commit stops the release) and that the tag equals `v` +
+     `rbic.__version__` (it stops if they differ), runs the test suite,
+     builds the sdist and wheel with the pinned build tooling, and uploads
+     them as the `dist` artifact.
    - `publish-testpypi`: uploads to TestPyPI.
    - `publish-pypi`: waits for approval of the `pypi` environment, then
      uploads the same files to PyPI.
@@ -85,7 +87,32 @@ reviewer is the second gate.
 6. Bump `__version__` to the next `.dev0` (e.g. `0.1.1.dev0`) in a follow-up
    PR.
 
+## Pinned actions and build tooling
+
+`release.yml` (and `tests.yml`) pin every third-party action to a full
+commit SHA, with the tag it was taken from in a trailing comment
+(`actions/checkout@<sha> # v4`). The release job uses no pip cache, and the
+sdist/wheel are built in a fresh venv with exact versions from
+`BUILD_REQUIREMENTS` (`build`, `hatchling`) and `--no-isolation`, so a
+published artifact never depends on whatever is latest on PyPI that day.
+
+To update a pin, look up the commit the tag (or, for
+`pypa/gh-action-pypi-publish`, the `release/v1` branch) points to and
+replace SHA and comment together, e.g.:
+
+```bash
+gh api repos/actions/checkout/commits/v4 --jq .sha
+git ls-remote https://github.com/pypa/gh-action-pypi-publish refs/heads/release/v1
+```
+
+Bump `BUILD_REQUIREMENTS` deliberately (and check the wheel contents test
+still passes) rather than letting it float.
+
 ## If something goes wrong
+
+- **Tagged commit is not on main**: the tag points at a commit that isn't
+  reachable from `origin/main` (e.g. a feature branch). Delete the tag,
+  merge the change through a PR, and tag the merge commit on `main`.
 
 - **Tag/version mismatch**: delete the tag (`git push origin :refs/tags/vX.Y.Z`),
   fix `__version__` via a PR, and tag again.
