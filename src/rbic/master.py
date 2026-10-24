@@ -6,7 +6,7 @@ prints every proposed change (plain-English effect + unified diff of the
 real file) and applies it only if the human answers yes/y (case-insensitive;
 no/n declines, anything else re-asks, EOF/Ctrl-C declines).
 Validation, master protections and the atomic write all live in
-policy_admin.PolicyAdmin. This bot has no path to business data.
+rbic.admin.PolicyAdmin. This bot has no path to business data.
 """
 
 import json
@@ -16,7 +16,7 @@ import sys
 import anthropic
 from dotenv import load_dotenv
 
-from policy_admin import MASTER_ROLE, PolicyAdmin
+from .admin import MASTER_ROLE, PolicyAdmin
 
 MODEL = "claude-sonnet-4-6"
 MAX_TOOL_TURNS = 8

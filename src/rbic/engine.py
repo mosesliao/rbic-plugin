@@ -15,7 +15,7 @@ import sys
 import anthropic
 from dotenv import load_dotenv
 
-from sql_gate import DENY_MESSAGE, AccessDenied, SQLGate
+from .gate import DENY_MESSAGE, AccessDenied, SQLGate
 
 MODEL = "claude-sonnet-4-6"
 DB_PATH = "company.db"

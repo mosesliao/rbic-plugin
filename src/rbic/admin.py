@@ -4,11 +4,11 @@ Every change is a two-step affair: a propose_* method validates the
 request and returns a Change (the exact before/after file text) without
 touching disk; apply() writes it only if the file is still exactly what
 the proposal was computed against. The LLM never calls apply() — the
-human confirms each Change in code (see master_bot.py).
+human confirms each Change in code (see rbic.master).
 
 Rules are held by a ROLE (a group) or by one USER (subject "user:<name>",
 which overrides the role: user deny > user allow > role deny > role
-allow, see sql_gate). Allow rules: p (columns), p2 (rows / scoped
+allow, see rbic.gate). Allow rules: p (columns), p2 (rows / scoped
 grants); deny rules: p3 (columns), p4 (rows). "g, user:<name>, <role>"
 gives a user an extra role on top of their own.
 
@@ -50,7 +50,7 @@ from typing import Optional
 import casbin
 from casbin.persist.adapter import load_policy_line
 
-from sql_gate import (
+from .gate import (
     PTYPE_ALLOW_COLUMNS, PTYPE_ALLOW_ROWS, PTYPE_DENY_COLUMNS, PTYPE_DENY_ROWS,
     SCOPE_COLUMN_SEP, STATIC_FILTER_WARNING, USER_PREFIX, FilterError,
     MissingAttribute, PolicySnapshot, bind_row_filter, compile_row_filter,
@@ -601,7 +601,7 @@ class PolicyAdmin:
         Uses the gate's own compiler (so anything accepted here also loads
         in the gate), once per supported dialect. Strict rules: printable
         ASCII only, no SQL comments, a boolean combination of
-        column-vs-value predicates, no tautologies (see sql_gate).
+        column-vs-value predicates, no tautologies (see rbic.gate).
         """
         if not isinstance(template, str) or not template.strip():
             raise ValueError("Filter template must be a non-empty string.")
