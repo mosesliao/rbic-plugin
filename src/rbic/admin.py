@@ -4,11 +4,11 @@ Every change is a two-step affair: a propose_* method validates the
 request and returns a Change (the exact before/after file text) without
 touching disk; apply() writes it only if the file is still exactly what
 the proposal was computed against. The LLM never calls apply() — the
-human confirms each Change in code (see master_bot.py).
+human confirms each Change in code (see rbic.master).
 
 Rules are held by a ROLE (a group) or by one USER (subject "user:<name>",
 which overrides the role: user deny > user allow > role deny > role
-allow, see sql_gate). Allow rules: p (columns), p2 (rows / scoped
+allow, see rbic.gate). Allow rules: p (columns), p2 (rows / scoped
 grants); deny rules: p3 (columns), p4 (rows). "g, user:<name>, <role>"
 gives a user an extra role on top of their own.
 
@@ -23,7 +23,11 @@ Fail-closed rules:
   SQL comments, or a non-predicate / always-true shape      -> reject
 - ANY input file (policy, attributes, schema, model)
   changed since the proposal                                -> reject
-- resulting policy.csv doesn't load in the SQL gate         -> reject
+- the resulting files (policy.csv + worker_attributes.json)
+  don't load with the SQL gate's own loader (gate.load_snapshot:
+  bytes-based Casbin load, lone CR / unknown ptype refusal,
+  compile_snapshot, email and user-subject checks), checked for
+  every proposal and again under the lock in apply()          -> reject
 
 apply() is serialized across processes with a lock file next to
 policy.csv, and the changelog record ("applying") is written BEFORE the
@@ -37,7 +41,6 @@ import difflib
 import functools
 import hashlib
 import json
-import logging
 import os
 import re
 import tempfile
@@ -50,15 +53,16 @@ from typing import Optional
 import casbin
 from casbin.persist.adapter import load_policy_line
 
-from sql_gate import (
+from .audit import logger
+from .config import EngineConfig
+from .gate import (
     PTYPE_ALLOW_COLUMNS, PTYPE_ALLOW_ROWS, PTYPE_DENY_COLUMNS, PTYPE_DENY_ROWS,
     SCOPE_COLUMN_SEP, STATIC_FILTER_WARNING, USER_PREFIX, FilterError,
     MissingAttribute, PolicySnapshot, bind_row_filter, compile_row_filter,
-    compile_snapshot, is_user_subject, parse_scope_columns, subjects_for,
-    user_subject,
+    compile_snapshot, is_user_subject, load_enforcer, load_snapshot,
+    parse_scope_columns, subjects_for, user_subject,
 )
 
-logger = logging.getLogger("rbic.audit")
 
 MASTER_ROLE = "master"
 CHANGES_HEADER = "# ---- Changes via master chatbot ----"
@@ -78,7 +82,17 @@ INT_RE = re.compile(r"[0-9]{1,18}\Z", re.ASCII)
 INT_LIST_RE = re.compile(r"[0-9]{1,18}(\s*,\s*[0-9]{1,18})*\Z", re.ASCII)
 
 STALE_MESSAGE = "Policy changed since this was proposed — please ask again"
+# Attributes that identify WHO a worker is (hosts map a signed-in user to a
+# worker by them). Owned by HR / the identity provider: no admin path may
+# change them, or a master could take over another worker's identity.
+IDENTITY_ATTRIBUTES = ("email",)
+IDENTITY_ATTRIBUTE_MESSAGE = (
+    "The {key} attribute is identity-critical (it decides which signed-in "
+    "person is this worker) and is owned by HR / the identity provider; it "
+    "cannot be changed through the chatbot.")
+_ABSENT = object()
 LOCK_NAME = ".policy.lock"
+CHANGELOG_FILE = "policy_changes.jsonl"
 LOCK_TIMEOUT_S = 10.0
 FILTER_DIALECTS = ("postgres", "sqlite")
 COLUMN_PTYPES = (PTYPE_ALLOW_COLUMNS, PTYPE_DENY_COLUMNS)
@@ -131,6 +145,11 @@ def _read(path: str) -> str:
         return f.read()
 
 
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def _newline(text: str) -> str:
     return "\r\n" if "\r\n" in text else "\n"
 
@@ -156,6 +175,9 @@ def _proposal(method):
     def wrapper(self, *args, **kwargs):
         before = self._input_hashes()
         change = method(self, *args, **kwargs)
+        # Whatever the method checked, the files it would produce must
+        # load in the gate exactly as the gate loads them.
+        self._check_gate_loads(change)
         if self._input_hashes() != before:
             raise ValueError(STALE_MESSAGE + ".")
         change.input_hashes = before
@@ -199,17 +221,28 @@ def _cols(text) -> list:
 class PolicyAdmin:
     def __init__(
         self,
-        policy_path: str = "casbin/policy.csv",
-        attributes_path: str = "worker_attributes.json",
-        schema_path: str = "db_schema.json",
-        model_path: str = "casbin/model.conf",
-        changelog_path: str = "policy_changes.jsonl",
+        policy_path,
+        attributes_path,
+        schema_path,
+        model_path,
+        changelog_path,
     ):
-        self.policy_path = policy_path
-        self.attributes_path = attributes_path
-        self.schema_path = schema_path
-        self.model_path = model_path
-        self.changelog_path = changelog_path
+        # No default paths: nothing depends on the current directory.
+        self.policy_path = os.fspath(policy_path)
+        self.attributes_path = os.fspath(attributes_path)
+        self.schema_path = os.fspath(schema_path)
+        self.model_path = os.fspath(model_path)
+        self.changelog_path = os.fspath(changelog_path)
+
+    @classmethod
+    def from_config(cls, cfg: EngineConfig,
+                    changelog_path=None) -> "PolicyAdmin":
+        """Admin over an EngineConfig's files; the changelog defaults to
+        <config_dir>/policy_changes.jsonl."""
+        if changelog_path is None:
+            changelog_path = cfg.config_dir / CHANGELOG_FILE
+        return cls(cfg.policy_path, cfg.attributes_path, cfg.schema_path,
+                   cfg.model_path, changelog_path)
 
     # ------------------------------------------------------------------
     # state loading
@@ -264,15 +297,36 @@ class PolicyAdmin:
             os.remove(path)
 
     def _enforcer(self, policy_text: Optional[str] = None) -> casbin.Enforcer:
-        if policy_text is None:
-            return casbin.Enforcer(self.model_path, self.policy_path)
-        fd, tmp = tempfile.mkstemp(suffix=".csv")
+        """Casbin enforcer over policy.csv (or `policy_text`), loaded from
+        bytes exactly as the gate loads it."""
+        policy = (_read_bytes(self.policy_path) if policy_text is None
+                  else policy_text.encode("utf-8"))
+        return load_enforcer(_read_bytes(self.model_path), policy)
+
+    def _after_state(self, change: "Change") -> tuple:
+        """(policy bytes, attributes bytes) once `change` is applied; the
+        file it doesn't touch is read from disk."""
+        after = change.after_text.encode("utf-8")
+        target = self._managed_path(change.target)
+        if target == self.policy_path:
+            return after, _read_bytes(self.attributes_path)
+        return _read_bytes(self.policy_path), after
+
+    def _check_gate_loads(self, change: "Change") -> None:
+        """Refuse a change whose resulting files the SQL gate would refuse
+        to load (the gate would then deny everyone): the same
+        gate.load_snapshot the gate runs on every reload, in every
+        supported dialect."""
+        policy, attributes = self._after_state(change)
+        model = _read_bytes(self.model_path)
+        schema = _read_bytes(self.schema_path)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                f.write(policy_text)
-            return casbin.Enforcer(self.model_path, tmp)
-        finally:
-            os.remove(tmp)
+            for dialect in FILTER_DIALECTS:
+                load_snapshot(model, policy, attributes, schema,
+                              dialect=dialect)
+        except Exception as err:  # noqa: BLE001 - anything the gate refuses
+            raise ValueError(f"The resulting policy would not load in the SQL "
+                             f"gate: {type(err).__name__}: {err}") from None
 
     def _snapshot(self, e: casbin.Enforcer, attrs=None, schema=None,
                   what="The current policy.csv") -> PolicySnapshot:
@@ -282,7 +336,7 @@ class PolicyAdmin:
         schema = self.schema() if schema is None else schema
         try:
             for dialect in FILTER_DIALECTS:
-                snap = compile_snapshot(0, e, attrs, schema, dialect)
+                snap = compile_snapshot(0, e, attrs, schema, dialect=dialect)
         except ValueError as err:
             raise ValueError(f"{what} would not load in the SQL gate: "
                              f"{err}") from None
@@ -601,14 +655,14 @@ class PolicyAdmin:
         Uses the gate's own compiler (so anything accepted here also loads
         in the gate), once per supported dialect. Strict rules: printable
         ASCII only, no SQL comments, a boolean combination of
-        column-vs-value predicates, no tautologies (see sql_gate).
+        column-vs-value predicates, no tautologies (see rbic.gate).
         """
         if not isinstance(template, str) or not template.strip():
             raise ValueError("Filter template must be a non-empty string.")
         template = template.strip()
         for dialect in FILTER_DIALECTS:
-            compiled = compile_row_filter(table, template, schema, dialect,
-                                          strict=True)
+            compiled = compile_row_filter(table, template, schema,
+                                          dialect=dialect, strict=True)
         return template, compiled
 
     @staticmethod
@@ -660,7 +714,8 @@ class PolicyAdmin:
         for table, t in templates:
             for dialect in FILTER_DIALECTS:
                 try:
-                    rf = compile_row_filter(table, t, schema, dialect)
+                    rf = compile_row_filter(table, t, schema,
+                                            dialect=dialect)
                     bind_row_filter(rf, record, table)
                 except MissingAttribute:
                     break  # the gate denies these queries outright
@@ -1455,13 +1510,26 @@ class PolicyAdmin:
         changed = sorted(u for u in set(before) | set(after)
                          if before.get(u) != after.get(u))
         for user in changed:
+            old_record = before.get(user)
             record = after.get(user)
+            # Identity attributes never change here, in either direction
+            # (forward change or undo of an older changelog entry).
+            for key in IDENTITY_ATTRIBUTES:
+                old_value = (old_record.get(key, _ABSENT)
+                             if isinstance(old_record, dict) else _ABSENT)
+                new_value = (record.get(key, _ABSENT)
+                             if isinstance(record, dict) else _ABSENT)
+                if old_value != new_value:
+                    raise ValueError(f"{user}: "
+                                     + IDENTITY_ATTRIBUTE_MESSAGE.format(key=key))
             if record is None:
                 continue
             if not USER_RE.fullmatch(user) or not isinstance(record, dict):
                 raise ValueError(f"Invalid user record {user!r}.")
             for key, value in record.items():
-                if key == "role":
+                # role is checked by assign_role; identity attributes are
+                # unchanged (above) and validated by the gate's loader.
+                if key == "role" or key in IDENTITY_ATTRIBUTES:
                     continue
                 if not ATTR_KEY_RE.fullmatch(key):
                     raise ValueError(f"Invalid attribute name {user}.{key!r}.")
@@ -1517,6 +1585,8 @@ class PolicyAdmin:
                              "letters, digits, underscores.")
         if key == "role":
             raise ValueError("Use assign_role to change a user's role.")
+        if key in IDENTITY_ATTRIBUTES:
+            raise ValueError(IDENTITY_ATTRIBUTE_MESSAGE.format(key=key))
         if isinstance(value, bool) or not isinstance(value, (str, int)):
             raise ValueError("Attribute value must be a string or integer.")
         if isinstance(value, str) and not ATTR_VALUE_RE.fullmatch(value):
@@ -1620,9 +1690,13 @@ class PolicyAdmin:
                 f.write(change.after_text)
                 f.flush()
                 os.fsync(f.fileno())
+            # Same loader as the gate, over the exact bytes about to go
+            # live (the input-hash check above pinned every other file).
+            self._check_gate_loads(change)
             if target == self.policy_path:
                 self._check_no_master_in_policy(
-                    casbin.Enforcer(self.model_path, tmp))
+                    load_enforcer(_read_bytes(self.model_path),
+                                  change.after_text.encode("utf-8")))
             else:
                 self._check_master_intact(attrs, json.loads(change.after_text))
             # The audit record goes down BEFORE the file changes, so a live

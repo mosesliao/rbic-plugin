@@ -9,9 +9,10 @@ import logging
 
 import pytest
 
-import master_bot
+from rbic.cli import master as master_cli
+from rbic import master as master_bot
 from test_master_policy import (  # noqa: F401 - fixtures
-    GRANT_CALL, SALARY_Q, FakeClient, end_turn, env, rows, seeded_db, sha,
+    GRANT_CALL, SALARY_Q, FakeClient, end_turn, env, rows, sha,
     tool_use,
 )
 
@@ -142,7 +143,7 @@ def test_full_bot_yes_capitalised_applies(env):
                          end_turn("Proposed.")])
     inputs = iter(["let hr_staff see salaries", "yes please", "Yes", "exit"])
     out = []
-    master_bot.run_master_bot("master", client=client,
+    master_cli.run_master_bot("master", client=client,
                               input_fn=lambda _: next(inputs),
                               output=out.append, admin=env.admin)
     assert applied(env)
