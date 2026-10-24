@@ -7,18 +7,16 @@ real file) and applies it only if the human answers yes/y (case-insensitive;
 no/n declines, anything else re-asks, EOF/Ctrl-C declines).
 Validation, master protections and the atomic write all live in
 rbic.admin.PolicyAdmin. This bot has no path to business data.
+
+This module is I/O-free: the confirm flow takes input/output callables
+and the interactive loop lives in rbic.cli.master.
 """
 
-import argparse
 import json
-import logging
-import sys
-
-import anthropic
-from dotenv import load_dotenv
 
 from .admin import MASTER_ROLE, PolicyAdmin
-from .config import DEFAULT_MODEL, ConfigError, EngineConfig, resolve_config
+from .audit import logger as audit
+from .config import DEFAULT_MODEL
 
 MODEL = DEFAULT_MODEL
 MAX_TOOL_TURNS = 8
@@ -33,7 +31,6 @@ CONFIRM_RULE = (
     "  chat, explain that you cannot apply changes yourself and offer to\n"
     "  re-propose it so they can answer yes at the prompt.")
 
-audit = logging.getLogger("rbic.audit")
 
 
 def _tool(name, description, optional=(), **props):
@@ -362,64 +359,15 @@ def confirm_pending(admin, username, pending, history, input_fn, output):
         pending.clear()
 
 
+class NotMasterError(PermissionError):
+    """The user may not use the master chatbot (not a master user)."""
+
+
 def require_master(admin: PolicyAdmin, username: str) -> None:
+    """Raise NotMasterError unless `username` is a master user. Checked
+    before the session starts and again before every turn."""
     record = admin.attributes().get(username)
-    if record is None or record.get("role") != MASTER_ROLE:
-        sys.exit(f"{username!r} is not a master user; the master chatbot "
-                 "is restricted to users with role 'master'.")
-
-
-def run_master_bot(username, client=None, input_fn=input, output=print,
-                   admin=None, *, config: EngineConfig | None = None):
-    if admin is None:
-        if config is None:
-            raise ConfigError("run_master_bot needs a PolicyAdmin or an EngineConfig.")
-        admin = PolicyAdmin.from_config(config)
-    model = config.model if config is not None else MODEL
-    require_master(admin, username)
-    client = client or anthropic.Anthropic()
-    history, pending = [], {}
-
-    output(f"\n=== Master Chatbot | user: {username} ===")
-    output("Ask about or change access policy. Type 'exit' to quit.\n")
-
-    while True:
-        try:
-            user_input = input_fn("You: ").strip()
-        except EOFError:
-            break
-        if user_input.lower() == "exit":
-            break
-        if not user_input:
-            continue
-        require_master(admin, username)
-
-        add_user_text(history, user_input)
-        reply = complete_turn(client, admin, username, build_system_prompt(admin),
-                              history, pending, model)
-        output(f"\nMaster: {reply}\n")
-        confirm_pending(admin, username, pending, history, input_fn, output)
-
-
-def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(
-        prog="rbic-master",
-        description="Change access policy by chatting; every change needs "
-                    "your yes/no.")
-    parser.add_argument("username", help="master username (worker_attributes.json)")
-    parser.add_argument("--config-dir",
-                        help="policy/config directory (default: $RBIC_CONFIG_DIR)")
-    parser.add_argument("--model", help=f"LLM model (default: $RBIC_MODEL or {MODEL})")
-    args = parser.parse_args(argv)
-    try:
-        cfg = resolve_config(args.config_dir, model=args.model)
-    except ConfigError as err:
-        parser.error(str(err))
-    load_dotenv()
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    logging.getLogger("casbin").setLevel(logging.WARNING)  # every proposal loads policy
-    run_master_bot(args.username, config=cfg)
-
-
-if __name__ == "__main__":
-    main()
+    if not isinstance(record, dict) or record.get("role") != MASTER_ROLE:
+        raise NotMasterError(
+            f"{username!r} is not a master user; the master chatbot is "
+            "restricted to users with role 'master'.")

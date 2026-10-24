@@ -16,11 +16,14 @@ from types import SimpleNamespace as NS
 
 import pytest
 
+from rbic.cli import master as master_cli
+from rbic.cli import chat as chat_cli
 from rbic import admin as policy_admin
 from rbic import engine as chatbot
 from rbic import master as master_bot
 from rbic.admin import CHANGES_HEADER, PolicyAdmin
 from rbic.config import resolve_config
+from rbic.identity import LocalProvider
 from rbic.gate import (
     DENY_MESSAGE, STATIC_FILTER_WARNING, AccessDenied, FilterError, SQLGate,
     compile_row_filter,
@@ -319,7 +322,7 @@ def test_master_bot_decline_then_apply(env):
     ])
     inputs = iter(["let hr_staff see salaries", "no", "ok", "exit"])
     out = []
-    master_bot.run_master_bot("master", client=client,
+    master_cli.run_master_bot("master", client=client,
                               input_fn=lambda _: next(inputs),
                               output=out.append, admin=env.admin)
     assert sha(env.policy) == original
@@ -332,7 +335,7 @@ def test_master_bot_decline_then_apply(env):
 
     client = FakeClient([tool_use("propose_grant", GRANT_CALL), end_turn("Done?")])
     inputs = iter(["let hr_staff see salaries", "yes", "exit"])
-    master_bot.run_master_bot("master", client=client,
+    master_cli.run_master_bot("master", client=client,
                               input_fn=lambda _: next(inputs),
                               output=out.append, admin=env.admin)
     assert "p, hr_staff, employees.salary, read" in env.policy.read_text(
@@ -347,7 +350,7 @@ def test_master_bot_validation_error_goes_to_model(env):
         end_turn("That is not allowed."),
     ])
     inputs = iter(["make bob a master", "exit"])
-    master_bot.run_master_bot("master", client=client,
+    master_cli.run_master_bot("master", client=client,
                               input_fn=lambda _: next(inputs),
                               output=lambda *_: None, admin=env.admin)
     result = client.calls[1]["messages"][-1]["content"][0]
@@ -359,7 +362,7 @@ def test_master_bot_validation_error_goes_to_model(env):
 @pytest.mark.parametrize("user", ["bob", "nobody"])
 def test_master_bot_refuses_non_master(env, user):
     with pytest.raises(SystemExit) as exc:
-        master_bot.run_master_bot(user, client=FakeClient([]),
+        master_cli.run_master_bot(user, client=FakeClient([]),
                                   input_fn=lambda _: "exit",
                                   output=lambda *_: None, admin=env.admin)
     assert exc.value.code not in (0, None)
@@ -389,7 +392,7 @@ def test_chatbot_resets_history_on_policy_change(env, monkeypatch, capsys):
     script = iter([lambda: "what's in stock?",
                    lambda: revoke_then("and now?"),
                    lambda: "exit"])
-    chatbot.run_chatbot("alice", client=client, gate=env.gate,
+    chat_cli.run_chatbot("alice", client=client, gate=env.gate,
                         config=resolve_config(env.root),
                         input_fn=lambda _: next(script)())
 
@@ -766,7 +769,7 @@ def test_r7_gate_denies_instead_of_raising(env, sql):
 def test_r7_worker_chatbot_survives_tokenizer_error(env, monkeypatch, capsys):
     client = FakeClient([tool_use("run_sql", {"sql": "SELECT 'abc FROM inventory"})])
     script = iter(["what's in stock?", "exit"])
-    chatbot.run_chatbot("alice", client=client, gate=env.gate,
+    chat_cli.run_chatbot("alice", client=client, gate=env.gate,
                         config=resolve_config(env.root),
                         input_fn=lambda _: next(script))
     assert DENY_MESSAGE in capsys.readouterr().out
@@ -791,7 +794,7 @@ def test_r8_broken_gate_ignores_worker_history(env):
     client = FakeClient([])
     engine = chatbot.RBICEngine(resolve_config(env.root), gate=env.gate,
                                 client=client,
-                                attribute_provider=chatbot.LocalProvider())
+                                attribute_provider=LocalProvider())
     history = [{"role": "user", "content": "hi"},
                {"role": "assistant", "content": "rows..."},
                {"role": "user", "content": "and?"}]

@@ -12,16 +12,12 @@ asking (Identity), but the chat history it sends is untrusted text (see
 rbic.history), and the system prompt is always built here.
 """
 
-import argparse
 import asyncio
 import hashlib
 import json
-import logging
 import os
 import sqlite3
-import sys
 import threading
-import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import Enum
@@ -29,6 +25,8 @@ from typing import Optional
 
 import anthropic
 
+from . import audit
+from .audit import logger
 from .config import DEFAULT_MODEL, ConfigError, EngineConfig, resolve_config
 from .gate import (
     DENY_MESSAGE, MASTER_ROLE, AccessDenied, PolicySnapshot, SQLGate,
@@ -36,9 +34,7 @@ from .gate import (
 )
 from .history import (DEFAULT_MAX_CHARS, DEFAULT_MAX_MESSAGES, normalize_turn,
                       sanitize_history)
-from .identity import Identity, JsonAttributeProvider, LocalProvider
-
-logger = logging.getLogger("rbic.audit")
+from .identity import Identity, JsonAttributeProvider
 
 MODEL = DEFAULT_MODEL
 EXECUTOR_DIALECT = "sqlite"
@@ -331,6 +327,10 @@ class RBICEngine:
     instance across threads. Building it, reload() and identity/audience
     denials never need an API key: the Anthropic client is created on the
     first LLM call (unless `client` is injected).
+
+    Hosts must keep the audit trail: call rbic.audit.configure(path) (or
+    attach a handler to "rbic.audit") before building the engine, or it
+    warns once (AuditNotConfiguredWarning) and audit records are lost.
     """
 
     def __init__(self, config: EngineConfig, *, gate: Optional[SQLGate] = None,
@@ -356,6 +356,7 @@ class RBICEngine:
         self._api_key = api_key
         self._client_lock = threading.Lock()
         self._guard = _ConversationGuard()
+        audit.warn_if_unconfigured()
 
     @classmethod
     def from_config_dir(cls, config_dir=None, *, db_path=None, model=None,
@@ -536,64 +537,3 @@ class RBICEngine:
                 self._client = (anthropic.Anthropic(api_key=self._api_key)
                                 if self._api_key else anthropic.Anthropic())
             return self._client
-
-
-# ---------------------------------------------------------------------------
-# CLI (moves to rbic.cli in a later step)
-# ---------------------------------------------------------------------------
-
-def run_chatbot(username: str, client=None, gate=None, input_fn=input,
-                output=print, *, config: EngineConfig):
-    """Local terminal chat as `username` (LocalProvider: CLI only)."""
-    engine = RBICEngine(config, gate=gate, client=client,
-                        attribute_provider=LocalProvider())
-    record = engine.gate.attributes.get(username)
-    if not isinstance(record, dict):
-        sys.exit(f"Unknown worker {username!r} — add them to worker_attributes.json")
-    identity = Identity("local", username)
-    conversation_id = uuid.uuid4().hex
-    history = []  # text only: what the user typed and what was shown
-
-    output(f"\n=== Worker Chatbot | user: {username} | role: {record.get('role')} ===")
-    output("Type 'exit' to quit.\n")
-
-    while True:
-        try:
-            user_input = input_fn("You: ").strip()
-        except EOFError:
-            break
-        if user_input.lower() == "exit":
-            break
-        if not user_input:
-            continue
-
-        history.append({"role": "user", "content": user_input})
-        result = engine.ask(identity, history, conversation_id=conversation_id)
-        if result.reset:
-            del history[:-1]  # earlier turns belong to the old policy
-        history.append({"role": "assistant", "content": result.text})
-        output(f"\nAssistant: {result.text}\n")
-
-
-def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(
-        prog="rbic-chat", description="Chat with company data as a worker.")
-    parser.add_argument("username", help="worker username (worker_attributes.json)")
-    parser.add_argument("--config-dir",
-                        help="policy/config directory (default: $RBIC_CONFIG_DIR)")
-    parser.add_argument("--db", help="SQLite database (default: $RBIC_DB_PATH "
-                                     "or <config-dir>/company.db)")
-    parser.add_argument("--model", help=f"LLM model (default: $RBIC_MODEL or {MODEL})")
-    args = parser.parse_args(argv)
-    from dotenv import load_dotenv  # entry point only: never in library code
-    load_dotenv()
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    try:
-        cfg = resolve_config(args.config_dir, db_path=args.db, model=args.model)
-        run_chatbot(args.username, config=cfg)
-    except ConfigError as err:
-        parser.error(str(err))
-
-
-if __name__ == "__main__":
-    main()

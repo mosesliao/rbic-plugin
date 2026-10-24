@@ -6,11 +6,8 @@ alice (site SG-01) must never see SG-02 rows, bob/carol (engineering)
 must never see logistics HR rows, dave (logistics) only logistics expenses.
 """
 
-import argparse
 import os
 import sqlite3
-
-from ..config import ConfigError, resolve_config
 
 DDL = """
 CREATE TABLE inventory (
@@ -127,26 +124,3 @@ def seed(db_path) -> int:
     conn.commit()
     conn.close()
     return sum(len(r) for r in DATA.values())
-
-
-def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(
-        prog="rbic-seed", description="Create and seed the demo SQLite database.")
-    parser.add_argument("--db", help="database file to (re)create")
-    parser.add_argument("--config-dir",
-                        help="config directory whose db path to use when --db "
-                             "is omitted (default: $RBIC_CONFIG_DIR)")
-    args = parser.parse_args(argv)
-    if args.db:
-        db_path = os.path.abspath(args.db)
-    else:
-        try:
-            db_path = os.fspath(resolve_config(args.config_dir).db_path)
-        except ConfigError as err:
-            parser.error(f"pass --db PATH or a config directory. {err}")
-    count = seed(db_path)
-    print(f"Seeded {db_path} with {count} rows across {len(DATA)} tables.")
-
-
-if __name__ == "__main__":
-    main()

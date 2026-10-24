@@ -4,7 +4,7 @@
     python scripts/demo/drive.py alice  <sync_dir>   # bottom pane
 
 Runs the REAL bot (`rbic-master master` / `rbic-chat alice`, as
-`python -m rbic.master|rbic.engine --config-dir examples/demo`) as a child
+`python -m rbic.cli.master|rbic.cli.chat --config-dir examples/demo`) as a child
 process, streams its output to this console unchanged, waits for the bot's
 own input prompts ("You: ", "Apply change <id>? [yes/no]: "), then "types"
 each scripted line so it is visible, and sends it to the bot's stdin.
@@ -200,7 +200,7 @@ def master_turn(bot, sync, pos, request, expected_diff_line):
 
 
 def run_master(sync):
-    bot = Bot(["-m", "rbic.master", "--config-dir", CONFIG_DIR, "master"],
+    bot = Bot(["-m", "rbic.cli.master", "--config-dir", CONFIG_DIR, "master"],
               show_audit=False)
     _, pos = bot.wait_prompt(0, r"You: ", sync)
     wait_marker(sync, "go")
@@ -222,7 +222,7 @@ def alice_turn(bot, sync, pos):
 
 
 def run_alice(sync):
-    bot = Bot(["-m", "rbic.engine", "--config-dir", CONFIG_DIR, "alice"],
+    bot = Bot(["-m", "rbic.cli.chat", "--config-dir", CONFIG_DIR, "alice"],
               show_audit=True)
     _, pos = bot.wait_prompt(0, r"You: ", sync)
     wait_marker(sync, "go")

@@ -78,11 +78,9 @@ swaps it in under a lock; authorize() takes the snapshot once and every
 stage of that request uses only it.
 """
 
-import argparse
 import hashlib
 import io
 import json
-import logging
 import os
 import re
 import string
@@ -99,9 +97,8 @@ from sqlglot import exp
 from sqlglot.errors import SqlglotError
 from sqlglot.optimizer.qualify import qualify
 
-from .config import ConfigError, EngineConfig, resolve_config
-
-logger = logging.getLogger("rbic.audit")
+from .audit import logger
+from .config import EngineConfig
 
 DENY_MESSAGE = "You have no access to this information, please approach your manager."
 READ = "read"
@@ -1521,58 +1518,3 @@ class SQLGate:
     def _deny(username: str, sql: str, reason: str) -> NoReturn:
         logger.warning("DENY user=%s reason=%s sql=%r", username, reason, sql)
         raise AccessDenied(reason)
-
-
-def demo(gate: "SQLGate") -> None:
-    """Print the gate's decision for a fixed set of demo queries."""
-    demos = [
-        # (user, LLM-generated SQL)
-        ("alice", "SELECT sku, qty FROM inventory WHERE qty < 10"),
-        ("alice", "SELECT * FROM inventory"),
-        ("bob", "SELECT name, dept FROM employees"),
-        ("bob", "SELECT name, salary FROM employees"),      # salary -> deny
-        ("bob", "SELECT * FROM employees"),                 # * expands to salary -> deny
-        ("carol", "SELECT name, salary FROM employees"),    # hr_manager inherits + salary
-        ("dave", "SELECT vendor, amount FROM invoices"),
-        ("dave", "SELECT name FROM employees"),             # finance can't read HR -> deny
-        ("alice", "DROP TABLE inventory"),                  # not a SELECT -> deny
-        ("alice", "SELECT secret FROM classified"),         # unknown table -> deny
-        # personal scoped grant (p2, user:alice, employees, id = 2, id|name|salary):
-        # alice alone reads Carol's name+salary (plus her own row via her role)
-        ("alice", "SELECT name, salary FROM employees WHERE name LIKE '%Carol%'"),
-        ("alice", "SELECT name, dept FROM employees"),      # dept not in scope -> deny
-        ("alice", "SELECT * FROM employees"),               # star beyond scope -> deny
-        # whole-row reference (Postgres) is not a Column -> unsupported -> deny
-        ("bob", "SELECT name FROM employees e WHERE (e).salary > 100000"),
-        # a column-less query still needs a grant on the table -> deny
-        ("dave", "SELECT COUNT(*) FROM employees"),
-    ]
-    for user, sql in demos:
-        print(f"{user}: {sql}")
-        try:
-            print(f"  -> ALLOW: {gate.authorize(user, sql)}\n")
-        except AccessDenied as e:
-            print(f"  -> DENY ({e})")
-            print(f"     bot says: {DENY_MESSAGE}\n")
-
-
-def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(
-        prog="rbic-gate-demo",
-        description="Run the SQL gate over a fixed set of demo queries "
-                    "(no API key needed).")
-    parser.add_argument("--config-dir",
-                        help="policy/config directory (default: $RBIC_CONFIG_DIR)")
-    parser.add_argument("--dialect",
-                        help="SQL dialect (default: $RBIC_DIALECT or sqlite)")
-    args = parser.parse_args(argv)
-    try:
-        cfg = resolve_config(args.config_dir, dialect=args.dialect)
-    except ConfigError as err:
-        parser.error(str(err))
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    demo(SQLGate.from_config(cfg))
-
-
-if __name__ == "__main__":
-    main()

@@ -37,7 +37,6 @@ import difflib
 import functools
 import hashlib
 import json
-import logging
 import os
 import re
 import tempfile
@@ -50,6 +49,7 @@ from typing import Optional
 import casbin
 from casbin.persist.adapter import load_policy_line
 
+from .audit import logger
 from .config import EngineConfig
 from .gate import (
     PTYPE_ALLOW_COLUMNS, PTYPE_ALLOW_ROWS, PTYPE_DENY_COLUMNS, PTYPE_DENY_ROWS,
@@ -59,7 +59,6 @@ from .gate import (
     user_subject,
 )
 
-logger = logging.getLogger("rbic.audit")
 
 MASTER_ROLE = "master"
 CHANGES_HEADER = "# ---- Changes via master chatbot ----"

@@ -16,6 +16,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
+from rbic.cli import master as master_cli
 from rbic import engine as chatbot
 from rbic import master as master_bot
 from rbic.admin import CHANGES_HEADER, PolicyAdmin
@@ -823,7 +824,7 @@ def test_master_bot_new_tools_propose_then_apply(env, name, args, line):
     client = FakeClient([tool_use(name, args), end_turn("Proposed.")])
     inputs = iter(["please", "yes", "exit"])
     out = []
-    master_bot.run_master_bot("master", client=client,
+    master_cli.run_master_bot("master", client=client,
                               input_fn=lambda _: next(inputs),
                               output=out.append, admin=env.admin)
     assert line in env.policy.read_text(encoding="utf-8")
@@ -860,7 +861,7 @@ def test_master_bot_reports_both_subjects_error_to_model(env):
         end_turn("Which one?"),
     ])
     inputs = iter(["let bob see salaries", "exit"])
-    master_bot.run_master_bot("master", client=client,
+    master_cli.run_master_bot("master", client=client,
                               input_fn=lambda _: next(inputs),
                               output=lambda *_: None, admin=env.admin)
     result = client.calls[1]["messages"][-1]["content"][0]

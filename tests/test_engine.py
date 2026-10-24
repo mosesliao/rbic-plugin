@@ -8,9 +8,6 @@ import asyncio
 import copy
 import json
 import logging
-import os
-import subprocess
-import sys
 import threading
 from types import SimpleNamespace as NS
 
@@ -418,56 +415,6 @@ def test_concurrent_asks_for_different_users(make_engine):
     for name, r in results:
         assert (r.worker, r.role, r.text) == (name, users[name],
                                               f"hello {users[name]}")
-
-
-# ---- CLI on ask() ----------------------------------------------------------------
-
-def test_cli_chat_runs_on_ask(demo_config):
-    client = FakeClient([tool_use(SALARY_Q), end_turn("hi bob")])
-    script = iter(["salaries?", "hello", "exit"])
-    out = []
-    from rbic.engine import run_chatbot
-    run_chatbot("bob", client=client, config=demo_config,
-                input_fn=lambda _: next(script), output=out.append)
-    text = "\n".join(out)
-    assert DENY_MESSAGE in text and "hi bob" in text
-    # the denied turn left only text in the history the engine was given
-    assert client.calls[1]["messages"] == [U("salaries?"), A(DENY_MESSAGE),
-                                           U("hello")]
-
-
-# ---- library hygiene: no .env loading --------------------------------------------
-
-def test_import_and_engine_do_not_read_dotenv(demo_config, tmp_path):
-    (tmp_path / "envdir").mkdir()
-    (tmp_path / "envdir" / ".env").write_text(
-        "RBIC_DOTENV_SENTINEL=1\nANTHROPIC_API_KEY=sk-from-dotenv\n")
-    code = (
-        "import os, sys\n"
-        "import rbic, rbic.engine, rbic.gate, rbic.admin, rbic.master\n"
-        "from rbic import RBICEngine, Identity, LocalProvider\n"
-        "e = RBICEngine.from_config_dir(sys.argv[1])\n"
-        "e.reload()\n"
-        "e.ask(Identity('x', 'y', 'nobody@example.test'), [{'role': 'user', 'content': 'hi'}])\n"
-        "print('RBIC_DOTENV_SENTINEL' in os.environ, os.environ.get('ANTHROPIC_API_KEY') == 'sk-from-dotenv')\n"
-    )
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("ANTHROPIC_API_KEY", "RBIC_DOTENV_SENTINEL")}
-    proc = subprocess.run([sys.executable, "-c", code, str(demo_config.config_dir)],
-                          cwd=tmp_path / "envdir", env=env, capture_output=True,
-                          text=True, timeout=120)
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip() == "False False"
-
-
-def test_run_chatbot_does_not_load_dotenv(demo_config, monkeypatch):
-    import dotenv
-    called = []
-    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: called.append(1))
-    from rbic.engine import run_chatbot
-    run_chatbot("alice", client=FakeClient([]), config=demo_config,
-                input_fn=lambda _: "exit", output=lambda *_: None)
-    assert called == []
 
 
 def test_public_api_exports():

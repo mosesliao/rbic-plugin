@@ -14,8 +14,8 @@
 #   2. sets examples/demo/casbin/policy.csv to the committed version (git HEAD), so alice
 #      starts without any personal grant
 #   3. opens a Windows Terminal window split horizontally: top pane runs
-#      scripts/demo/drive.py master (rbic.master), bottom pane runs
-#      scripts/demo/drive.py alice (rbic.engine); see drive.py
+#      scripts/demo/drive.py master (rbic.cli.master), bottom pane runs
+#      scripts/demo/drive.py alice (rbic.cli.chat); see drive.py
 #   4. records the window with ffmpeg gdigrab, then builds the GIF with a
 #      two-pass palette (palettegen / paletteuse)
 #   5. ALWAYS (finally) restores the backed-up files byte for byte, verifies

@@ -11,20 +11,20 @@ requires-python = ">=3.10"
 dependencies = [
     "anthropic>=0.86,<2",
     "casbin>=1.43,<2",
-    "python-dotenv>=1",
+    "python-dotenv>=1",  # rbic.cli only (reads .env); never imported by the library
     # The parser is the security boundary (invariant #2): one major version.
     "sqlglot>=30.12,<31",
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
+# build: tests/test_wheel_contents.py builds the wheel it inspects.
+test = ["pytest", "build"]
 
-# Temporary entry points; they move to rbic.cli in a later step.
 [project.scripts]
-rbic-chat = "rbic.engine:main"
-rbic-master = "rbic.master:main"
-rbic-gate-demo = "rbic.gate:main"
-rbic-seed = "rbic.demo.seed:main"
+rbic-chat = "rbic.cli.chat:main"
+rbic-master = "rbic.cli.master:main"
+rbic-gate-demo = "rbic.cli.gate_demo:main"
+rbic-seed = "rbic.cli.seed:main"
 
 [tool.hatch.version]
 path = "src/rbic/__init__.py"
