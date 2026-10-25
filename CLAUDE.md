@@ -684,3 +684,5 @@ LLM model for text-to-SQL / summarization: `claude-sonnet-4-6`.
 - **Gate test suite**: keep growing it with every new SQL construct
   admitted past the parser (invariant #2); the demo cases run in
   `test_cli.py` and the mock-client chatbot tests in `test_engine.py`
+- **Plugin roadmap**: see `docs/plugin-plan.md` (core package → Open WebUI
+  plugin with SSO → onboarding toolkit; Chainlit and master web UI deferred)
