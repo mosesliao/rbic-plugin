@@ -1,0 +1,10 @@
+# Build context is the repository root; send only what the Dockerfile copies.
+*
+!pyproject.toml
+!README.md
+!src/
+!integrations/openwebui/requirements-build.txt
+!integrations/openwebui/requirements-rbic.txt
+!integrations/openwebui/rbic_pipe.py
+**/__pycache__
+**/*.pyc

@@ -1,0 +1,14 @@
+# rbic-plugin's runtime dependencies that the Open WebUI image does not ship,
+# pinned with hashes (installed with --no-deps --require-hashes by the
+# Dockerfile). anthropic (==0.86.0) and python-dotenv already come with
+# Open WebUI v0.12.4 and satisfy rbic's ranges (anthropic>=0.86,<2,
+# python-dotenv>=1); the Dockerfile verifies that after installing.
+# Regenerate when pyproject.toml's ranges change:
+#   pip download --no-deps -d wheels casbin==X simpleeval==Y sqlglot==Z
+#   pip hash wheels/*
+casbin==1.43.0 \
+    --hash=sha256:63a3d1228870250e859ccd94133fe478821093f71dd37f05e0baa0c6fea26623
+simpleeval==1.0.8 \
+    --hash=sha256:c9c4ff42879ebf0c05f6562cb81031869948916be343bcc950b81fcc081fe9ce
+sqlglot==30.24.0 \
+    --hash=sha256:9488828cc018453b7a3ba01e65d2749c9a731314c14583695163ca1f358203fe
