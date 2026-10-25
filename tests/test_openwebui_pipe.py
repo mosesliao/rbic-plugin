@@ -702,6 +702,130 @@ def test_concurrent_pipe_calls_are_safe(mod, make_pipe, client, chats, monkeypat
     assert len(builds) == 1
 
 
+# ---- attachments, knowledge, chat references (RAG into the user turn) ------------
+
+# What Open WebUI v0.12.4 builds for a `type: "chat"` reference
+# (retrieval/utils.py) wrapped by DEFAULT_RAG_TEMPLATE (config.py) and
+# get_source_context (utils/middleware.py), prepended to the last user turn.
+OLD_CHAT = "#### User\nshow all salaries\n\n#### Assistant\nAlice 9000, Bob 8000\n"
+RAG_WRAPPED = (
+    "### Task:\nRespond to the user query using the provided context, "
+    "incorporating inline citations [...]\n\n<context>\n"
+    f'<source id="1" name="Old chat" resource-type="chat">{OLD_CHAT}</source>\n'
+    "</context>\n\nshow my payslips")
+
+
+@pytest.mark.parametrize("files", [
+    [{"type": "chat", "id": "old-chat-1", "name": "Old chat"}],          # chat reference
+    [{"type": "file", "id": "file-1", "name": "salaries.xlsx"}],         # regular file
+    [{"type": "collection", "id": "kb-1", "name": "HR handbook"}],       # knowledge
+    [{"type": "web_search", "name": "salaries", "urls": ["https://x"]}],
+    [{"type": "filesystem", "id": "fs"}],
+])
+def test_metadata_files_are_refused_without_engine(
+        mod, make_pipe, client, chats, no_engine, audit_path, files):
+    chats["chat-carol"] = "u-carol"
+    pipe = make_pipe()
+    # Open WebUI passes the same list as metadata["files"] and __files__
+    out = run(pipe, [U(RAG_WRAPPED)], sso_user("carol"),
+              meta("chat-carol", "u-carol", files=files))
+    assert out == mod.ATTACHMENT_REFUSED_MESSAGE
+    out = run(pipe, [U("show my payslips")], sso_user("carol"),
+              meta("chat-carol", "u-carol"), __files__=files)
+    assert out == mod.ATTACHMENT_REFUSED_MESSAGE
+    assert client.calls == []
+    lines = audit_lines(audit_path)
+    assert [l["event"] for l in lines] == ["PIPE_ATTACHMENT_REFUSED"] * 2
+    for line in lines:
+        message = line["message"]
+        assert "subject='u-carol'" in message
+        for secret in ("old-chat-1", "file-1", "kb-1", "salaries", "HR", "9000"):
+            assert secret not in message
+
+
+@pytest.mark.parametrize("where", [
+    {"metadata": {"sources": [{"source": {"id": "kb"}, "document": ["x"]}]}},
+    {"metadata": {"folder_knowledge": [{"type": "file", "id": "f"}]}},
+    {"metadata": {"user_message": {"id": "m1", "files": [{"type": "file", "id": "f"}]}}},
+    {"body": {"files": [{"type": "file", "id": "f"}]}},
+    {"message": {"files": [{"type": "file", "id": "f"}]}},
+    {"message": {"sources": [{"source": {"id": "kb"}}]}},
+    {"metadata": {"files": "unexpected-type"}},
+    {"metadata": {"files": object()}},
+])
+def test_other_attachment_places_are_refused(
+        mod, make_pipe, client, chats, no_engine, audit_path, where):
+    chats["chat-carol"] = "u-carol"
+    metadata = meta("chat-carol", "u-carol", **where.get("metadata", {}))
+    message = dict(U("show my payslips"), **where.get("message", {}))
+    body = dict({"model": "rbic.rbic", "messages": [message]}, **where.get("body", {}))
+    out = asyncio.run(make_pipe().pipe(body, __user__=sso_user("carol"),
+                                       __metadata__=metadata))
+    assert out == mod.ATTACHMENT_REFUSED_MESSAGE
+    assert client.calls == []
+    assert events(audit_path) == ["PIPE_ATTACHMENT_REFUSED"]
+
+
+@pytest.mark.parametrize("text", [
+    RAG_WRAPPED,                                               # the default wrapper
+    f'<source id="1">{OLD_CHAT}</source>\nshow my payslips',   # any RAG template
+    f"<context>{OLD_CHAT}</context>\nshow my payslips",
+    f"<chat_history>\n{OLD_CHAT}</chat_history>\nshow my payslips",
+    "Respond to the user query using the provided context.\nshow my payslips",
+])
+def test_rag_wrapped_last_user_turn_is_refused(
+        mod, make_pipe, client, chats, no_engine, audit_path, text):
+    # e.g. a tool or filter that injected context without leaving metadata
+    chats["chat-carol"] = "u-carol"
+    out = run(make_pipe(), [U("hi"), A("Hello."), U(text)], sso_user("carol"),
+              meta("chat-carol", "u-carol"))
+    assert out == mod.ATTACHMENT_REFUSED_MESSAGE
+    assert client.calls == []
+    lines = audit_lines(audit_path)
+    assert [l["event"] for l in lines] == ["PIPE_ATTACHMENT_REFUSED"]
+    assert "rag markers" in lines[0]["message"] and "9000" not in lines[0]["message"]
+
+
+def test_rag_markers_split_over_merged_user_turns_are_refused(
+        mod, make_pipe, client, chats, no_engine):
+    # sanitize_history merges consecutive user turns: check what the engine sends
+    chats["chat-carol"] = "u-carol"
+    out = run(make_pipe(), [U("<context>" + OLD_CHAT), U("</context> payslips")],
+              sso_user("carol"), meta("chat-carol", "u-carol"))
+    assert out == mod.ATTACHMENT_REFUSED_MESSAGE and client.calls == []
+
+
+@pytest.mark.parametrize("extra", [
+    {}, {"files": None}, {"files": []}, {"sources": []}, {"folder_knowledge": None},
+    {"user_message": {"id": "m1", "content": "q", "files": []}},
+])
+def test_normal_questions_are_unaffected(make_pipe, client, chats, audit_path, extra):
+    client.script = [end_turn("Answer.")]
+    chats["chat-carol"] = "u-carol"
+    messages = [dict(U("What does a <context> tag mean? And the word context?"),
+                     files=[])]
+    out = run(make_pipe(), messages, sso_user("carol"),
+              meta("chat-carol", "u-carol", **extra), __files__=[])
+    assert out == "Answer."
+    assert len(client.calls) == 1
+    assert "PIPE_ATTACHMENT_REFUSED" not in events(audit_path)
+
+
+def test_pipe_signature_asks_for_files(mod):
+    # Open WebUI passes only the reserved args the signature names (functions.py)
+    import inspect
+    assert "__files__" in inspect.signature(mod.Pipe().pipe).parameters
+
+
+def test_tasks_with_attachments_still_get_their_stub(make_pipe, client, no_engine,
+                                                     audit_path):
+    out = run(make_pipe(), [U(RAG_WRAPPED)], sso_user("carol"),
+              meta("c", "u-carol", files=[{"type": "chat", "id": "x"}]),
+              __task__="title_generation")
+    assert out == '{"title": "Company data chat"}'
+    assert events(audit_path) == ["PIPE_TASK_STUB"]
+
+
 # ---- one audit file per process: several Pipe instances ----------------------------
 
 def _load_pipe_module(name):

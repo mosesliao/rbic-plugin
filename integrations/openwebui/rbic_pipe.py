@@ -23,6 +23,9 @@ description: Answers questions from the company database; every SQL query is che
 #      transcript into a USER turn for tasks (CLAUDE.md "Host requirements").
 #   2. Configuration checks: AUDIT_LOG_PATH set (audit.configure), the
 #      installed rbic version (EXPECTED_RBIC_VERSION), IDENTITY_SOURCE.
+#   2b. Attachments: files, knowledge, chat references, web search results
+#      or anything else Open WebUI would retrieve and paste into the last
+#      USER turn (RAG) get a fixed refusal; the engine is never called.
 #   3. Identity: Identity("openwebui", user id, email) from __user__. With
 #      IDENTITY_SOURCE="oauth" the user must carry Open WebUI's SSO marker
 #      (__user__["oauth"] = {provider: {"sub": ...}}), else IDENTITY_DENY.
@@ -51,6 +54,7 @@ from rbic import (AUDIENCE_DENY_MESSAGE, DENY_MESSAGE, Audience, ConfigError,
                   Identity, JsonAttributeProvider, RBICEngine, audit)
 from rbic.audit import logger as audit_log
 from rbic.engine import LLM_UNAVAILABLE_MESSAGE
+from rbic.history import sanitize_history
 
 PROVIDER = "openwebui"
 MODEL_ID = "rbic"
@@ -60,6 +64,9 @@ IDENTITY_SOURCES = ("oauth", "admin_created")
 NOT_CONFIGURED_MESSAGE = ("The company data assistant is not configured "
                           "correctly. Please contact your administrator.")
 UNAVAILABLE_MESSAGE = LLM_UNAVAILABLE_MESSAGE
+ATTACHMENT_REFUSED_MESSAGE = ("Attachments, documents and chat references "
+                              "can't be used with this assistant. Please ask "
+                              "your question directly.")
 STATUS_TEXT = "Checking access…"
 EMITTER_TIMEOUT_S = 5.0
 MAX_FOLDER_DEPTH = 64
@@ -83,6 +90,34 @@ TASK_STUBS = {
     "context_compaction": "(Earlier messages are not summarized.)",
 }
 DEFAULT_TASK_STUB = ""
+
+# Where Open WebUI v0.12.4 puts retrieval inputs a Pipe can see. Any
+# non-empty one is refused: the files handler (utils/middleware.py
+# chat_completion_files_handler, run for Pipes too unless the model's
+# "File Context" capability is off) turns them into text and, unless
+# RAG_SYSTEM_CONTEXT=true, pastes it into the last USER turn
+# (apply_source_context_to_messages). A `type: "chat"` reference is a whole
+# earlier chat rebuilt as "#### User / #### Assistant" text
+# (retrieval/utils.py), i.e. old rows the conversation guard can't see.
+#   metadata.files          the request's files, knowledge, web search, chat
+#                           references (main.py chat_completion,
+#                           middleware.py process_chat_payload); __files__ is
+#                           the same list (functions.py)
+#   metadata.sources        retrieved context already built for this turn
+#   metadata.folder_knowledge   knowledge attached to the chat's folder
+#   metadata.user_message.files the stored user message's attachments
+#   body.files, messages[*].files / .sources   (defensive; normally popped)
+ATTACHMENT_METADATA_KEYS = ("files", "sources", "folder_knowledge")
+ATTACHMENT_MESSAGE_KEYS = ("files", "sources")
+
+# Defense in depth: text Open WebUI's RAG/context wrappers put into a user
+# turn. `<source id="` is written by get_source_context (utils/middleware.py)
+# whatever RAG template is configured; the rest is DEFAULT_RAG_TEMPLATE and
+# the task templates' transcript wrapper (config.py).
+RAG_MARKERS = ('<source id="',
+               "Respond to the user query using the provided context")
+RAG_MARKER_PAIRS = (("<context>", "</context>"),
+                    ("<chat_history>", "</chat_history>"))
 
 # Test seam: tests set this to a zero-argument callable returning a fake
 # Anthropic client. Production never sets it (the engine then creates the
@@ -120,6 +155,46 @@ def _get(mapping, key):
     """mapping[key] for a plain dict, else None (dict.get itself, so a dict
     subclass can't override what it returns)."""
     return dict.get(mapping, key) if isinstance(mapping, dict) else None
+
+
+def _present(value) -> bool:
+    """True unless value is None/False or an empty str/list/tuple/dict/set
+    (anything unusual counts as present: fail closed)."""
+    if value is None or value is False:
+        return False
+    if isinstance(value, (str, list, tuple, dict, set, frozenset)):
+        try:
+            return len(value) > 0
+        except Exception:  # noqa: BLE001
+            return True
+    return True
+
+
+def _attachment_source(body, metadata, files) -> Optional[str]:
+    """The name of the first place an attachment or retrieved context shows
+    up in this request, or None. Names only: never file names, ids or text."""
+    if _present(files):
+        return "__files__"
+    for key in ATTACHMENT_METADATA_KEYS:
+        if _present(_get(metadata, key)):
+            return f"metadata.{key}"
+    if _present(_get(_get(metadata, "user_message"), "files")):
+        return "metadata.user_message.files"
+    if _present(_get(body, "files")):
+        return "body.files"
+    messages = _get(body, "messages")
+    if isinstance(messages, list):
+        for message in list(messages):
+            for key in ATTACHMENT_MESSAGE_KEYS:
+                if _present(_get(message, key)):
+                    return f"message.{key}"
+    # the user turn the engine would send (sanitized exactly as it will be)
+    last = sanitize_history(messages)[-1:]
+    text = last[0]["content"] if last else ""
+    if any(marker in text for marker in RAG_MARKERS) or any(
+            start in text and end in text for start, end in RAG_MARKER_PAIRS):
+        return "rag markers in user turn"
+    return None
 
 
 def _configure_audit(audit_path: str) -> None:
@@ -300,10 +375,11 @@ class Pipe:
     async def pipe(self, body: dict, __user__: Optional[dict] = None,
                    __metadata__: Optional[dict] = None,
                    __task__: Optional[str] = None,
+                   __files__: Optional[list] = None,
                    __event_emitter__=None) -> str:
         try:
             return await self._pipe(body, __user__, __metadata__, __task__,
-                                    __event_emitter__)
+                                    __files__, __event_emitter__)
         except Exception as err:  # noqa: BLE001 - never leak, never crash
             try:
                 audit_log.error("PIPE_ERROR error=%s", _class_name(err))
@@ -311,7 +387,7 @@ class Pipe:
                 pass
             return UNAVAILABLE_MESSAGE
 
-    async def _pipe(self, body, user, metadata, task, emitter) -> str:
+    async def _pipe(self, body, user, metadata, task, files, emitter) -> str:
         valves = self.valves  # one snapshot: Open WebUI swaps it per request
         metadata = metadata if isinstance(metadata, dict) else {}
         user = user if isinstance(user, dict) else {}
@@ -350,6 +426,13 @@ class Pipe:
         if source not in IDENTITY_SOURCES:
             audit_log.error("PIPE_CONFIG_ERROR reason=unknown IDENTITY_SOURCE")
             return NOT_CONFIGURED_MESSAGE
+
+        # 2b. attachments / retrieved context: never reach the engine
+        where = _attachment_source(body, metadata, files)
+        if where is not None:
+            audit_log.warning("PIPE_ATTACHMENT_REFUSED subject=%r source=%s",
+                              user_id, where)
+            return ATTACHMENT_REFUSED_MESSAGE
 
         await _emit(emitter, done=False)
         try:
