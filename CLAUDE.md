@@ -119,7 +119,7 @@ project/
 │   ├── Dockerfile          # Open WebUI v0.12.4 (digest-pinned) + rbic wheel built from src/
 │   ├── requirements-*.txt  # hash-pinned casbin/simpleeval/sqlglot + wheel build tooling
 │   ├── docker-compose.yml  # test deployment: Open WebUI + Keycloak OIDC, hardening env
-│   ├── keycloak/realm-rbic.json  # test realm: open-webui client, owui-admin/bob/carol/dave/mallory
+│   ├── keycloak/realm-rbic.json  # test realm: open-webui client + owui-admin/owui-user roles claim; owui-admin/bob/carol/dave/mallory
 │   └── README.md           # quickstart, Valves, SSO recipes, hardening checklist, e2e script
 └── scripts/demo/           # drive.py + record.ps1: re-record docs/master-bot-demo.gif
 ```
@@ -227,9 +227,10 @@ logging.
   `POLICY_UNAVAILABLE_DENY`, `POLICY_RESET`, `POLICY_CHANGED_DURING_TURN`,
   `SQL_ERROR`, `LLM_ERROR`/`ENGINE_ERROR` (engine), `POLICY_RELOAD[_FAILED]`,
   `POLICY_CONFIRM`, `POLICY_CHANGE[_LOG_FAILED]` (master/admin),
-  `PIPE_TASK_STUB`, `PIPE_AUDIENCE`, `PIPE_CONFIG_ERROR`, `PIPE_ERROR`
-  (Open WebUI Pipe; it also writes `IDENTITY_DENY … reason=not an SSO
-  user`). The line formats are stable.
+  `PIPE_TASK_STUB`, `PIPE_ATTACHMENT_REFUSED`, `PIPE_AUDIENCE`,
+  `PIPE_CONFIG_ERROR`, `PIPE_CONFIG_WARNING`, `PIPE_ERROR` (Open WebUI
+  Pipe; it also writes `IDENTITY_DENY … reason=not an SSO user`). The line
+  formats are stable.
 - **Decision: library convention.** Importing `rbic` attaches only a
   `NullHandler` to `rbic.audit` and never touches the root logger. The
   trade-off is deliberate: with no handler anywhere, Python's last-resort
@@ -240,7 +241,9 @@ logging.
   `RBICEngine()` emits one `AuditNotConfiguredWarning` per process when
   neither happened (`audit.is_configured()`).
 - `configure()` attaches one idempotent JSON-lines `FileHandler` (same
-  path → same handler; a new path replaces it; host handlers are left
+  path → same handler; a new path replaces it — except that a call with
+  `owner=` never replaces a file configured for a different owner, or
+  without one, and returns that handler instead; host handlers are left
   alone; `unconfigure()` removes it) and lowers the logger level to
   `level` if needed. Each line: `{"ts": UTC ISO 8601, "level", "event":
   first word of the message, "message": the full audit line}`.
@@ -644,7 +647,7 @@ keyword.
 Phase 2 host, written against Open WebUI **v0.12.4** source (facts and
 file references in `integrations/openwebui/README.md`, "Verified
 against"). One model (`pipes()` → `<function id>.rbic`, "Company Data
-(RBIC)"); `async pipe(body, __user__, __metadata__, __task__,
+(RBIC)"); `async pipe(body, __user__, __metadata__, __task__, __files__,
 __event_emitter__)` returns a `str` (no streaming). In order, every
 refusal is fixed code text:
 1. **Tasks**: `__task__` (or `__metadata__["task"]`) set → a fixed,
@@ -653,9 +656,22 @@ refusal is fixed code text:
    `{"text": ""}`, `{"operations": []}`, a fixed compaction note, else
    `""`), audit `PIPE_TASK_STUB`; the engine is never called (Host
    requirements below).
-2. **Config**: Valve `AUDIT_LOG_PATH` required (`rbic.audit.configure`,
-   else "not configured" text); `EXPECTED_RBIC_VERSION`, when set, must
-   equal `rbic.__version__` (`PIPE_CONFIG_ERROR`).
+2. **Config**: Valve `AUDIT_LOG_PATH` required (`rbic.audit.configure(…,
+   owner=<function id>)`, else "not configured" text; another RBIC Pipe's
+   or the host's file in the same process is kept, one
+   `PIPE_CONFIG_WARNING` per path pair — one RBIC Pipe per process);
+   `EXPECTED_RBIC_VERSION`, when set, must equal `rbic.__version__`
+   (`PIPE_CONFIG_ERROR`).
+2b. **Attachments**: non-empty `__files__`, `__metadata__` `files` /
+   `sources` / `folder_knowledge` / `user_message.files`, `body["files"]`
+   or any message's `files`/`sources`, or Open WebUI's RAG wrapper in the
+   sanitized last user turn (`<source id="`, `<context>…</context>`,
+   `<chat_history>…</chat_history>`, the default RAG template's first
+   line) → `ATTACHMENT_REFUSED_MESSAGE`, audit `PIPE_ATTACHMENT_REFUSED
+   source=<where>` (no names/ids/content), no engine call. Open WebUI runs
+   its files handler for Pipes and pastes retrieved text — a `type: chat`
+   reference is a whole old chat — into the last user turn (Host
+   requirements).
 3. **Identity**: `Identity("openwebui", __user__["id"],
    __user__["email"])`. `IDENTITY_SOURCE="oauth"` (default) requires
    Open WebUI's SSO marker `__user__["oauth"] = {provider: {"sub": …}}`
@@ -697,6 +713,17 @@ refusal is fixed code text:
   seeing them (disable them; see the hardening checklist); Open WebUI
   does not check `email_verified`, so the IdP must own emails;
   `ENABLE_PERSISTENT_CONFIG=false` keeps the hardening env authoritative.
+- **Deployment settings the Pipe relies on** (compose + README checklist):
+  `RAG_SYSTEM_CONTEXT=true` (retrieved context → system message, which
+  `sanitize_history` drops) and no File Upload / File Context / Web
+  Search / tools / knowledge on the RBIC model; `OAUTH_UPDATE_EMAIL_ON_LOGIN=true`
+  (Open WebUI's stored email — the identity key — follows the IdP on each
+  sign-in; admins can still edit emails, so they are fully trusted);
+  Open WebUI admin from the IdP (`ENABLE_OAUTH_ROLE_MANAGEMENT`,
+  `OAUTH_ROLES_CLAIM=roles`, `OAUTH_ALLOWED_ROLES=owui-user`,
+  `OAUTH_ADMIN_ROLES=owui-admin`) plus a `WEBUI_ADMIN_EMAIL` placeholder
+  admin, because Open WebUI makes its first account admin regardless;
+  `WEBUI_SECRET_KEY` has no default; `ENABLE_OAUTH_TOKEN_EXCHANGE=false`.
 
 ### Host requirements (Phase 2 design note)
 
@@ -712,6 +739,13 @@ refusal is fixed code text:
   this (stubs for every `__task__`); Open WebUI must also not route
   tasks or context compaction to a *different* model (see
   `integrations/openwebui/README.md`).
+- **Never paste retrieved context into a user turn either.** RAG over
+  files, knowledge, web search or *chat references* (an earlier chat
+  rebuilt as `#### User` / `#### Assistant` text) lands in the last user
+  turn in Open WebUI by default — the same bypass. Hosts must refuse such
+  requests or put the context where `sanitize_history` drops it (system
+  message). The Pipe refuses them (step 2b) and the compose file sets
+  `RAG_SYSTEM_CONTEXT=true`.
 
 ---
 
