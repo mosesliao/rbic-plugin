@@ -28,6 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           fetch-depth: 0  # full history for the ancestor check below
       - name: Tagged commit must be on main
         run: |
