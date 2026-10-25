@@ -12,6 +12,20 @@
   "duplicateEmailsAllowed": false,
   "verifyEmail": false,
   "bruteForceProtected": true,
+  "roles": {
+    "client": {
+      "open-webui": [
+        {
+          "name": "owui-user",
+          "description": "Open WebUI role 'user' (OAUTH_ALLOWED_ROLES)"
+        },
+        {
+          "name": "owui-admin",
+          "description": "Open WebUI role 'admin' (OAUTH_ADMIN_ROLES)"
+        }
+      ]
+    }
+  },
   "clients": [
     {
       "clientId": "open-webui",
@@ -34,7 +48,25 @@
       ],
       "attributes": {
         "post.logout.redirect.uris": "http://localhost:3000/*"
-      }
+      },
+      "protocolMappers": [
+        {
+          "name": "open-webui roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-client-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "usermodel.clientRoleMapping.clientId": "open-webui",
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "users": [
@@ -52,7 +84,12 @@
           "value": "demo-owui-admin-pw",
           "temporary": false
         }
-      ]
+      ],
+      "clientRoles": {
+        "open-webui": [
+          "owui-admin"
+        ]
+      }
     },
     {
       "username": "bob",
@@ -68,7 +105,12 @@
           "value": "demo-bob-pw",
           "temporary": false
         }
-      ]
+      ],
+      "clientRoles": {
+        "open-webui": [
+          "owui-user"
+        ]
+      }
     },
     {
       "username": "carol",
@@ -84,7 +126,12 @@
           "value": "demo-carol-pw",
           "temporary": false
         }
-      ]
+      ],
+      "clientRoles": {
+        "open-webui": [
+          "owui-user"
+        ]
+      }
     },
     {
       "username": "dave",
@@ -100,7 +147,12 @@
           "value": "demo-dave-pw",
           "temporary": false
         }
-      ]
+      ],
+      "clientRoles": {
+        "open-webui": [
+          "owui-user"
+        ]
+      }
     },
     {
       "username": "mallory",
@@ -116,7 +168,12 @@
           "value": "demo-mallory-pw",
           "temporary": false
         }
-      ]
+      ],
+      "clientRoles": {
+        "open-webui": [
+          "owui-user"
+        ]
+      }
     }
   ],
   "components": {

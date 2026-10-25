@@ -2,12 +2,15 @@
 #
 #   rbic-seed --config-dir examples/demo        # once, on the host (repo root)
 #   export ANTHROPIC_API_KEY=...                # your key, from your shell
+#   export WEBUI_SECRET_KEY=...                 # long random value (README)
+#   export WEBUI_BOOTSTRAP_ADMIN_PASSWORD=...   # long random value (README)
 #   cd integrations/openwebui && docker compose up --build
 #
 # Then open http://localhost:3000 and sign in with SSO (Keycloak).
 #
-# Every secret below is a clearly fake DEMO value. Change all of them (and use
-# HTTPS) for anything that is not a throwaway local test.
+# Every other secret below (Keycloak admin password, client secret, the
+# realm's user passwords) is a clearly fake DEMO value. Change all of them
+# (and use HTTPS) for anything that is not a throwaway local test.
 #
 # Hostnames: the browser and the Open WebUI container must reach Keycloak
 # under the SAME URL, or token issuer checks fail. We use
@@ -62,7 +65,7 @@ services:
 
       # ---- Open WebUI basics ---------------------------------------------
       WEBUI_URL: http://localhost:3000
-      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:-CHANGE-ME-demo-only-not-a-secret}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?Set WEBUI_SECRET_KEY to a long random value}
       # Env stays authoritative: admin-UI changes to persistent settings
       # don't override the hardening below (they don't survive a restart).
       ENABLE_PERSISTENT_CONFIG: "false"
@@ -82,12 +85,34 @@ services:
       OPENID_PROVIDER_URL: http://keycloak.localhost:8080/realms/rbic/.well-known/openid-configuration
       OPENID_REDIRECT_URI: http://localhost:3000/oauth/oidc/login/callback
       OAUTH_SCOPES: openid email profile
+      # The stored email (the rbic identity key) follows the IdP's on every
+      # sign-in instead of keeping the first-seen / admin-edited value.
+      OAUTH_UPDATE_EMAIL_ON_LOGIN: "true"
+      ENABLE_OAUTH_TOKEN_EXCHANGE: "false"   # no external IdP-token -> session exchange
       # Demo over plain HTTP: authlib's transport check
       # (authlib.common.security.is_secure_transport) only accepts https://
       # and http://localhost|127.0.0.1. NEVER set this in production.
       AUTHLIB_INSECURE_TRANSPORT: "1"
-      # New SSO users can chat right away in this demo. Production: keep the
-      # default "pending" (an admin approves) or use OAuth role management.
+
+      # ---- Open WebUI roles come from the IdP --------------------------------
+      # Keycloak puts the open-webui client roles into the "roles" claim (realm
+      # file): owui-admin -> admin, owui-user -> user; roles but neither ->
+      # sign-in refused; no roles claim -> DEFAULT_USER_ROLE (new users) or the
+      # current role. Re-evaluated on every sign-in (utils/oauth.py
+      # get_user_role).
+      ENABLE_OAUTH_ROLE_MANAGEMENT: "true"
+      OAUTH_ROLES_CLAIM: roles
+      OAUTH_ALLOWED_ROLES: owui-user
+      OAUTH_ADMIN_ROLES: owui-admin
+      # Open WebUI makes the FIRST account admin regardless of role management.
+      # This placeholder local account is created at first start, before any
+      # SSO sign-in, so that is never an SSO user. It cannot sign in
+      # (ENABLE_PASSWORD_AUTH=false); keep it.
+      WEBUI_ADMIN_EMAIL: bootstrap-admin@rbic-demo.invalid
+      WEBUI_ADMIN_NAME: Bootstrap placeholder (cannot sign in)
+      WEBUI_ADMIN_PASSWORD: ${WEBUI_BOOTSTRAP_ADMIN_PASSWORD:?Set WEBUI_BOOTSTRAP_ADMIN_PASSWORD to a long random value}
+      # Users whose token carries no roles claim get this role. Production:
+      # "pending" (an admin approves).
       DEFAULT_USER_ROLE: user
 
       # ---- no other models or connections ---------------------------------
@@ -109,6 +134,10 @@ services:
       ENABLE_CONTEXT_COMPACTION: "false"
       ENABLE_MEMORIES: "false"
       ENABLE_MEMORY_BACKGROUND_REVIEW: "false"
+      # Retrieved context (files, knowledge, chat references, web search) goes
+      # into the SYSTEM message, which rbic drops, never into the user turn.
+      # The Pipe also refuses any request that carries attachments.
+      RAG_SYSTEM_CONTEXT: "true"
 
       # ---- no sharing, no shared audiences ---------------------------------
       ENABLE_COMMUNITY_SHARING: "false"

@@ -8,7 +8,7 @@ This directory ships the Open WebUI integration of rbic:
 | `Dockerfile` | Open WebUI v0.12.4 (pinned by digest) with `rbic-plugin` preinstalled from a wheel built from this repository. |
 | `requirements-rbic.txt`, `requirements-build.txt` | Hash-pinned dependencies for the image. |
 | `docker-compose.yml` | Local test deployment: Open WebUI plus Keycloak as the OIDC provider, with the hardening settings applied. |
-| `keycloak/realm-rbic.json` | Test realm with the `open-webui` client and the users owui-admin, bob, carol, dave and mallory. |
+| `keycloak/realm-rbic.json` | Test realm with the `open-webui` client (client roles `owui-admin`/`owui-user`, sent in the `roles` claim) and the users owui-admin (`owui-admin`), bob, carol, dave and mallory (`owui-user`). |
 
 Open WebUI handles sign-in (SSO) and the chat UI. rbic decides what each
 worker may see. The Pipe connects the two:
@@ -17,14 +17,20 @@ worker may see. The Pipe connects the two:
 2. The Pipe refuses anything that isn't a private one-to-one chat.
 3. Open WebUI's background tasks (titles, tags, follow-ups and so on)
    never reach rbic.
+4. Attachments, knowledge, chat references and any other retrieved
+   context are refused, because Open WebUI would paste them into the
+   user's message.
 
 Every SQL statement the LLM writes still goes through the SQL gate. Every
 refusal is fixed text from code (see the root `CLAUDE.md`).
 
-> **Status:** test deployment. Everything in `docker-compose.yml` and the
-> realm (client secret, passwords, `WEBUI_SECRET_KEY`, plain HTTP) is a
-> clearly fake demo value. Production needs real secrets, HTTPS and your
-> own IdP. See the hardening checklist below.
+> **Status:** test deployment. The secrets that ship in
+> `docker-compose.yml` and `keycloak/realm-rbic.json` (Keycloak admin
+> password, the `open-webui` client secret, every user password) are
+> **demo-only** values that anyone can read in this repository, and the
+> demo runs on plain HTTP. `WEBUI_SECRET_KEY` and the bootstrap admin
+> password have no default: you generate them. Production needs real
+> secrets, HTTPS and your own IdP. See the hardening checklist below.
 
 ---
 
@@ -39,15 +45,31 @@ repository installed in a virtualenv (`pip install -e ".[test]"`) for
 #    It is mounted read-only into the container.
 rbic-seed --config-dir examples/demo
 
-# 2. Build and start Open WebUI and Keycloak.
+# 2. Generate the two secrets compose requires. Keep them (a password
+#    manager, or an untracked integrations/openwebui/.env file): a new
+#    WEBUI_SECRET_KEY signs everyone out.
+export WEBUI_SECRET_KEY="$(python -c "import secrets;print(secrets.token_urlsafe(48))")"
+export WEBUI_BOOTSTRAP_ADMIN_PASSWORD="$(python -c "import secrets;print(secrets.token_urlsafe(48))")"
+
+# 3. Build and start Open WebUI and Keycloak.
 export ANTHROPIC_API_KEY=sk-ant-...        # only ever from your shell / a secret store
 cd integrations/openwebui
 docker compose up --build
 ```
 
 3. Open <http://localhost:3000> and click **Continue with Keycloak (demo)**.
-   **Sign in as `owui-admin` first** (password `demo-owui-admin-pw`). Open
-   WebUI makes its first account the admin.
+   Sign in as `owui-admin` (password `demo-owui-admin-pw`). Who is an Open
+   WebUI admin comes from the IdP, not from who signs in first: Keycloak
+   sends the `open-webui` client roles in the `roles` claim, and Open WebUI
+   maps `owui-admin` to admin and `owui-user` to user on every sign-in
+   (`ENABLE_OAUTH_ROLE_MANAGEMENT`). Open WebUI also makes its very first
+   account admin no matter what; compose therefore creates a placeholder
+   local admin (`bootstrap-admin@rbic-demo.invalid`) at first start, which
+   can't sign in because password sign-in is off.
+   **Before importing the Pipe, check Admin Panel → Users:** the only admins
+   are `owui-admin` and the placeholder; bob, carol, dave and mallory are
+   `user`. If anyone else is admin, stop, remove the `open-webui-data`
+   volume (`docker compose down -v`) and start again.
 4. Import the Pipe. Go to Admin Panel → Functions → **Import**, choose
    `integrations/openwebui/rbic_pipe.py` (the image also holds a copy at
    `/app/rbic/rbic_pipe.py`), save it and switch it on.
@@ -62,7 +84,14 @@ docker compose up --build
    Models, set **Company Data (RBIC)** as the default model. The compose
    file already turns off OpenAI/Ollama connections, so no other models
    exist.
-7. Sign out. Then sign in as `bob`, `carol` or `mallory` (password
+7. Strip the model's extras. Edit **Company Data (RBIC)** (Admin Panel →
+   Settings → Models): under *Capabilities* turn off **File Upload**,
+   **File Context**, **Web Search**, **Vision**, **Image Generation**,
+   **Code Interpreter** and **Builtin Tools**; attach no *Knowledge*,
+   *Tools*, *Filters*, *Actions* or *Skills*; save. The Pipe refuses any
+   request that still carries attachments, but nothing should be
+   retrieved for it in the first place.
+8. Sign out. Then sign in as `bob`, `carol` or `mallory` (password
    `demo-<name>-pw`) and run the end-to-end script below.
 
 Watch the audit log:
@@ -128,8 +157,29 @@ The steps run in this order. Every refusal is fixed text from code.
 2. **Configuration.** `AUDIT_LOG_PATH` must be set and writable, and
    `EXPECTED_RBIC_VERSION` must match when set. Otherwise the reply is
    *"The company data assistant is not configured correctly…"* and a
-   `PIPE_CONFIG_ERROR` line is logged.
-3. **Identity.** The Pipe builds `Identity("openwebui", __user__["id"],
+   `PIPE_CONFIG_ERROR` line is logged. If another RBIC Pipe function in
+   the same Open WebUI process already configured a different audit file,
+   that file is kept (records of both go there) and one
+   `PIPE_CONFIG_WARNING … requested=… in_use=…` line is logged: run one
+   RBIC Pipe per Open WebUI process, or give them the same
+   `AUDIT_LOG_PATH`.
+3. **Attachments.** Open WebUI runs its retrieval step for Pipes too.
+   Files, knowledge collections, web search results and **chat
+   references** (a whole earlier chat, rebuilt as `#### User` /
+   `#### Assistant` text) are turned into text and, unless
+   `RAG_SYSTEM_CONTEXT=true`, pasted into the last *user* message. That
+   would bring rows fetched under an old policy back to the model inside
+   the user's own words. So when `__files__`, `__metadata__["files"]`,
+   `["sources"]`, `["folder_knowledge"]`, `["user_message"]["files"]`,
+   `body["files"]` or any message's `files`/`sources` is non-empty, or the
+   user turn carries Open WebUI's RAG wrapper (`<source id="`,
+   `<context>…</context>`, `<chat_history>…</chat_history>`, the default
+   RAG template's first line), the reply is *"Attachments, documents and
+   chat references can't be used with this assistant. Please ask your
+   question directly."*, the engine is not called, and
+   `PIPE_ATTACHMENT_REFUSED subject=… source=<where>` is logged (never
+   file names, ids or content).
+4. **Identity.** The Pipe builds `Identity("openwebui", __user__["id"],
    __user__["email"])`. In `oauth` mode the user must carry Open WebUI's
    SSO marker, a non-empty `__user__["oauth"]` of the form
    `{"<provider>": {"sub": "<subject>"}}`. Open WebUI writes it on every
@@ -139,7 +189,7 @@ The steps run in this order. Every refusal is fixed text from code.
    called. Otherwise the engine maps the email to a worker in
    `worker_attributes.json`. An unmapped email (mallory) gets
    `DENY_MESSAGE` and `IDENTITY_DENY`, with no Anthropic call.
-4. **Audience.** `Audience.PRIVATE` applies only to a saved chat that the
+5. **Audience.** `Audience.PRIVATE` applies only to a saved chat that the
    asking user owns and nobody else can read or continue. The Pipe reads
    Open WebUI's own tables in-process to check this. Anything else is sent
    to the engine as `UNKNOWN` or `SHARED`, so the engine replies with
@@ -155,7 +205,7 @@ The steps run in this order. Every refusal is fixed text from code.
    - internal requests (sub-agents, notes)
    - a `metadata.user_id` that differs from `__user__["id"]`
    - any lookup error
-5. **Answer.** The Pipe calls `engine.aask(identity, body["messages"],
+6. **Answer.** The Pipe calls `engine.aask(identity, body["messages"],
    conversation_id=chat_id, audience=…)`. The messages are passed
    unchanged; the engine sanitizes them. The Pipe returns `result.text`
    only, never `result.reason` and never an exception message. One status
@@ -176,13 +226,33 @@ ENABLE_PASSWORD_AUTH=false        # ENABLE_LOGIN_FORM only hides the form
 ENABLE_SIGNUP=false
 OAUTH_MERGE_ACCOUNTS_BY_EMAIL=false
 OAUTH_ALLOWED_DOMAINS=company.com
+OAUTH_UPDATE_EMAIL_ON_LOGIN=true  # stored email follows the IdP on every sign-in
+ENABLE_OAUTH_TOKEN_EXCHANGE=false # (default) no IdP-token -> session exchange endpoint
 WEBUI_URL=https://chat.company.com
+# Open WebUI admin/user roles from the IdP (claim name and values: your IdP)
+ENABLE_OAUTH_ROLE_MANAGEMENT=true
+OAUTH_ROLES_CLAIM=roles
+OAUTH_ALLOWED_ROLES=owui-user
+OAUTH_ADMIN_ROLES=owui-admin
+DEFAULT_USER_ROLE=pending         # users whose token has no roles claim wait for approval
+# Open WebUI makes its first account admin whatever the IdP says: create a
+# placeholder admin at first start so that is never an SSO user.
+WEBUI_ADMIN_EMAIL=bootstrap-admin@<unused domain>
+WEBUI_ADMIN_PASSWORD=<long random value from a secret store>
 ```
 
-> **The email is the identity key.** Open WebUI doesn't check the
-> `email_verified` claim (`utils/oauth.py`, v0.12.4), and rbic maps workers
-> by email. Use an IdP where **only administrators** can set a user's email,
-> and never accept guest or consumer accounts.
+> **The email is the identity key.** rbic maps the email Open WebUI has
+> **stored** for the user to a worker. Open WebUI doesn't check the
+> `email_verified` claim (`utils/oauth.py`, v0.12.4). By default it also
+> keeps the email it saw at the first sign-in (`OAUTH_UPDATE_EMAIL_ON_LOGIN`
+> is off), and any Open WebUI admin can edit a user's email (Admin Panel →
+> Users), which re-maps that SSO user to another worker. That is part of
+> "Open WebUI admins are fully trusted" (checklist). With
+> `OAUTH_UPDATE_EMAIL_ON_LOGIN=true` the stored email is reset to the IdP's
+> on the user's next sign-in, so Open WebUI stays in sync with the IdP; it
+> does not undo an admin edit for an already-open session. Use an IdP
+> where **only administrators** can set a user's email, and never accept
+> guest or consumer accounts.
 
 ### Microsoft Entra ID
 
@@ -240,6 +310,13 @@ Realm settings → User profile → `email` → *Who can edit* to admin only, as
 `keycloak/realm-rbic.json` does, and turn off self-registration. In Okta,
 make the email attribute read-only for users.
 
+For role management, the IdP must put the Open WebUI role into a claim of
+the ID token or userinfo. The test realm does it with client roles
+`owui-admin` / `owui-user` on the `open-webui` client and a *User Client
+Role* mapper that writes them to `roles` (ID token, access token and
+userinfo). In Entra ID use app roles (claim `roles`); in Okta a groups or
+custom claim.
+
 ---
 
 ## Admin hardening checklist
@@ -254,14 +331,31 @@ Check the rest in the admin UI.
 - [ ] The Pipe's `IDENTITY_SOURCE` is `oauth`.
 - [ ] `WEBUI_AUTH_TRUSTED_EMAIL_HEADER` is unset (trusted-header auth
       would let any proxy client choose an email).
-- [ ] The IdP owns emails: users can't change them, there are no guest or
-      consumer accounts, and email addresses are never reused.
-- [ ] `DEFAULT_USER_ROLE=pending` (an admin approves new users) or OAuth
-      role management. The demo uses `user`.
-- [ ] Sign in with the intended admin account first, because the first
-      account becomes admin.
-- [ ] `WEBUI_SECRET_KEY` is a long random secret, and HTTPS is used
-      everywhere. Never set `AUTHLIB_INSECURE_TRANSPORT` outside the demo.
+- [ ] Emails come from the IdP: users can't change them there, there are
+      no guest or consumer accounts, and addresses are never reused.
+      `OAUTH_UPDATE_EMAIL_ON_LOGIN=true`, so Open WebUI's stored copy (the
+      email rbic maps) is reset to the IdP's on every sign-in. Open WebUI
+      admins can still edit any user's email and so re-map an SSO user to
+      another worker until that user signs in again: one more reason they
+      are fully trusted (Platform, below).
+- [ ] Admin rights come from the IdP: `ENABLE_OAUTH_ROLE_MANAGEMENT=true`
+      with `OAUTH_ROLES_CLAIM`, `OAUTH_ALLOWED_ROLES` and
+      `OAUTH_ADMIN_ROLES` matching your IdP's claim, and only the intended
+      admins hold the admin role. Re-checked on every sign-in.
+- [ ] The first-account race is closed: `WEBUI_ADMIN_EMAIL` /
+      `WEBUI_ADMIN_PASSWORD` create a placeholder admin at first start
+      (Open WebUI makes its first account admin regardless of role
+      management), with an email no IdP user has and a long random
+      password; it can't sign in with password sign-in off. Before
+      importing the Pipe, check Admin Panel → Users: no unexpected admin.
+- [ ] `DEFAULT_USER_ROLE=pending` (an admin approves users whose token has
+      no roles claim). The demo uses `user`.
+- [ ] `ENABLE_OAUTH_TOKEN_EXCHANGE=false` (the default): no endpoint that
+      turns an IdP token from elsewhere into an Open WebUI session.
+- [ ] `WEBUI_SECRET_KEY` is a long random secret (compose refuses to start
+      without one), and HTTPS is used everywhere. Never set
+      `AUTHLIB_INSECURE_TRANSPORT` outside the demo. Replace every demo
+      secret of `docker-compose.yml` and `keycloak/realm-rbic.json`.
 
 **Only the RBIC model**
 - [ ] Make the RBIC model the only model workers can see:
@@ -272,9 +366,19 @@ Check the rest in the admin UI.
       `USER_PERMISSIONS_CHAT_MULTIPLE_MODELS=false`. Switching a chat to
       another model would send the whole history, rows included, to that
       model.
-- [ ] Don't attach tools, knowledge or files to the RBIC model. Keep file
-      and web upload off (`USER_PERMISSIONS_CHAT_FILE_UPLOAD=false`,
-      `USER_PERMISSIONS_CHAT_WEB_UPLOAD=false`).
+- [ ] Nothing is retrieved for the RBIC model. On the model (Admin Panel →
+      Settings → Models → Company Data (RBIC)) turn off the *File Upload*,
+      *File Context*, *Web Search*, *Vision*, *Image Generation*, *Code
+      Interpreter* and *Builtin Tools* capabilities, and attach no
+      knowledge bases, tools, filters, actions or skills; put RBIC chats in
+      no folder that has knowledge files. Keep file and web upload off
+      (`USER_PERMISSIONS_CHAT_FILE_UPLOAD=false`,
+      `USER_PERMISSIONS_CHAT_WEB_UPLOAD=false`) and web search off
+      (`ENABLE_WEB_SEARCH=false`).
+- [ ] `RAG_SYSTEM_CONTEXT=true`, so any context Open WebUI still retrieves
+      (files, knowledge, chat references, web search) goes into the system
+      message, which rbic drops, never into the user's turn. The Pipe
+      refuses requests carrying attachments either way.
 - [ ] `ENABLE_API_KEYS=false` unless needed. The Pipe refuses requests
       without a `chat_id` anyway.
 
@@ -310,11 +414,17 @@ Check the rest in the admin UI.
       setting. The trade-off: admin-UI settings don't survive a restart.
 - [ ] Mount the config directory and database **read-only**; only the
       audit log volume is writable.
+- [ ] Run one RBIC Pipe function per Open WebUI process (or give every
+      copy the same `AUDIT_LOG_PATH`). rbic has one audit file per
+      process: a second copy with a different path writes into the first
+      one's file and logs `PIPE_CONFIG_WARNING`.
 - [ ] Treat Open WebUI admins as fully trusted. They can edit function
       code, read Valves, the environment (including the API key), the
       config directory, `policy_changes.jsonl` (worker emails) and every
-      stored chat. Keep the admin set minimal. `ENABLE_ADMIN_CHAT_ACCESS=false`
-      reduces casual exposure but is not a boundary.
+      stored chat, and they can change any user's email (which re-maps
+      that user to another worker). Keep the admin set minimal.
+      `ENABLE_ADMIN_CHAT_ACCESS=false` reduces casual exposure but is not
+      a boundary.
 - [ ] Answers are stored at rest in Open WebUI's database
       (`/app/backend/data`), including any rows the model summarized.
       Protect and back up that volume like the company database, and set a
@@ -336,6 +446,8 @@ audit log while you go (`docker compose exec open-webui tail -f
 | 4 | carol | Ask about payslips. Then on the host run `rbic-master --config-dir examples/demo master` and ask it to remove `payroll_manager`'s row scope on `payroll` (the `employee_id IN ({self_and_subordinate_ids})` rule; answer `yes`). Ask again in the **same chat**. | The next answer starts with *"(Access policy was updated — conversation reset.)"* and shows only her own payslip (employee_id 2) | Container: `POLICY_RELOAD`, `POLICY_RESET user=carol …`, then `ALLOW … WHERE payroll.employee_id = '2'`. Host (`rbic-master`'s stderr): `POLICY_CHANGE …` |
 | 5 | any | Temporarily set `ENABLE_TITLE_GENERATION=true` and restart, then chat | The chat title is "Company data chat" | `PIPE_TASK_STUB task='title_generation'`, with no `ALLOW`/`DENY` for it |
 | 6 | carol | Call the API without a `chat_id` (see below) | `AUDIENCE_DENY_MESSAGE` (*"This assistant only answers in private one-to-one chats."*) | `PIPE_AUDIENCE … reason=no chat_id`, `AUDIENCE_DENY …` |
+| 7 | carol | With `ALLOW_API_REQUESTS=true`, repeat step 6 with a chat reference: add `"files": [{"type": "chat", "id": "<id of carol's chat from step 2>"}]` to the JSON (the id is the last part of the chat's URL) | *"Attachments, documents and chat references can't be used with this assistant. Please ask your question directly."* | `PIPE_ATTACHMENT_REFUSED subject='<id>' source=metadata.files`, and no `ALLOW`/`DENY` line |
+| 8 | owui-admin | Admin Panel → Users | owui-admin and the bootstrap placeholder are `admin`; bob, carol, dave, mallory are `user`, whatever order they signed in | — |
 
 Undo step 4 afterwards with `rbic-master` (`propose_undo`) or by
 re-checking out `examples/demo/casbin/policy.csv`.
@@ -360,6 +472,8 @@ deployment:
 
 1. Start it with `ENABLE_PASSWORD_AUTH=true`, `ENABLE_LOGIN_FORM=true` and
    `WEBUI_ADMIN_EMAIL` / `WEBUI_ADMIN_PASSWORD` set to throwaway values.
+   (Password sign-in also opens the bootstrap placeholder admin, which is
+   why it stays off in every real deployment.)
 2. Have the admin create a local test user whose email is a demo worker's
    (Admin Panel → Users → Add user).
 3. Set the Valves `IDENTITY_SOURCE=admin_created` and
@@ -380,7 +494,11 @@ Never do this with real credentials or on a shared host.
 | `IDENTITY_DENY … unmapped identity` for a real worker | The SSO email doesn't match the worker's `email` in `worker_attributes.json` (compared ASCII-lowercased). Fix the HR record, not the IdP. |
 | Every answer is *"This assistant only answers in private one-to-one chats."* | A temporary chat, channel or shared chat, or an API call without `chat_id`. `PIPE_AUDIENCE … reason=…` names the case. Start a normal new chat. |
 | Login loops or "OAuth login failed" | The browser and the container must reach Keycloak under the same URL (`http://keycloak.localhost:8080`). If your browser doesn't resolve `*.localhost`, add `127.0.0.1 keycloak.localhost` to your hosts file. Check `WEBUI_URL` and that the redirect URI matches the Keycloak client (`/oauth/oidc/login/callback`). |
-| New users can't chat ("pending") | `DEFAULT_USER_ROLE` is `pending`; approve them under Admin Panel → Users. |
+| New users can't chat ("pending") | `DEFAULT_USER_ROLE` is `pending` and their token carries no roles claim; give them the IdP role (`owui-user`) or approve them under Admin Panel → Users. |
+| Sign-in fails with "access prohibited" | OAuth role management: the token's `roles` claim has neither an `OAUTH_ALLOWED_ROLES` nor an `OAUTH_ADMIN_ROLES` value. Assign the user `owui-user` (or `owui-admin`) on the `open-webui` client in Keycloak. |
+| `docker compose up` stops with "Set WEBUI_SECRET_KEY …" | Export `WEBUI_SECRET_KEY` and `WEBUI_BOOTSTRAP_ADMIN_PASSWORD` first (Quickstart step 2). |
+| *"Attachments, documents and chat references can't be used…"* | The request carried a file, knowledge, a chat reference, web search results or retrieved context (`PIPE_ATTACHMENT_REFUSED … source=…` names where). Ask without attachments; turn off the model's File Upload / File Context / Web Search capabilities and detach its knowledge. |
+| `PIPE_CONFIG_WARNING … audit log already configured by another RBIC Pipe` | Two RBIC Pipe functions with different `AUDIT_LOG_PATH`s in one process. Records go to the `in_use` file. Keep one RBIC Pipe, or give both the same path. |
 | Function import fails with `No module named 'rbic'` | The container isn't the derived image. Rebuild with `docker compose up --build`. |
 | Status "Checking access…" never clears | Harmless. The answer is still delivered; emitter errors are ignored. |
 | `LLM_ERROR` lines, *"temporarily unavailable"* | `ANTHROPIC_API_KEY` is missing or wrong in the container environment, or the API is unreachable. |
@@ -395,7 +513,7 @@ Re-check them when bumping the image.
 
 - **Pipe calling convention:** `backend/open_webui/functions.py`.
   - The Pipe gets `body` plus only the reserved arguments its signature
-    names (`__user__ = user.model_dump()`, `__metadata__`, `__task__`,
+    names (`__user__ = user.model_dump()`, `__metadata__`, `__task__`, `__files__`,
     `__event_emitter__`, …).
   - `pipes()` returns `{"id", "name"}` entries, which become model ids
     `<function id>.<id>`.
@@ -410,7 +528,42 @@ Re-check them when bumping the image.
   - It is written on OAuth sign-up and sign-in.
   - Email merging only happens if `OAUTH_MERGE_ACCOUNTS_BY_EMAIL`.
   - `email_verified` is not checked.
-  - The first account becomes admin.
+  - The first account becomes admin even with role management on: the
+    first SSO sign-up is promoted after insert when it is the only user
+    (`utils/oauth.py` 2194-2198), and the only user is kept admin on
+    every sign-in (`get_user_role`, ~1602-1605). `WEBUI_ADMIN_EMAIL` +
+    `WEBUI_ADMIN_PASSWORD` create an admin at start-up when there are no
+    users (`env.py` 806-808, `main.py` 400-403, `utils/auth.py`
+    `create_admin_user` 631-656).
+  - Role management (`config.py` 2673, 2688-2700; `utils/oauth.py`
+    `get_user_role` 1614-1671): the `OAUTH_ROLES_CLAIM` (dotted paths
+    allowed, `_get_claim` 227) is read from the ID-token/userinfo claims;
+    an `OAUTH_ADMIN_ROLES` value → admin, an `OAUTH_ALLOWED_ROLES` value →
+    user, roles present but neither → sign-in refused (403), no claim → the
+    current role / `DEFAULT_USER_ROLE`.
+  - `OAUTH_UPDATE_EMAIL_ON_LOGIN` (`config.py` 2708, default off) resets
+    the stored email to the IdP's claim on sign-in (`utils/oauth.py`
+    2112-2124; skipped if another account has that email). Admins can edit
+    any user's email (`routers/users.py` ~993-995).
+  - `ENABLE_OAUTH_TOKEN_EXCHANGE` (`env.py` 901, default off) gates the
+    token-exchange endpoint (`routers/auths.py` ~1613-1615).
+- **Retrieval for Pipes** (why attachments are refused):
+  - The request's `files` become `metadata["files"]` (`main.py` 1335;
+    `utils/middleware.py` `process_chat_payload` 2641-2651) and the Pipe's
+    `__files__` (`functions.py` 228, 256).
+  - The files handler runs for every model whose *File Context*
+    capability is on (default) (`utils/middleware.py` 2944-2949) and
+    records the retrieved context in `metadata["sources"]` (2970).
+  - A `type: "chat"` reference is rebuilt as `#### User` / `#### Assistant`
+    text (`retrieval/utils.py` 1469-1500).
+  - The context is wrapped in `<source id=…>` tags (`get_source_context`,
+    `utils/middleware.py` 613-640) and the RAG template
+    (`DEFAULT_RAG_TEMPLATE`, `config.py` 1077-1101: `### Task:` …
+    `<context>…</context>`), and goes into the **last user message** unless
+    `RAG_SYSTEM_CONTEXT=true` (`env.py` 372, default off;
+    `apply_source_context_to_messages`, `utils/middleware.py` 669-680).
+  - Model capability names: `src/lib/components/workspace/Models/Capabilities.svelte`
+    (`file_upload`, `file_context`, `web_search`, `builtin_tools`, …).
 - **Chat ids:** `backend/open_webui/utils/chat_id.py` (`temporary:`,
   legacy `local:`, `channel:`) and `backend/open_webui/main.py`
   (`chat_completion`).

@@ -67,4 +67,6 @@ jobs:
         working-directory: integrations/openwebui
         env:
           ANTHROPIC_API_KEY: ci-placeholder-not-a-key
+          WEBUI_SECRET_KEY: ci-placeholder-not-a-secret
+          WEBUI_BOOTSTRAP_ADMIN_PASSWORD: ci-placeholder-not-a-password
         run: docker compose config --quiet
