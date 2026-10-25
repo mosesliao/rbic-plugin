@@ -18,7 +18,9 @@ dependencies = [
 
 [project.optional-dependencies]
 # build: tests/test_wheel_contents.py builds the wheel it inspects.
-test = ["pytest", "build"]
+# pydantic: tests/test_openwebui_pipe.py loads the Open WebUI Pipe (its
+# Valves are pydantic v2 models; anthropic already depends on pydantic).
+test = ["pytest", "build", "pydantic>=2"]
 
 [project.scripts]
 rbic-chat = "rbic.cli.chat:main"
