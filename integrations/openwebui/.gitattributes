@@ -1,0 +1,2 @@
+# Dockerfile, shell in RUN steps, YAML and JSON stay LF on Windows checkouts.
+* text=auto eol=lf

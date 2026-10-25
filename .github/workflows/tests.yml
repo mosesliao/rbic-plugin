@@ -41,7 +41,9 @@ jobs:
           "$RUNNER_TEMP/wheel-venv/bin/rbic-gate-demo" --config-dir "$GITHUB_WORKSPACE/examples/demo"
 
   # Not a required check. Proves the declared lower bound anthropic>=0.86
-  # (the version Open WebUI pins) works with the engine.
+  # works with the engine, and runs the Open WebUI Pipe tests against the
+  # versions Open WebUI v0.12.4 pins (anthropic==0.86.0, pydantic==2.13.4).
+  # (The pytest job above runs the Pipe tests too, with the latest deps.)
   adapters:
     name: adapters (anthropic 0.86.0)
     runs-on: ubuntu-latest
@@ -52,10 +54,11 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: pyproject.toml
-      - name: Install anthropic 0.86.0, then the package
+      - name: Install anthropic 0.86.0 / pydantic 2.13.4, then the package
         run: |
-          pip install "anthropic==0.86.0"
-          pip install -e ".[test]" "anthropic==0.86.0"
+          pip install "anthropic==0.86.0" "pydantic==2.13.4"
+          pip install -e ".[test]" "anthropic==0.86.0" "pydantic==2.13.4"
           python -c "import anthropic; assert anthropic.__version__ == '0.86.0', anthropic.__version__; print('anthropic', anthropic.__version__)"
-      - name: Engine, identity and history tests
-        run: python -m pytest -q tests/test_engine.py tests/test_identity.py tests/test_history.py tests/test_cli.py
+          python -c "import pydantic; assert pydantic.VERSION == '2.13.4', pydantic.VERSION; print('pydantic', pydantic.VERSION)"
+      - name: Engine, identity, history and Open WebUI Pipe tests
+        run: python -m pytest -q tests/test_engine.py tests/test_identity.py tests/test_history.py tests/test_cli.py tests/test_openwebui_pipe.py
