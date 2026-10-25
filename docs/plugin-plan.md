@@ -1,7 +1,8 @@
 # RBIC plugin plan: core package, Open WebUI plugin, onboarding toolkit
 
 - **Date:** 2026-10-21
-- **Status:** approved plan, not yet implemented
+- **Status:** approved plan. Phase 1 is merged. Phase 2 (Open WebUI plugin) is implemented on branch
+  `feat/openwebui-pipe` (`integrations/openwebui/`); see `CLAUDE.md` for where it differs from section 5.
 
 This document records the agreed plan for turning the RBIC gate and chatbot
 into a reusable plugin. It is written for the project owner and for future
