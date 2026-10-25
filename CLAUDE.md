@@ -7,7 +7,7 @@ database while revealing only what their role permits:
 
 - **Master user** manages policy (Casbin model + policy files)
 - **Worker user** asks natural-language questions; the LLM translates them to SQL
-- A **SQL gate** (`sql_gate.py`) enforces access *before* any data reaches the LLM
+- A **SQL gate** (`rbic.gate`) enforces access *before* any data reaches the LLM
 - Denied requests get the fixed, code-generated response:
   _"You have no access to this information, please approach your manager."_
 
@@ -25,11 +25,19 @@ the query layer — never via system-prompt instructions (see Legacy note).
 ## Architecture
 
 ```
-worker question (natural language)
+host (rbic-chat CLI, Open WebUI Pipe, ...): authenticated Identity + chat history
         ↓
-LLM (text-to-SQL)                      Anthropic API
+RBICEngine.ask(identity, messages, conversation_id=, audience=)
+        ├─ audience      only Audience.PRIVATE              (else fixed deny)
+        ├─ snapshot      one gate snapshot for the whole request
+        ├─ identity      AttributeProvider → worker; unmapped/master → DENY_MESSAGE
+        ├─ history       sanitize_history: plain-text user/assistant turns only
+        ├─ guard         (worker, conversation_id) → fingerprint; drop stale turns
+        └─ system prompt built server-side from the worker's grants
+        ↓
+LLM (text-to-SQL, run_sql tool)        Anthropic API
         ↓  candidate SQL
-sql_gate.SQLGate.authorize(username, sql)
+rbic.gate.SQLGate.authorize(username, sql)
         ├─ 1. parse       sqlglot AST; single SELECT only (no UNION/DML/DDL)
         ├─ 2. qualify     resolve columns vs db_schema.json; expand SELECT *
         ├─ 3. constructs  allowlist of expression types: anything the column
@@ -43,10 +51,10 @@ sql_gate.SQLGate.authorize(username, sql)
         ↓  rewritten safe SQL
 database (least-privilege DB role)
         ↓  rows the worker may see
-LLM summarizes results → answer to worker
+LLM summarizes results → AskResult(text, denied, reason, ...) → host
 ```
 
-On `AccessDenied`, the chatbot prints `sql_gate.DENY_MESSAGE` directly — the
+On `AccessDenied`, `ask()` returns `rbic.gate.DENY_MESSAGE` directly — the
 LLM never generates (and can never be talked out of) the deny message.
 
 ---
@@ -55,39 +63,187 @@ LLM never generates (and can never be talked out of) the deny message.
 
 ```
 project/
-├── .env                    # ANTHROPIC_API_KEY — never commit
+├── .env                    # ANTHROPIC_API_KEY — never commit (read by rbic.cli only)
 ├── CLAUDE.md               # this file
-├── casbin/
-│   ├── model.conf          # RBAC model + p2 (ABAC filter) definition
-│   └── policy.csv          # p (grants), g (hierarchy), p2 (row filters)
-├── db_schema.json          # table → columns; the qualify/deny reference
-├── worker_attributes.json  # username → {role, dept/site…}; IdP/HRIS stand-in
-├── sql_gate.py             # the PEP: parse → RBAC → ABAC → safe SQL
-├── chatbot.py              # worker CLI: NL → text-to-SQL → gate → answer
-├── master_bot.py           # master CLI: NL → proposed policy change → human yes/no
-├── policy_admin.py         # validated, atomic, audited policy/attribute editor
-├── policy_changes.jsonl    # runtime audit log of applied changes (gitignored)
-├── seed_db.py              # creates + seeds company.db (demo data)
-├── company.db              # seeded SQLite demo DB (regenerate anytime)
-├── test_salary_policy_evolution.py  # pytest: policy stages 0→1→2
-├── test_master_policy.py   # pytest: master bot, hot reload, validation, undo
-├── test_scoped_grants.py   # pytest: 4-field p2 scoped grants
-├── test_user_overrides.py  # pytest: per-user rules, deny rules, precedence
-├── test_gate_review_fixes.py  # pytest: security-review regressions (both dialects)
-└── requirements.txt        # anthropic, python-dotenv, casbin, sqlglot, pytest
+├── README.md
+├── pyproject.toml          # rbic-plugin: deps, [test] extra, entry points (hatchling, src layout)
+├── docs/RELEASING.md       # owner checklist: Trusted Publishing, environments, tagging
+├── .github/workflows/
+│   ├── tests.yml           # pytest (3.10/3.11/3.12) + wheel smoke; adapters (anthropic 0.86.0)
+│   └── release.yml         # v*.*.* tag on main → build/test → TestPyPI → PyPI (OIDC, SHA-pinned actions)
+├── src/rbic/               # the library: no print/input/exit/basicConfig/dotenv here
+│   ├── __init__.py         # public API: RBICEngine, Identity, Audience, AskResult, SQLGate, ...
+│   ├── audit.py            # "rbic.audit" logger: NullHandler + configure(path) JSON lines
+│   ├── config.py           # EngineConfig / resolve_config: args > RBIC_* env > defaults
+│   ├── gate.py             # the PEP: parse → RBAC → ABAC → safe SQL; load_snapshot (THE loader)
+│   ├── engine.py           # RBICEngine.ask(): identity → history → guard → gated tool loop
+│   ├── identity.py         # Identity, AttributeProvider, JsonAttributeProvider, LocalProvider
+│   ├── history.py          # sanitize_history: untrusted host history → text-only turns
+│   ├── master.py           # master tools, dispatch, email redaction, confirm flow (injected I/O)
+│   ├── admin.py            # validated, atomic, audited policy/attribute editor
+│   ├── demo/seed.py        # demo company.db schema + rows (seed())
+│   └── cli/                # the only terminal I/O: argparse, print/input, .env, logging setup
+│       ├── chat.py         # rbic-chat: run_chatbot on RBICEngine.ask() (LocalProvider)
+│       ├── master.py       # rbic-master: interactive master session
+│       ├── gate_demo.py    # rbic-gate-demo: 15 fixed queries (6 ALLOW, 9 DENY on the demo)
+│       └── seed.py         # rbic-seed
+├── examples/demo/          # demo config dir (not in the wheel)
+│   ├── casbin/
+│   │   ├── model.conf      # RBAC model + p2 (ABAC filter) definition
+│   │   └── policy.csv      # p (grants), g (hierarchy), p2 (row filters)
+│   ├── db_schema.json      # table → columns; the qualify/deny reference
+│   ├── worker_attributes.json  # username → {role, email, dept/site…}; IdP/HRIS stand-in
+│   ├── company.db          # seeded SQLite demo DB (generated, gitignored)
+│   └── policy_changes.jsonl  # runtime changelog of applied changes (gitignored)
+├── tests/
+│   ├── conftest.py         # copies examples/demo + seeded DB into tmp_path
+│   ├── test_config.py      # pytest: config precedence, refusals, cwd independence
+│   ├── test_engine.py      # pytest: RBICEngine.ask() decision order, guard, errors
+│   ├── test_history.py     # pytest: host history sanitizing
+│   ├── test_identity.py    # pytest: identity providers, email index, fingerprint, no-email logs/LLM
+│   ├── test_phase1_review_fixes.py  # pytest: Phase 1 review regressions (emails, schema reload, URI, ...)
+│   ├── test_cli.py         # pytest: rbic.cli entry points with injected I/O / fake clients
+│   ├── test_library_hygiene.py  # pytest: AST scan, import side effects, audit.configure
+│   ├── test_wheel_contents.py   # pytest: wheel = rbic/** + dist-info only
+│   ├── test_admin_loader.py     # pytest: PolicyAdmin validates with gate.load_snapshot
+│   ├── test_salary_policy_evolution.py  # pytest: policy stages 0→1→2
+│   ├── test_master_policy.py   # pytest: master bot, hot reload, validation, undo
+│   ├── test_master_confirm.py  # pytest: master yes/no confirmation flow
+│   ├── test_scoped_grants.py   # pytest: 4-field p2 scoped grants
+│   ├── test_user_overrides.py  # pytest: per-user rules, deny rules, precedence
+│   └── test_gate_review_fixes.py  # pytest: security-review regressions (both dialects)
+└── scripts/demo/           # drive.py + record.ps1: re-record docs/master-bot-demo.gif
 ```
+
+The config directory has a fixed layout (`casbin/model.conf`,
+`casbin/policy.csv`, `db_schema.json`, `worker_attributes.json`; db
+defaults to `<config_dir>/company.db`). There is no default config dir and
+no cwd fallback: pass `--config-dir` or set `RBIC_CONFIG_DIR`
+(`RBIC_DB_PATH`, `RBIC_MODEL`, `RBIC_DIALECT` likewise). `SQLGate` and
+`PolicyAdmin` take explicit paths (or `.from_config(cfg)`); the gate's
+`dialect` is a required keyword argument.
 
 Run:
 ```bash
-python sql_gate.py        # gate demo cases (no API key needed)
-python seed_db.py         # (re)create the demo database
-pytest -q                 # policy-evolution + invariant tests
-python chatbot.py alice   # chat as a worker (needs ANTHROPIC_API_KEY)
-python chatbot.py bob     # hr_staff — try asking for salaries
-python master_bot.py master  # master user: change policy by chatting
+pip install -e ".[test]"
+rbic-gate-demo --config-dir examples/demo   # gate demo cases (no API key needed)
+rbic-seed --config-dir examples/demo        # (re)create the demo database
+python -m pytest -q                         # all tests (work on tmp copies)
+rbic-chat --config-dir examples/demo alice  # chat as a worker (needs ANTHROPIC_API_KEY)
+rbic-chat --config-dir examples/demo bob    # hr_staff — try asking for salaries
+rbic-master --config-dir examples/demo master  # master user: change policy by chatting
+python -m rbic.cli.gate_demo --config-dir examples/demo  # any CLI also runs as a module
 ```
+Every CLI takes `--help`; `rbic-chat`, `rbic-master` and `rbic-gate-demo`
+also take `--audit-log PATH` (JSON lines, see Audit logging).
 
-### chatbot.py flow
+### RBICEngine.ask() flow (engine.py)
+`ask(identity, messages, *, conversation_id=None, audience=PRIVATE) ->
+AskResult(text, denied, reason, worker, role, reset)` is the single entry
+point for every chat host (`aask` = `asyncio.to_thread(ask)`; `reload()`
+returns the policy fingerprint). In order — every refusal is code text and
+happens before the LLM is called:
+1. **Audience**: anything but `Audience.PRIVATE` (including strings) →
+   `AUDIENCE_DENY_MESSAGE`, audit `AUDIENCE_DENY`.
+2. **One snapshot**: `gate.refreshed_snapshot()` is taken once for
+   identity, system prompt and fingerprint. Broken → `DENY_MESSAGE`,
+   reason `policy unavailable`, history ignored.
+3. **Identity**: the host's `Identity` is first copied to a fresh
+   `Identity` of plain `str` fields (anything that isn't an `Identity`, or
+   whose fields can't be read → "not an Identity"). The attribute provider
+   (default `JsonAttributeProvider`: email → the worker whose record has
+   that `email`, compared with `gate.normalize_email` — ASCII whitespace
+   stripped, plain ASCII address required, ASCII-lowercased; **never
+   casefolded**, which maps lookalikes such as `ſ`/U+212A/`ß`/`ﬁ` onto
+   ASCII) resolves against that snapshot's **read-only** attributes
+   (`MappingProxyType` / tuples all the way down: a provider can't change
+   what later requests see). Unmapped, role-less, `master`, or a
+   `user:` role → `DENY_MESSAGE`, audit `IDENTITY_DENY` (provider and
+   subject — the host's user id — only: never the email, nor a hash of it).
+4. **History**: `sanitize_history()` keeps only plain-text user/assistant
+   turns (merged, truncated, ending with the user); empty → a fixed
+   "Please type a question." (not a deny). The iterable is materialized
+   once (one that fails part-way → empty); dicts are read via `dict.get`
+   itself, other Mappings in a try; roles/contents (and the
+   conversation id) are copied to exact `str`, so str/dict subclass
+   overrides never run.
+5. **Conversation guard** (in memory, bounded LRU of 10,000
+   `(worker, conversation_id)` entries → policy fingerprint + digests of
+   the replies `ask()` returned under it): no id / unknown conversation →
+   only the last user turn is sent; fingerprint changed → only the last
+   user turn, `reset=True`, reply prefixed with `POLICY_RESET_NOTICE`;
+   same fingerprint → the turns after the last assistant turn that is not
+   one of our own replies under this fingerprint (normally all of them),
+   so pre-change turns the host still holds are never resent.
+   The guard lives in **per-process memory**: after a restart, and in a
+   multi-worker host (several processes / replicas) whenever a request
+   lands on a process that hasn't seen the conversation, the conversation
+   is unknown and is treated as new (fail closed: only the last user turn
+   is sent). The fingerprint covers **every** worker's attributes, so any
+   edit to worker_attributes.json (an HR change for one person) resets
+   every conversation once.
+6. **System prompt** built here from the worker's role (`allowed_schema`,
+   `scoped_schema`) — never from the host.
+7. **Tool loop** on a private copy; every `run_sql` → `gate.authorize()`;
+   `AccessDenied` (or an unknown tool / malformed call) → `DENY_MESSAGE`,
+   reason = the gate's reason. Tool blocks never leave `ask()`.
+8. **Mid-turn change**: the snapshot is re-taken after the turn; a new
+   version/fingerprint (or a broken gate) discards the answer →
+   `POLICY_CHANGED_MESSAGE`, `reset=True`, guard entry dropped.
+9. **Errors**: any Anthropic error → `LLM_UNAVAILABLE_MESSAGE`, audit
+   `LLM_ERROR` (exception class only); anything else in the tool loop →
+   same text, `ENGINE_ERROR`. Gated SQL that fails to execute gives the
+   model only `"The query could not be executed. (<ExceptionClass>)"`
+   (`SQL_ERROR_TOOL_MESSAGE`; SQLite messages can quote values), audit
+   `SQL_ERROR` (class only).
+10. **Never raises**: `ask()` wraps the whole pipeline; any `Exception`
+   (a hostile host object, a bug) → `DENY_MESSAGE`, `denied=True`, reason
+   `engine error`, audit `ENGINE_ERROR stage=ask` (class only).
+
+`AskResult.reason` is for host logs only — hosts must never display it.
+The engine executes on SQLite read-only (`engine.readonly_uri`:
+`Path(db).resolve().as_uri() + "?mode=ro"`, never the raw path — a `#` or
+`?` in it would drop `mode=ro`, a `%` would be decoded) and refuses to
+build if the dialect isn't `sqlite` or the database is missing; the Anthropic client is
+created lazily on the first LLM call. Library code (everything outside
+`rbic.cli`) never calls `print`/`input`/`exit`/`sys.exit`/
+`logging.basicConfig` or imports `dotenv` (`test_library_hygiene.py`
+scans the AST); only the `rbic.cli.*` `main()`s load `.env` and set up
+logging.
+
+### Audit logging (rbic.audit)
+- Every module logs on the `"rbic.audit"` logger (`rbic.audit.logger`):
+  `ALLOW`/`DENY` (gate), `IDENTITY_DENY`, `AUDIENCE_DENY`,
+  `POLICY_UNAVAILABLE_DENY`, `POLICY_RESET`, `POLICY_CHANGED_DURING_TURN`,
+  `SQL_ERROR`, `LLM_ERROR`/`ENGINE_ERROR` (engine), `POLICY_RELOAD[_FAILED]`,
+  `POLICY_CONFIRM`, `POLICY_CHANGE[_LOG_FAILED]` (master/admin). The line
+  formats are stable.
+- **Decision: library convention.** Importing `rbic` attaches only a
+  `NullHandler` to `rbic.audit` and never touches the root logger. The
+  trade-off is deliberate: with no handler anywhere, Python's last-resort
+  handler stays silent and audit records (DENY warnings included) are
+  discarded. So hosts are **required** to call
+  `rbic.audit.configure(path, level=logging.INFO)` once at startup (the
+  Open WebUI Pipe will) or attach their own handler to `rbic.audit`/root.
+  `RBICEngine()` emits one `AuditNotConfiguredWarning` per process when
+  neither happened (`audit.is_configured()`).
+- `configure()` attaches one idempotent JSON-lines `FileHandler` (same
+  path → same handler; a new path replaces it; host handlers are left
+  alone; `unconfigure()` removes it) and lowers the logger level to
+  `level` if needed. Each line: `{"ts": UTC ISO 8601, "level", "event":
+  first word of the message, "message": the full audit line}`.
+- The CLIs log `LEVEL message` to stderr (`logging.basicConfig`, casbin at
+  WARNING) and add the JSON file with `--audit-log PATH`.
+- Audit lines never contain a worker's email or a hash of one.
+  `policy_changes.jsonl` (the master changelog used for history/undo) does
+  hold full before/after file text, emails included — protect it like the
+  config directory.
+
+### rbic.cli.chat flow (rbic-chat)
+- `run_chatbot` calls `engine.ask(Identity("local", username), history,
+  conversation_id=<per-session uuid>)` with `LocalProvider` (CLI only —
+  hosts serving web users must never use it), keeps a text-only history,
+  and prints `result.text`. Deny handling lives only in `ask()`.
 - The model gets a `run_sql` tool and a system prompt listing **only the
   tables/columns its role may read** (`allowed_schema()`), plus its scoped
   grants' column lists (`scoped_schema()`, flagged "row-limited", filter
@@ -96,19 +252,39 @@ python master_bot.py master  # master user: change policy by chatting
 - Every `run_sql` call goes through `gate.authorize()`; results are returned
   to the model as JSON (capped at `MAX_ROWS_TO_MODEL`).
 - The SQLite connection is opened **read-only** (`mode=ro`) — invariant #3.
-- On `AccessDenied`, the partial tool-use turn is rolled back from history and
-  `DENY_MESSAGE` is printed from code (invariant #4).
-- Each turn calls `refresh_session()` → `gate.refresh()`: the role is re-read
-  from `gate.attributes` and the system prompt rebuilt. If `policy_version`
-  changed, history is cleared and "(Access policy was updated — conversation
-  reset.)" is printed, so rows fetched under the old policy never linger.
+- On `AccessDenied`, the private tool-use turns are discarded and
+  `DENY_MESSAGE` is returned from code (invariant #4).
+- Each turn re-reads the policy (one snapshot) and rebuilds the system
+  prompt from the worker's current role. When the policy fingerprint
+  changed, earlier turns are dropped and the reply starts with "(Access
+  policy was updated — conversation reset.)", so rows fetched under the
+  old policy never linger; the CLI then trims its own history too.
 
-### Hot reload (sql_gate.py)
+### Hot reload (rbic.gate)
 - `authorize()` starts with `_maybe_reload()`: stat (mtime_ns, size, inode)
-  of policy.csv, model.conf, worker_attributes.json; on change, build a
-  complete new immutable `PolicySnapshot` (enforcer, attributes, compiled
-  row filters, version, broken reason) and swap it in under a
-  `threading.Lock`, then log `POLICY_RELOAD`.
+  of policy.csv, model.conf, worker_attributes.json **and db_schema.json**;
+  on change, build a complete new immutable `PolicySnapshot` (enforcer,
+  attributes, schema, compiled row filters, version, broken reason) with
+  `load_snapshot()` and swap it in under a `threading.Lock`, then log
+  `POLICY_RELOAD`.
+- `load_snapshot(model_bytes, policy_bytes, attributes_bytes,
+  schema_bytes, *, dialect)` is **the** loader: `check_policy_bytes` (lone
+  CR, unknown ptype), the bytes-based Casbin load (`load_enforcer`), JSON
+  attributes and schema, `compile_snapshot` (schema shape, arity, user
+  subjects, master, unsafe filters, email shape/uniqueness) and the
+  fingerprint. PolicyAdmin validates with the same function over the same
+  files (db_schema.json included), so it can never write a policy the gate
+  would refuse.
+- The schema is part of the snapshot (`snapshot.schema`, read-only;
+  `gate.schema` is the current snapshot's): qualify, column resolution,
+  row-filter compilation and the engine's system prompt all use the
+  request's snapshot schema, never a copy taken at start-up. Editing
+  db_schema.json takes effect on the next request (no restart), and a
+  malformed one fails the reload (deny all) like any other policy file.
+- Snapshot attributes and schema are deeply read-only (`gate.freeze`:
+  `MappingProxyType` over fresh dicts, tuples for lists). Code that needs
+  different attributes writes worker_attributes.json (or goes through
+  PolicyAdmin); nothing mutates a snapshot.
 - `authorize()` grabs the snapshot **once**; parse → RBAC → ABAC all use
   that snapshot (passed explicitly), so a reload mid-request can never mix
   old grants with new row filters. The gate is safe to share across
@@ -121,9 +297,14 @@ python master_bot.py master  # master user: change policy by chatting
 - Any unexpected exception inside `authorize()` (e.g. a sqlglot
   `TokenError`) is converted to a DENY — every `SqlglotError` is caught.
 
-### master_bot.py flow
-- `python master_bot.py master` refuses to start unless the user's role is
-  `master`. `master` is not a Casbin role and has no data grants or data tools.
+### rbic.master / rbic.cli.master flow (rbic-master)
+- `rbic.master` holds the tools, dispatch (`run_tool`), system prompt and
+  the confirm flow (`confirm_pending`, `ask_yes_no`) with injected
+  `input_fn`/`output`; `rbic.cli.master.run_master_bot` is the terminal
+  loop. `require_master` raises `NotMasterError`; the CLI exits with it.
+- `rbic-master --config-dir <dir> master` refuses to start (and re-checks
+  before every turn) unless the user's role is `master`. `master` is not a
+  Casbin role and has no data grants or data tools.
 - Tools: list_roles, list_tables, describe_role, describe_user, show_history,
   propose_grant, propose_revoke, propose_deny, propose_remove_deny,
   propose_row_scope, propose_remove_row_scope (optional `columns` → a
@@ -140,6 +321,14 @@ python master_bot.py master  # master user: change policy by chatting
 - `propose_*` → `PolicyAdmin` validates and returns a `Change` (exact
   before/after text + computed effect summary) without writing. It is held
   as pending; validation errors go back to the model as `is_error` results.
+  Every proposal's resulting files (policy.csv + worker_attributes.json)
+  must load through `gate.load_snapshot` in both dialects, else it is
+  refused ("would not load in the SQL gate: …").
+- **No worker emails reach the LLM.** `run_tool` output is what the model
+  sees: `describe_user` shows `email: <set>` / `<not set>`, and any worker
+  address left in any tool result (or `[Code note]` error) is replaced by
+  `<email>`. The human-facing description/diff printed at the
+  confirmation prompt is unchanged.
 - After the model's turn, code prints each pending change (description +
   unified diff) and asks `Apply change <id>? [yes/no]`. Only `yes`/`y`
   (any case) calls `PolicyAdmin.apply()`; `no`/`n` declines; anything else
@@ -151,8 +340,9 @@ python master_bot.py master  # master user: change policy by chatting
   `apply()` runs under an inter-process lock file (`casbin/.policy.lock`,
   `O_CREAT|O_EXCL`, retried with a timeout, always removed), re-checks the
   actor is a master and that every input hash still matches — otherwise
-  "Policy changed since this was proposed — please ask again" — and (for
-  policy.csv) that the new file loads in a fresh `casbin.Enforcer`.
+  "Policy changed since this was proposed — please ask again" — and that
+  the resulting files load through `gate.load_snapshot` (before the
+  changelog record is written).
 - Audit ordering: the full changelog record is appended with status
   `applying` **before** the atomic `os.replace`, then a full record with
   status `applied` (or a `failed: <reason>` record). A live change can
@@ -192,7 +382,7 @@ python master_bot.py master  # master user: change policy by chatting
 - **Subjects** are roles or `user:<username>` (namespaced so a username can
   never collide with a role). A `user:` subject must name an existing
   non-master worker in worker_attributes.json, else the load fails closed.
-- Four ptypes, all read by `sql_gate.py` (`enforce()` is not used for
+- Four ptypes, all read by `rbic.gate` (`enforce()` is not used for
   decisions; the gate applies `keyMatch` itself, which is equivalent to
   the matcher for the role level): `p` allow column, `p2` allow rows,
   `p3 = sub, obj, act` deny column, `p4 = sub, table, filter, columns` deny
@@ -221,7 +411,7 @@ python master_bot.py master  # master user: change policy by chatting
   `'{name}'` always binds a string literal; bare `{name}` binds a number if
   the value is an int or all digits (else a string), and inside `IN (...)`
   a comma-separated value expands to one literal per item.
-- **Template rules** (`sql_gate.compile_row_filter`). Always, also enforced
+- **Template rules** (`rbic.gate.compile_row_filter`). Always, also enforced
   by the gate on every load: a boolean condition; no subqueries, table
   references, stars, bind parameters or non-allowlisted functions; only
   unqualified columns of the filtered table; each placeholder stands alone
@@ -321,16 +511,33 @@ python master_bot.py master  # master user: change policy by chatting
   "own payslip" coexist with "browse department directory".
 
 ### `db_schema.json`
-Single source of truth for what tables/columns exist. Dual purpose:
+Single source of truth for what tables/columns exist
+(`{table: {column: type}}`). Dual purpose:
 1. lets `sqlglot.optimizer.qualify` resolve unqualified columns and expand
    `SELECT *` into explicit columns → star queries get real column-level RBAC;
 2. any table/column not listed here is an automatic deny.
 Keep it in sync with the real database (generate it from information_schema
-in production).
+in production). It is hot-reloaded and fingerprinted with the policy files
+(see Hot reload): a schema change applies on the next request and resets
+worker conversations once.
 
 ### `worker_attributes.json`
 Demo stand-in for the IdP/HRIS. In production these attributes must come from
-the authenticated session, never from user input.
+the authenticated session, never from user input. `email` (optional per
+worker) is the identity key `JsonAttributeProvider` maps sign-ins by: it
+must be a plain ASCII address and unique after ASCII lowercasing
+(`gate.normalize_email`, the same normalization identity emails get), or
+the load fails closed (everyone denied). The master bot can never change an email
+(`propose_set_attribute` refuses it, and no other path, undo included,
+may alter one) — it is owned by HR / the IdP.
+
+**Policy fingerprint**: `gate.fingerprint` / `PolicySnapshot.fingerprint`
+is a sha256 over the exact bytes of model.conf, policy.csv,
+worker_attributes.json and db_schema.json that the snapshot was built from
+(each file is read once per load; the bytes parsed are the bytes hashed). Unlike
+`policy_version` it is stable across restarts and processes.
+`compile_row_filter` and `compile_snapshot` take `dialect` as a required
+keyword.
 
 ---
 
@@ -343,7 +550,7 @@ the authenticated session, never from user input.
    parser can't fully account for must be rejected, not passed through. v1 is
    deliberately narrow (single SELECT); widen it only with tests proving the
    new construct is gated. Concretely, after `qualify` every node of the
-   tree must be in `sql_gate.SUPPORTED_NODES` and none in
+   tree must be in `rbic.gate.SUPPORTED_NODES` and none in
    `UNSUPPORTED_NODES` (`_check_constructs`): sqlglot's `TableColumn`
    (Postgres whole-row refs `e`, `(e).salary`, `to_jsonb(e)`,
    `row_to_json(e)`, `ORDER BY (e).salary` — a bare alias used as a value,
@@ -402,6 +609,36 @@ the authenticated session, never from user input.
     unknown user subject — denies everything (and clears worker history)
     until fixed. Policy writes are serialized by a file lock, verify all
     input hashes, and are audited before the file changes.
+11. **Identity comes only from the host's authenticated session.**
+    `ask()` resolves `Identity` (provider, subject, verified email) through
+    an `AttributeProvider` against the request's one snapshot; unmapped,
+    role-less, `master` and `user:`-role workers are denied with
+    `DENY_MESSAGE` before the LLM is called (audit `IDENTITY_DENY`).
+    Worker emails are validated and unique (else the load fails closed) and
+    can't be changed through the master bot. `LocalProvider` (subject =
+    worker key) is for the CLI and tests only.
+12. **Host history is untrusted text.** Only plain-text user/assistant
+    turns survive `sanitize_history`; the system prompt is always built
+    server-side; tool_use/tool_result blocks stay inside `ask()`; the
+    caller's message list is never mutated. Earlier turns are only sent
+    for a known conversation whose fingerprint is unchanged, and only after
+    the last assistant turn that isn't one of the engine's own replies
+    under that fingerprint.
+13. **Non-private audiences are denied.** Only `Audience.PRIVATE` is
+    answered; shared/unknown channels get `AUDIENCE_DENY_MESSAGE` from code
+    and the LLM is never called.
+
+### Host requirements (Phase 2 design note)
+
+- **Never paste transcripts into a user turn.** The conversation guard
+  (invariant #12) only filters *assistant* turns: earlier replies that a
+  host re-sends inside a USER turn are indistinguishable from the user's
+  own text, so they bypass the policy-change reset and rows fetched under
+  an old policy reach the model again. Open WebUI's background tasks
+  (chat title, tags, follow-up suggestions) do exactly this. Hosts must
+  route such background/task requests **away from `ask()`** (or answer
+  them without data, e.g. a fixed title) and only ever call `ask()` with
+  the real chat history, one message per turn.
 
 ---
 
@@ -423,7 +660,10 @@ reintroduce prompt-level enforcement as the primary control.
 ANTHROPIC_API_KEY=sk-ant-api03-your-key-here
 ```
 
-Install: `pip install -r requirements.txt`
+Install: `pip install -e ".[test]"` (development) or, once released,
+`pip install rbic-plugin`. Releases: tag `vX.Y.Z` → `.github/workflows/release.yml`
+(TestPyPI, then PyPI after approval); see `docs/RELEASING.md`.
+`__version__` lives only in `src/rbic/__init__.py` (currently `0.1.0.dev0`).
 
 LLM model for text-to-SQL / summarization: `claude-sonnet-4-6`.
 
@@ -431,17 +671,18 @@ LLM model for text-to-SQL / summarization: `claude-sonnet-4-6`.
 
 ## Next Steps
 
-- **Audit persistence**: ship `rbic.audit` records to a table/file with
-  worker, role, original SQL, rewritten SQL, decision, reason
+- **Audit persistence**: `rbic.audit.configure(path)` writes JSON lines
+  today; next, structured fields (worker, role, original SQL, rewritten
+  SQL, decision, reason) and shipping to a table / SIEM
 - **IdP integration**: replace `worker_attributes.json` with session-derived
   attributes
 - **Postgres migration**: swap SQLite for Postgres; generate `db_schema.json`
   from `information_schema`; add a SELECT-only DB role scoped to sanctioned
   views (strengthens invariant #3 beyond SQLite's `mode=ro`)
-- **Master web UI**: a web front end for `master_bot.py` (same
+- **Master web UI**: a web front end for `rbic.master` (same
   propose → human-confirm → apply flow; never expose an apply tool to the LLM)
-- **Gate test suite**: `test_salary_policy_evolution.py` is the start — fold
-  in the `sql_gate.py` demo cases and mock-client chatbot tests, and grow the
-  suite with every new SQL construct admitted past the parser (invariant #2)
+- **Gate test suite**: keep growing it with every new SQL construct
+  admitted past the parser (invariant #2); the demo cases run in
+  `test_cli.py` and the mock-client chatbot tests in `test_engine.py`
 - **Plugin roadmap**: see `docs/plugin-plan.md` (core package → Open WebUI
   plugin with SSO → onboarding toolkit; Chainlit and master web UI deferred)

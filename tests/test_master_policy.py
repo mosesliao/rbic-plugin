@@ -9,7 +9,6 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import sqlite3
 import threading
 from pathlib import Path
@@ -17,38 +16,27 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-import chatbot
-import master_bot
-import policy_admin
-import seed_db
-from policy_admin import CHANGES_HEADER, PolicyAdmin
-from sql_gate import (
+from rbic.cli import master as master_cli
+from rbic.cli import chat as chat_cli
+from rbic import admin as policy_admin
+from rbic import engine as chatbot
+from rbic import master as master_bot
+from rbic.admin import CHANGES_HEADER, PolicyAdmin
+from rbic.config import resolve_config
+from rbic.identity import LocalProvider
+from rbic.gate import (
     DENY_MESSAGE, STATIC_FILTER_WARNING, AccessDenied, FilterError, SQLGate,
     compile_row_filter,
 )
 
 logging.disable(logging.CRITICAL)
 
-ROOT = Path(__file__).parent
 SALARY_Q = "SELECT name, salary FROM employees"
 
 
-@pytest.fixture(scope="session")
-def seeded_db(tmp_path_factory):
-    db = tmp_path_factory.mktemp("seed") / "company.db"
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(seed_db, "DB_PATH", str(db))
-        seed_db.main()
-    return db
-
-
 @pytest.fixture
-def env(tmp_path, seeded_db):
-    (tmp_path / "casbin").mkdir()
-    for rel in ("casbin/model.conf", "casbin/policy.csv", "db_schema.json",
-                "worker_attributes.json"):
-        shutil.copy(ROOT / rel, tmp_path / rel)
-    shutil.copy(seeded_db, tmp_path / "company.db")
+def env(demo_dir):
+    tmp_path = demo_dir
     paths = NS(
         root=tmp_path,
         policy=tmp_path / "casbin" / "policy.csv",
@@ -334,7 +322,7 @@ def test_master_bot_decline_then_apply(env):
     ])
     inputs = iter(["let hr_staff see salaries", "no", "ok", "exit"])
     out = []
-    master_bot.run_master_bot("master", client=client,
+    master_cli.run_master_bot("master", client=client,
                               input_fn=lambda _: next(inputs),
                               output=out.append, admin=env.admin)
     assert sha(env.policy) == original
@@ -347,7 +335,7 @@ def test_master_bot_decline_then_apply(env):
 
     client = FakeClient([tool_use("propose_grant", GRANT_CALL), end_turn("Done?")])
     inputs = iter(["let hr_staff see salaries", "yes", "exit"])
-    master_bot.run_master_bot("master", client=client,
+    master_cli.run_master_bot("master", client=client,
                               input_fn=lambda _: next(inputs),
                               output=out.append, admin=env.admin)
     assert "p, hr_staff, employees.salary, read" in env.policy.read_text(
@@ -362,7 +350,7 @@ def test_master_bot_validation_error_goes_to_model(env):
         end_turn("That is not allowed."),
     ])
     inputs = iter(["make bob a master", "exit"])
-    master_bot.run_master_bot("master", client=client,
+    master_cli.run_master_bot("master", client=client,
                               input_fn=lambda _: next(inputs),
                               output=lambda *_: None, admin=env.admin)
     result = client.calls[1]["messages"][-1]["content"][0]
@@ -374,7 +362,7 @@ def test_master_bot_validation_error_goes_to_model(env):
 @pytest.mark.parametrize("user", ["bob", "nobody"])
 def test_master_bot_refuses_non_master(env, user):
     with pytest.raises(SystemExit) as exc:
-        master_bot.run_master_bot(user, client=FakeClient([]),
+        master_cli.run_master_bot(user, client=FakeClient([]),
                                   input_fn=lambda _: "exit",
                                   output=lambda *_: None, admin=env.admin)
     assert exc.value.code not in (0, None)
@@ -389,7 +377,6 @@ def test_master_bot_has_no_apply_or_data_tool():
 # ---- 12. worker chatbot resets history on policy change ----------------------
 
 def test_chatbot_resets_history_on_policy_change(env, monkeypatch, capsys):
-    monkeypatch.setattr(chatbot, "DB_PATH", str(env.db))
     client = FakeClient([
         tool_use("run_sql", {"sql": "SELECT sku, qty FROM inventory"}),
         end_turn("You have PAL-4512, BOX-2210 and GLV-0031."),
@@ -405,7 +392,8 @@ def test_chatbot_resets_history_on_policy_change(env, monkeypatch, capsys):
     script = iter([lambda: "what's in stock?",
                    lambda: revoke_then("and now?"),
                    lambda: "exit"])
-    chatbot.run_chatbot("alice", client=client, gate=env.gate,
+    chat_cli.run_chatbot("alice", client=client, gate=env.gate,
+                        config=resolve_config(env.root),
                         input_fn=lambda _: next(script)())
 
     first_turn = client.calls[1]["messages"]
@@ -417,11 +405,9 @@ def test_chatbot_resets_history_on_policy_change(env, monkeypatch, capsys):
     assert chatbot.POLICY_RESET_NOTICE in capsys.readouterr().out
 
 
-def test_refresh_session_no_reset_without_change(env):
-    history = [{"role": "user", "content": "hi"}]
-    role, prompt, version, reset = chatbot.refresh_session(
-        env.gate, "bob", history, env.gate.policy_version)
-    assert (role, reset, len(history)) == ("hr_staff", False, 1)
+def test_system_prompt_for_worker(env):
+    role, prompt = chatbot.system_prompt_for(env.gate, "bob")
+    assert role == "hr_staff"
     assert "- employees(id, name, dept, start_date)\n" in prompt
 
 
@@ -494,10 +480,10 @@ def test_r1_shipped_filters_render_equivalently(env):
     "dept{dept} = 1",              # ... or into a name
     "dept = '__rbic_ph_dept__'",   # reserved sentinel text
 ])
-def test_r1_placeholder_must_stand_alone(template):
-    schema = json.loads((ROOT / "db_schema.json").read_text())
+def test_r1_placeholder_must_stand_alone(template, demo_template):
+    schema = json.loads((demo_template / "db_schema.json").read_text())
     with pytest.raises(FilterError):
-        compile_row_filter("employees", template, schema)
+        compile_row_filter("employees", template, schema, dialect="postgres")
 
 
 # ---- R2. a reload mid-request can't mix old RBAC with new row filters -------
@@ -781,10 +767,10 @@ def test_r7_gate_denies_instead_of_raising(env, sql):
 
 
 def test_r7_worker_chatbot_survives_tokenizer_error(env, monkeypatch, capsys):
-    monkeypatch.setattr(chatbot, "DB_PATH", str(env.db))
     client = FakeClient([tool_use("run_sql", {"sql": "SELECT 'abc FROM inventory"})])
     script = iter(["what's in stock?", "exit"])
-    chatbot.run_chatbot("alice", client=client, gate=env.gate,
+    chat_cli.run_chatbot("alice", client=client, gate=env.gate,
+                        config=resolve_config(env.root),
                         input_fn=lambda _: next(script))
     assert DENY_MESSAGE in capsys.readouterr().out
 
@@ -802,12 +788,22 @@ def test_r8_row_scope_headline_warns_when_heirs_are_widened(env):
     assert "rows of employees WIDENED to" in change.description
 
 
-def test_r8_broken_gate_clears_worker_history(env):
+def test_r8_broken_gate_ignores_worker_history(env):
+    # While the policy is broken the engine denies before the LLM: rows
+    # fetched before the failed reload can't be answered from.
+    client = FakeClient([])
+    engine = chatbot.RBICEngine(resolve_config(env.root), gate=env.gate,
+                                client=client,
+                                attribute_provider=LocalProvider())
     history = [{"role": "user", "content": "hi"},
-               {"role": "assistant", "content": "rows..."}]
+               {"role": "assistant", "content": "rows..."},
+               {"role": "user", "content": "and?"}]
     version = env.gate.policy_version
     env.policy.write_text(env.policy.read_text(encoding="utf-8")
                           + "p, broken), line, read\n", encoding="utf-8")
-    role, prompt, new_version, reset = chatbot.refresh_session(
-        env.gate, "alice", history, version)
-    assert env.gate.broken and history == [] and new_version == version
+    result = engine.ask(chatbot.Identity("local", "alice"), history,
+                        conversation_id="c1")
+    assert env.gate.broken and env.gate.policy_version == version
+    assert (result.text, result.denied, result.reason) == (
+        DENY_MESSAGE, True, "policy unavailable")
+    assert client.calls == []

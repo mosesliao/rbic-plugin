@@ -9,8 +9,6 @@ must never see logistics HR rows, dave (logistics) only logistics expenses.
 import os
 import sqlite3
 
-DB_PATH = "company.db"
-
 DDL = """
 CREATE TABLE inventory (
     id INTEGER PRIMARY KEY, sku TEXT, qty INTEGER, warehouse_id TEXT
@@ -113,19 +111,16 @@ DATA = {
 }
 
 
-def main():
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
-    conn = sqlite3.connect(DB_PATH)
+def seed(db_path) -> int:
+    """(Re)create the demo database at db_path; return the number of rows."""
+    db_path = os.fspath(db_path)
+    if os.path.exists(db_path):
+        os.remove(db_path)
+    conn = sqlite3.connect(db_path)
     conn.executescript(DDL)
     for table, rows in DATA.items():
         placeholders = ", ".join("?" * len(rows[0]))
         conn.executemany(f"INSERT INTO {table} VALUES ({placeholders})", rows)
     conn.commit()
     conn.close()
-    print(f"Seeded {DB_PATH} with {sum(len(r) for r in DATA.values())} rows "
-          f"across {len(DATA)} tables.")
-
-
-if __name__ == "__main__":
-    main()
+    return sum(len(r) for r in DATA.values())
