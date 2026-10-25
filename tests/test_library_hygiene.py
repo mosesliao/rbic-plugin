@@ -193,6 +193,25 @@ def test_configure_is_idempotent_and_replaces_its_own_handler(clean_audit, tmp_p
         audit.logger.removeHandler(host)
 
 
+def test_configure_with_owner_keeps_another_owners_file(clean_audit, tmp_path):
+    a = audit.configure(tmp_path / "a.jsonl", owner="pipe-a")
+    # another owner, or a host call without an owner, never swaps a's file
+    assert audit.configure(tmp_path / "b.jsonl", owner="pipe-b") is a
+    assert a.baseFilename == str(tmp_path / "a.jsonl")
+    assert audit.configure(tmp_path / "a.jsonl", owner="pipe-b") is a  # same file
+    # the owner itself may move its file (e.g. its setting changed)
+    c = audit.configure(tmp_path / "c.jsonl", owner="pipe-a")
+    assert c is not a and c.baseFilename == str(tmp_path / "c.jsonl")
+    ours = [h for h in audit.logger.handlers if isinstance(h, logging.FileHandler)]
+    assert ours == [c]
+    # a host handler without owner is kept against an owner-tagged call ...
+    audit.unconfigure()
+    host = audit.configure(tmp_path / "host.jsonl")
+    assert audit.configure(tmp_path / "d.jsonl", owner="pipe-a") is host
+    # ... and the classic call without owner still replaces (unchanged API)
+    assert audit.configure(tmp_path / "e.jsonl") is not host
+
+
 def test_unconfigured_engine_warns_once(demo_config, tmp_path):
     code = (
         "import sys, warnings, json\n"

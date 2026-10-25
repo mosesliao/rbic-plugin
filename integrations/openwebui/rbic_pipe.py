@@ -39,6 +39,8 @@ description: Answers questions from the company database; every SQL query is che
 
 import asyncio
 import logging
+import os
+import re
 import threading
 from typing import Literal, Optional
 
@@ -92,6 +94,14 @@ log = logging.getLogger("rbic.openwebui")  # operational errors, class names onl
 _engine_lock = threading.Lock()
 _engine_entry = None  # (key, RBICEngine): one engine per Valves tuple
 
+# rbic.audit has one configure() file per process. The owner id lets this
+# function move its own file when its Valve changes, but never swap the file
+# of another RBIC function in the same process. Open WebUI names the module
+# "function_<id>_<32 hex>" (utils/plugin.py load_function_module_by_id) and
+# re-execs it when the code changes, so the hex suffix is dropped.
+AUDIT_OWNER = re.sub(r"_[0-9a-f]{32}$", "", __name__)
+_audit_warned = set()  # (requested path, path in use) already reported
+
 
 def _plain_str(value) -> Optional[str]:
     """An exact str copy of a str (subclass overrides are gone), else None."""
@@ -110,6 +120,20 @@ def _get(mapping, key):
     """mapping[key] for a plain dict, else None (dict.get itself, so a dict
     subclass can't override what it returns)."""
     return dict.get(mapping, key) if isinstance(mapping, dict) else None
+
+
+def _configure_audit(audit_path: str) -> None:
+    """audit.configure for this function. Another RBIC function's file in
+    this process is kept, with one PIPE_CONFIG_WARNING per path pair."""
+    handler = audit.configure(audit_path, owner=AUDIT_OWNER)
+    requested = os.path.abspath(audit_path)
+    in_use = getattr(handler, "baseFilename", None)
+    if in_use != requested and (requested, in_use) not in _audit_warned:
+        _audit_warned.add((requested, in_use))
+        audit_log.warning(
+            "PIPE_CONFIG_WARNING reason=audit log already configured by "
+            "another RBIC Pipe in this process, records go to the file in "
+            "use requested=%r in_use=%r", requested, in_use)
 
 
 def _engine_key(valves) -> tuple:
@@ -297,7 +321,7 @@ class Pipe:
         audit_ok = False
         if audit_path:
             try:
-                audit.configure(audit_path)
+                _configure_audit(audit_path)
                 audit_ok = True
             except Exception as err:  # noqa: BLE001
                 log.error("rbic pipe: audit log %r unusable (%s)", audit_path,

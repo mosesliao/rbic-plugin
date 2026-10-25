@@ -700,3 +700,67 @@ def test_concurrent_pipe_calls_are_safe(mod, make_pipe, client, chats, monkeypat
                 "mallory": DENY_MESSAGE}
     assert results == [expected[name] for name in users]
     assert len(builds) == 1
+
+
+# ---- one audit file per process: several Pipe instances ----------------------------
+
+def _load_pipe_module(name):
+    spec = importlib.util.spec_from_file_location(name, PIPE_FILE)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_audit_owner_is_the_open_webui_function_id():
+    module = _load_pipe_module(f"function_company_data_{uuid.uuid4().hex}")
+    try:
+        assert module.AUDIT_OWNER == "function_company_data"
+    finally:
+        sys.modules.pop(module.__name__, None)
+
+
+def test_second_pipe_instance_keeps_the_first_audit_file(demo_dir, tmp_path):
+    mods = [_load_pipe_module(f"function_{n}_{uuid.uuid4().hex}") for n in "ab"]
+    try:
+        path_a, path_b, path_c = (tmp_path / "a.jsonl", tmp_path / "b.jsonl",
+                                  tmp_path / "c.jsonl")
+        pipes = []
+        for module, path in zip(mods, (path_a, path_b)):
+            pipe = module.Pipe()
+            pipe.valves = pipe.Valves(CONFIG_DIR=str(demo_dir),
+                                      AUDIT_LOG_PATH=str(path))
+            pipes.append(pipe)
+
+        def task(pipe):
+            return run(pipe, [U("x")], sso_user("carol"), meta("c", "u-carol"),
+                       __task__="tags_generation")
+        task(pipes[0])
+        task(pipes[1])
+        task(pipes[1])
+        assert not path_b.exists()                 # never swapped to b's file
+        lines = audit_lines(path_a)
+        assert [l["event"] for l in lines] == [
+            "PIPE_TASK_STUB", "PIPE_CONFIG_WARNING", "PIPE_TASK_STUB",
+            "PIPE_TASK_STUB"]                      # one warning, not one per request
+        assert lines[1]["level"] == "WARNING"
+        assert f"requested={str(path_b)!r} in_use={str(path_a)!r}" in lines[1]["message"]
+        # the owning instance may still move its own file (its Valve changed)
+        pipes[0].valves = pipes[0].Valves(CONFIG_DIR=str(demo_dir),
+                                          AUDIT_LOG_PATH=str(path_c))
+        task(pipes[0])
+        assert events(path_c) == ["PIPE_TASK_STUB"]
+        task(pipes[1])                             # b now writes to a's new file
+        assert events(path_c) == ["PIPE_TASK_STUB", "PIPE_CONFIG_WARNING",
+                                  "PIPE_TASK_STUB"]
+    finally:
+        for module in mods:
+            sys.modules.pop(module.__name__, None)
+
+
+def test_pipe_keeps_a_host_configured_audit_file(make_pipe, tmp_path, audit_path):
+    host_path = tmp_path / "host.jsonl"
+    audit.configure(host_path)                     # e.g. the host did it at startup
+    run(make_pipe(), [U("x")], None, None, __task__="tags_generation")
+    assert not audit_path.exists()
+    assert events(host_path) == ["PIPE_CONFIG_WARNING", "PIPE_TASK_STUB"]
