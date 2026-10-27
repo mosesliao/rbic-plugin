@@ -23,7 +23,9 @@ CSV format (UTF-8, optional BOM, one header row):
   attribute is removed from an existing worker.
 - `email`: a plain ASCII address (gate.normalize_email: no lookalikes, no
   non-ASCII), stored lowercased; unique across the file and the workers
-  the import keeps. `employee_id`: digits only, stored as a number, unique.
+  the import keeps. `employee_id`: digits only, stored as a number, unique
+  across the RESULTING worker set (the file, kept workers and masters;
+  the gate's loader refuses a duplicate too).
   `manager`: the manager's username, which must be a row of the same file.
 - Attribute values follow PolicyAdmin's value rule (letters, digits,
   spaces and . , @ : / _ - , at most 200 characters), so spreadsheet
@@ -62,7 +64,8 @@ from typing import Iterable, Optional
 
 from ..admin import (ATTR_KEY_RE, ATTR_VALUE_RE, COLUMN_PTYPES, INT_RE,
                      MASTER_ROLE, ROLE_RE, ROW_PTYPES, USER_RE)
-from ..gate import USER_PREFIX, normalize_email
+from ..gate import (EMPLOYEE_ID, USER_PREFIX, _employee_id_key,
+                    normalize_email)
 from . import ONBOARDING_DIR
 
 GROUP_MAP_FILE = ONBOARDING_DIR / "group_map.json"
@@ -432,6 +435,24 @@ def plan_import(current: dict, parsed: ParsedCsv, group_map: list, *,
             errors.append(f"{_who(row.line, row.username)}: email already "
                           f"belongs to {taken[row.email]}, who is not in the "
                           "export (kept)")
+    # employee_id must be unique across the RESULTING worker set: row
+    # filters such as `employee_id = '{employee_id}'` bind it, so a new row
+    # reusing a kept worker's id would read that worker's rows (payslip).
+    # (Rows of the file are compared with each other in parse_csv; the
+    # gate's loader refuses any duplicate as well.)
+    taken_eid = {}
+    for user in [*masters, *kept]:
+        record = current.get(user)
+        if isinstance(record, dict) and EMPLOYEE_ID in record:
+            taken_eid[_employee_id_key(record[EMPLOYEE_ID])] = user
+    for row in parsed.rows:
+        if row.employee_id is not None and row.employee_id in taken_eid:
+            owner = taken_eid[row.employee_id]
+            kind = "master user" if owner in masters else \
+                "worker, who is not in the export (kept)"
+            errors.append(f"{_who(row.line, row.username)}: employee_id "
+                          f"already belongs to {owner} ({kind}); employee_ids "
+                          "must be unique (value not shown)")
     manager_of = {}
     by_name = {r.username: r for r in parsed.rows}
     for row in parsed.rows:

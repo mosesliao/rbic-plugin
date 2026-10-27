@@ -336,6 +336,68 @@ def test_email_of_a_kept_worker_is_refused(demo_dir):
     refused(demo_dir, text, "email already belongs to carol")
 
 
+EVE_CSV = "username,email,groups,employee_id\neve,eve@example.test,Warehouse SG,2\n"
+
+
+def test_employee_id_of_a_kept_worker_is_refused(demo_dir):
+    # Review finding: eve (employee_id 2) while carol (id 2) is kept would
+    # read carol's payslip through `employee_id = '{employee_id}'`.
+    message = refused(demo_dir, EVE_CSV, r"row 2 \(eve\): employee_id already "
+                      r"belongs to carol")
+    assert ",2" not in message and " 2 " not in message.replace("row 2 ", "")
+    # with --remove-missing carol goes, so the id is free again
+    p = plan(demo_dir, EVE_CSV, remove_missing=True)
+    assert p.attributes["eve"]["employee_id"] == 2 and "carol" not in p.attributes
+
+
+def test_employee_id_of_a_master_is_refused(demo_dir):
+    data = attrs(demo_dir)
+    data["master"]["employee_id"] = 9
+    write_attrs(demo_dir, data)
+    text = "username,email,groups,employee_id\neve,eve@example.test,Finance,9\n"
+    refused(demo_dir, text, r"row 2 \(eve\): employee_id already belongs to "
+                            r"master \(master user\)")
+
+
+def test_eve_cannot_read_carols_payslip_end_to_end(demo_dir):
+    # The reviewer's attack, through every layer: the plan refuses, and a
+    # hand-built import (or a hand edit) fails the gate's own loader.
+    refused(demo_dir, EVE_CSV, "employee_id already belongs to carol")
+    bad = attrs(demo_dir)
+    bad["eve"] = {"role": "warehouse_worker", "email": "eve@example.test",
+                  "site": "SG-01", "employee_id": "2"}
+    with pytest.raises(ValueError, match="'carol' and 'eve' share the same "
+                                         "employee_id"):
+        admin(demo_dir).propose_user_import(bad, actor="master")
+    from rbic.gate import AccessDenied, SQLGate
+    gate = SQLGate.from_config(cfg(demo_dir))
+    write_attrs(demo_dir, bad)                       # by hand: deny everyone
+    with pytest.raises(AccessDenied, match="policy reload failed"):
+        gate.authorize("eve", "SELECT salary FROM payroll")
+    assert "employee_id" in gate.broken
+
+
+@pytest.mark.parametrize("value", [2, "2", "02", " 2"])
+def test_gate_loader_refuses_duplicate_employee_ids(demo_dir, value):
+    from rbic.gate import check_worker_employee_ids
+    with pytest.raises(ValueError, match="'carol' and 'x' share"):
+        check_worker_employee_ids({"carol": {"employee_id": 2},
+                                   "x": {"employee_id": value}})
+    check_worker_employee_ids({"carol": {"employee_id": 2},
+                               "x": {"employee_id": 3}, "y": {}})
+
+
+def test_set_attribute_cannot_duplicate_an_employee_id(demo_dir):
+    with pytest.raises(ValueError, match="share the same employee_id"):
+        admin(demo_dir).propose_set_attribute("alice", "employee_id", 2,
+                                              actor="master")
+    with pytest.raises(ValueError, match="share the same employee_id"):
+        admin(demo_dir).propose_set_attribute("alice", "employee_id", "2",
+                                              actor="master")
+    admin(demo_dir).propose_set_attribute("alice", "employee_id", 42,
+                                          actor="master")
+
+
 def test_remove_missing_refuses_workers_with_personal_rules(demo_dir):
     a = admin(demo_dir)
     a.apply(a.propose_grant(username="dave", table="employees", column="name",
