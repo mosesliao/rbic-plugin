@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "map": [
+    {"group": "HR Managers", "role": "hr_manager"},
+    {"group": "HR Staff", "role": "hr_staff"},
+    {"group": "Finance", "role": "finance_analyst"},
+    {"group": "Warehouse SG", "role": "warehouse_worker"}
+  ]
+}

@@ -6,11 +6,13 @@ template, so no test reads or mutates the repository's files or depends on
 the current directory.
 """
 
+import logging
 import shutil
 from pathlib import Path
 
 import pytest
 
+from rbic import audit
 from rbic.config import (ATTRIBUTES_FILE, ENV_CONFIG_DIR, ENV_DB_PATH,
                          ENV_DIALECT, ENV_MODEL, MODEL_FILE, POLICY_FILE,
                          SCHEMA_FILE, resolve_config)
@@ -55,3 +57,13 @@ def demo_dir(tmp_path, demo_template) -> Path:
 def demo_config(demo_dir):
     """EngineConfig over demo_dir (sqlite dialect)."""
     return resolve_config(demo_dir, dialect="sqlite")
+
+
+@pytest.fixture
+def audit_on():
+    """Re-enable logging (many test modules disable it) for audit checks."""
+    previous = logging.root.manager.disable
+    logging.disable(logging.NOTSET)
+    yield
+    logging.disable(previous)
+    audit.unconfigure()

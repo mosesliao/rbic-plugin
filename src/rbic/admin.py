@@ -29,6 +29,12 @@ Fail-closed rules:
   compile_snapshot, email and user-subject checks), checked for
   every proposal and again under the lock in apply()          -> reject
 
+worker_attributes.json changes come from the master bot (roles and
+non-identity attributes only) or from the HR / IdP channel
+(propose_user_import, `rbic-init import-users`), the one path that may set
+emails. Imported workers whose IdP groups map to no role have no `role`
+key: the engine denies them everything (fail closed).
+
 apply() is serialized across processes with a lock file next to
 policy.csv, and the changelog record ("applying") is written BEFORE the
 file is replaced, followed by an "applied"/"failed: ..." record — a live
@@ -86,6 +92,11 @@ INT_RE = re.compile(r"[0-9]{1,18}\Z", re.ASCII)
 INT_LIST_RE = re.compile(r"[0-9]{1,18}(\s*,\s*[0-9]{1,18})*\Z", re.ASCII)
 
 STALE_MESSAGE = "Policy changed since this was proposed — please ask again"
+SOURCES_NOT_REVERTED = (
+    "NOTE: the onboarding sources (onboarding/catalog.json, roles.json) were "
+    "NOT reverted: rbic-init status / drift report the generated block as "
+    "out of date, and the next rbic-init compile applies them again unless "
+    "you change them first.")
 # Attributes that identify WHO a worker is (hosts map a signed-in user to a
 # worker by them). Owned by HR / the identity provider: no admin path may
 # change them, or a master could take over another worker's identity.
@@ -770,10 +781,10 @@ class PolicyAdmin:
             if not isinstance(record, dict):
                 raise ValueError(f"Record for {user!r} must be an object.")
             role = record.get("role")
-            if role == MASTER_ROLE:
-                continue
+            if role == MASTER_ROLE or role is None:
+                continue  # master: no data access; no role: denied outright
             if not isinstance(role, str):
-                raise ValueError(f"User {user!r} has no role.")
+                raise ValueError(f"User {user!r} has an invalid role.")
             self._check_rendered_scopes(e, role, record, schema, user)
 
     def _check_master_intact(self, before: dict, after: dict):
@@ -1643,7 +1654,13 @@ class PolicyAdmin:
                                  before, attrs, record)
 
     @_proposal
-    def propose_undo(self, actor=None) -> Change:
+    def propose_undo(self, actor=None, *, identity_channel=False) -> Change:
+        """Revert the most recently applied change that is not undone yet.
+
+        `identity_channel=True` is the HR / IdP channel (rbic-init
+        import-users --undo): it only undoes a user_import, and may restore
+        emails. The master bot never passes it, so it can undo an import
+        only when no email differs."""
         entries = self._applied()
         undone = {e.get("undoes") for e in entries}
         candidates = [e for e in entries
@@ -1663,12 +1680,29 @@ class PolicyAdmin:
         headline = (f"Undo change {last['id']} ({last['kind']}), restoring "
                     f"{target} to its previous content. Undone change was: "
                     + last["description"].splitlines()[0])
+        if identity_channel and last.get("kind") != "user_import":
+            raise ValueError(f"The last change ({last['id']}, {last['kind']}) "
+                             "is not a user import; undo it with rbic-master.")
         if target == self.policy_path:
+            notes = ([SOURCES_NOT_REVERTED]
+                     if last.get("kind") == "generated_policy" else [])
             change = self._policy_change("undo", actor, headline, current,
-                                         restored)
+                                         restored, notes)
         elif target == self.schema_path:
             change = self._schema_change("undo", actor, headline, current,
                                          restored)
+        elif last.get("kind") == "user_import":
+            before_attrs, after_attrs = json.loads(current), json.loads(restored)
+            if not identity_channel and self._identity_differs(before_attrs,
+                                                               after_attrs):
+                raise ValueError(
+                    f"Change {last['id']} imported workers from the HR / IdP "
+                    "export; undoing it would change emails, which only that "
+                    "channel may do: run rbic-init import-users --undo (or "
+                    "import a corrected export).")
+            change = self._make("undo", actor, headline,
+                                self._import_notes(before_attrs, after_attrs),
+                                target, current, restored)
         else:
             before_attrs, after_attrs = json.loads(current), json.loads(restored)
             self._check_master_intact(before_attrs, after_attrs)
@@ -1678,6 +1712,152 @@ class PolicyAdmin:
                                 current, restored)
         change.undoes = last["id"]
         return change
+
+    # ------------------------------------------------------------------
+    # worker_attributes.json from the HR / IdP export (rbic-init import-users)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _identity_differs(before: dict, after: dict) -> bool:
+        for user in set(before) | set(after):
+            for key in IDENTITY_ATTRIBUTES:
+                b, a = before.get(user), after.get(user)
+                if (b.get(key, _ABSENT) if isinstance(b, dict) else _ABSENT) != \
+                        (a.get(key, _ABSENT) if isinstance(a, dict) else _ABSENT):
+                    return True
+        return False
+
+    def _import_notes(self, before: dict, after: dict) -> list:
+        """Validate a whole new worker_attributes.json from the HR / IdP
+        channel and describe it per user - usernames, role names, column
+        names and attribute NAMES only: never an email or attribute value
+        (emails show as <email set> / <email changed> / <email removed>).
+
+        Masters must be untouched; every non-master record must have valid
+        keys and values; every user's row filters must bind with their
+        real values; the result must load in the gate (email shape and
+        uniqueness, user subjects naming existing workers)."""
+        if not isinstance(after, dict) or not all(
+                isinstance(r, dict) for r in after.values()):
+            raise ValueError("Worker attributes must map username -> object.")
+        self._check_master_intact(before, after)
+        schema = self.schema()
+        e = self._enforcer()
+        for user, record in after.items():
+            if record.get("role") == MASTER_ROLE:
+                continue
+            if not isinstance(user, str) or not USER_RE.fullmatch(user):
+                raise ValueError("Invalid username in the import (letters, "
+                                 "digits and _ . @ - only, at most 64).")
+            for key, value in record.items():
+                if key in IDENTITY_ATTRIBUTES:
+                    continue  # shape + uniqueness: the gate's loader below
+                if key == "role":
+                    if not isinstance(value, str) or not ROLE_RE.fullmatch(value) \
+                            or value == MASTER_ROLE:
+                        raise ValueError(f"{user}: invalid role (never "
+                                         "master; lowercase letters, digits, "
+                                         "underscores).")
+                    if value in after:
+                        raise ValueError(f"{user}: role {value} is also a "
+                                         "username; roles are groups.")
+                    continue
+                if not isinstance(key, str) or not ATTR_KEY_RE.fullmatch(key):
+                    raise ValueError(f"{user}: invalid attribute name.")
+                try:
+                    self._check_attr_value(user, key, value)
+                except ValueError:
+                    raise ValueError(f"{user}.{key}: invalid attribute value "
+                                     "(letters, digits, spaces and . , @ : / "
+                                     "_ - only, at most 200; value not "
+                                     "shown).") from None
+        for user in sorted(after):
+            try:
+                self._check_all_users(e, after, schema, users={user})
+            except ValueError:
+                raise ValueError(
+                    f"{user}: an attribute value cannot be used in a row "
+                    "filter that applies to them (an unquoted placeholder "
+                    "such as IN ({...}) needs a number or a comma-separated "
+                    "list of numbers; values not shown).") from None
+        after_s = self._snapshot(e, after, schema,
+                                 "The policy with the imported workers")
+        before_s = self._snapshot(e, before, schema)
+        notes = []
+        for user in sorted(set(before) | set(after)):
+            old, new = before.get(user), after.get(user)
+            if old == new:
+                continue
+            if new is None:
+                notes.append(f"{user}: removed (loses all access)")
+                continue
+            bits = []
+            role = new.get("role")
+            if old is None:
+                bits.append(f"new worker, role {role}" if role else
+                            "new worker with NO role (unmapped: every "
+                            "request is denied)")
+            elif old.get("role") != role:
+                bits.append(f"role {old.get('role') or 'none'} -> "
+                            f"{role or 'NONE (unmapped: every request is denied)'}")
+            had = old is not None and "email" in old
+            if "email" in new and not had:
+                bits.append("<email set>")
+            elif "email" in new and old.get("email") != new["email"]:
+                bits.append("<email changed>")
+            elif had and "email" not in new:
+                bits.append("<email removed>")
+            keys_old = {k for k in (old or {}) if k not in ("role", "email")}
+            keys_new = {k for k in new if k not in ("role", "email")}
+            added = sorted(keys_new - keys_old)
+            changed = sorted(k for k in keys_new & keys_old if old[k] != new[k])
+            removed = sorted(keys_old - keys_new)
+            for label, keys in (("attributes set", added),
+                                ("attributes changed", changed),
+                                ("attributes removed", removed)):
+                if keys:
+                    bits.append(f"{label}: {', '.join(keys)}")
+            if old is not None:
+                diff = self._column_diff(
+                    before_s.effective_columns(user, schema),
+                    after_s.effective_columns(user, schema))
+                for table, gained, lost in diff:
+                    if gained:
+                        bits.append(f"gains read on {table}.({', '.join(gained)})")
+                    if lost:
+                        bits.append(f"loses read on {table}.({', '.join(lost)})")
+            for table, keys in self._missing_for_user(after_s, user).items():
+                bits.append(f"WARNING: lacks attribute(s) {', '.join(keys)}, so "
+                            f"their queries on {table} that the rule needing "
+                            "it covers will be denied")
+            notes.append(f"{user}: " + "; ".join(bits))
+        return notes
+
+    @_proposal
+    def propose_user_import(self, attributes: dict, actor=None, *,
+                            headline: Optional[str] = None,
+                            extra_notes=()) -> Change:
+        """Replace worker_attributes.json with `attributes` (the result of
+        rbic.onboarding.users.plan_import: the HR / IdP export applied to
+        the current file). The only proposal that may set or change emails;
+        masters must be untouched. Validated like every change (gate loader
+        in both dialects, every user's filters bound, input hashes, lock,
+        changelog before replace, undo). The description never holds an
+        email or attribute value."""
+        before = _read(self.attributes_path)
+        current = json.loads(before)
+        notes = self._import_notes(current, attributes)
+        nl = _newline(before)
+        after = json.dumps(attributes, indent=2).replace("\n", nl) + nl
+        if after == before:
+            raise ValueError("worker_attributes.json already matches this "
+                             "import; nothing to change.")
+        if headline is None:
+            headline = (f"Import {len(attributes)} worker record(s) from the "
+                        "HR / IdP export into worker_attributes.json.")
+        return self._make("user_import", actor, headline,
+                          [*extra_notes, *notes], self.attributes_path,
+                          before, after)
 
     # ------------------------------------------------------------------
     # the rbic-init block (rbic-init compile)
@@ -1726,7 +1906,8 @@ class PolicyAdmin:
                     "the block are unchanged.")
         change = self._policy_change(
             "generated_policy", actor, headline, before, after,
-            [f"compile: {w}" for w in (*notes, *generated.warnings)])
+            [*(f"compile: {a}" for a in generated.acknowledged),
+             *(f"compile: {w}" for w in (*notes, *generated.warnings))])
         change.extra_inputs = extra
         change.input_hashes = {k: v for k, v in hashes.items()
                                if k.startswith("extra:")}

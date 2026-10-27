@@ -18,8 +18,9 @@ from rbic.onboarding import catalog_path, report_path, roles_path
 from rbic.onboarding.block import BEGIN_MARKER
 
 SUBCOMMANDS = ("schema", "suggest", "status", "approve", "reject", "roles",
-               "compile", "report")
-ROLES_ACTIONS = ("show", "packs", "add-pack", "set", "scope", "remove")
+               "compile", "report", "import-users", "drift")
+ROLES_ACTIONS = ("show", "packs", "add-pack", "set", "scope", "remove",
+                 "all-rows")
 
 
 @pytest.fixture

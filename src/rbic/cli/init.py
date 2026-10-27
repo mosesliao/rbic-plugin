@@ -11,9 +11,16 @@
                              [--description TEXT] --config-dir DIR --actor NAME
     rbic-init roles scope ROLE TABLE "TEMPLATE" [--columns a,b] [--remove]
                              --config-dir DIR --actor NAME
+    rbic-init roles all-rows ROLE TABLE (--reason TEXT | --remove)
+                             --config-dir DIR --actor NAME
     rbic-init roles remove ROLE --config-dir DIR --actor NAME
+    rbic-init import-users --config-dir DIR --csv FILE --actor NAME
+                           [--group-map PATH] [--team-depth direct|all]
+                           [--remove-missing]
+    rbic-init import-users --config-dir DIR --undo --actor NAME
     rbic-init compile --config-dir DIR --actor NAME [--report PATH]
     rbic-init report  --config-dir DIR [--out PATH]
+    rbic-init drift   --config-dir DIR [--db PATH] [--json]   # exit 0/1/2
 
 Every write is shown first and needs a typed yes/y (any case); no/n
 declines, anything else re-asks, EOF declines, and the decision is
@@ -21,10 +28,13 @@ audited. db_schema.json and policy.csv are written only through
 PolicyAdmin (validated with the gate's loader, locked, changelogged
 before replace). No data value is ever printed: suggestions show rule
 ids, names and counts only; the access report names roles, usernames,
-columns and rule templates, never a value or an email.
+columns and rule templates, never a value or an email. import-users is
+the HR / IdP channel (the only one that may set emails): it prints a
+per-user summary with emails masked, never the diff.
 """
 
 import argparse
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,10 +51,15 @@ from ..onboarding.catalog import (CatalogError, apply_decisions, catalog_status,
                                   plan_rejections, save_catalog)
 from ..onboarding.compile import (CompileError, build_policy_text,
                                   compile_from_files)
+from ..onboarding.drift import IN_SYNC, NOT_ONBOARDED, block_state, check_drift
 from ..onboarding.report import report_from_bytes
 from ..onboarding.roles import (RolesError, RowScope, add_scope, list_packs,
-                                load_pack, load_roles, merge_pack, remove_role,
-                                remove_scope, save_roles, set_role)
+                                load_pack, load_roles, merge_pack,
+                                remove_all_rows, remove_role, remove_scope,
+                                save_roles, set_all_rows, set_role)
+from ..onboarding.users import (TEAM_DEPTHS, UserImportError, group_map_path,
+                                load_group_map, parse_csv, plan_import,
+                                user_rules)
 from ..onboarding.schema import diff_schema, introspect_sqlite, ordered_like
 from ..onboarding.suggest import suggest_categories
 from . import add_audit_log_argument, setup_logging
@@ -205,6 +220,12 @@ def cmd_status(args, input_fn, output):
     if st.partial_tables:
         output("Not fully approved: " + ", ".join(
             f"{t} ({a}/{n})" for t, (a, n) in st.partial_tables.items()))
+    state, messages = block_state(cfg)
+    label = {IN_SYNC: "in sync", NOT_ONBOARDED: "not generated yet"}.get(
+        state, state.replace("_", " ").upper())
+    output(f"Generated block (policy.csv): {label}")
+    for m in messages:
+        output(f"  {m}")
     return 0
 
 
@@ -410,6 +431,19 @@ def cmd_roles_scope(args, input_fn, output):
     return _roles_write(args, input_fn, output, plan)
 
 
+def cmd_roles_all_rows(args, input_fn, output):
+    def plan(roles, catalog, csha, schema, usernames):
+        if args.remove == (args.reason is not None):
+            raise RolesError("give --reason TEXT to acknowledge, or --remove")
+        if args.table not in schema:
+            raise RolesError(f"unknown table {args.table!r} (not in "
+                             "db_schema.json)")
+        if args.remove:
+            return remove_all_rows(roles, args.role, args.table)
+        return set_all_rows(roles, args.role, args.table, args.reason)
+    return _roles_write(args, input_fn, output, plan)
+
+
 def cmd_roles_remove(args, input_fn, output):
     return _roles_write(args, input_fn, output,
                         lambda roles, *_: remove_role(roles, args.role))
@@ -492,6 +526,110 @@ def cmd_compile(args, input_fn, output):
     return 0
 
 
+# ----------------------------------------------------------------------
+# import-users (the HR / IdP channel)
+# ----------------------------------------------------------------------
+
+def _confirm_and_apply(args, input_fn, output, admin, change, done):
+    confirmed = ask_yes_no(input_fn, output, APPLY_PROMPT)
+    audit.info("POLICY_CONFIRM change=%s actor=%s decision=%s", change.id,
+               args.actor, "confirmed" if confirmed else "declined")
+    if not confirmed:
+        output(f"Change {change.id} declined; nothing was written.")
+        return 0
+    try:
+        admin.apply(change, actor=args.actor)
+    except (ValueError, OSError) as err:
+        raise CommandError(f"Change {change.id} was NOT applied: {err}") from None
+    output(f"Change {change.id} APPLIED. {done}")
+    return 0
+
+
+def _show_import(change, output):
+    output(f"\n--- Proposed change {change.id} ({change.kind}) ---")
+    output(change.description)
+    output("(the file diff is not shown: worker_attributes.json holds emails "
+           "and attribute values; review the summary above)")
+
+
+def cmd_import_users(args, input_fn, output):
+    cfg = _config(args)
+    admin = PolicyAdmin.from_config(cfg)
+    _owner(admin, args.actor)
+    done = ("The engine uses the new worker records on its next request "
+            "(every open conversation resets once).")
+    if args.undo:
+        if args.csv or args.remove_missing:
+            raise CommandError("--undo takes no --csv / --remove-missing.")
+        try:
+            change = admin.propose_undo(actor=args.actor, identity_channel=True)
+        except ValueError as err:
+            raise CommandError(f"Refused: {err}") from None
+        _show_import(change, output)
+        return _confirm_and_apply(args, input_fn, output, admin, change, done)
+    if not args.csv:
+        raise CommandError("--csv FILE (the HR / IdP export) is required.")
+    try:
+        data = Path(args.csv).read_bytes()
+    except OSError as err:
+        raise CommandError(f"cannot read {args.csv}: {err.strerror}") from None
+    current = admin.attributes()
+    known = {r["role"] for r in admin.list_roles()}
+    rpath = roles_path(cfg.config_dir)
+    if rpath.exists():
+        try:
+            known |= set(load_roles(rpath)[0].roles)
+        except RolesError as err:
+            raise CommandError(f"{rpath}: {err}") from None
+    gpath = Path(args.group_map) if args.group_map \
+        else group_map_path(cfg.config_dir)
+    try:
+        parsed = parse_csv(data)
+        group_map = load_group_map(gpath, known_roles=known,
+                                   usernames=[r.username for r in parsed.rows])
+        plan = plan_import(current, parsed, group_map, known_roles=known,
+                           team_depth=args.team_depth,
+                           remove_missing=args.remove_missing,
+                           rules_by_user=user_rules(admin._enforcer()))
+    except UserImportError as err:
+        raise CommandError(str(err)) from None
+    output(f"Export: {plan.rows} row(s), delimiter {parsed.delimiter!r}, "
+           f"columns: {', '.join(parsed.columns)}")
+    output(f"Group map: {gpath} ({len(group_map)} mapping(s))")
+    output(plan.headline())
+    try:
+        change = admin.propose_user_import(plan.attributes, actor=args.actor,
+                                           headline=plan.headline(),
+                                           extra_notes=plan.notes)
+    except ValueError as err:
+        raise CommandError(f"Refused: {err}") from None
+    _show_import(change, output)
+    return _confirm_and_apply(args, input_fn, output, admin, change, done)
+
+
+# ----------------------------------------------------------------------
+# drift
+# ----------------------------------------------------------------------
+
+def cmd_drift(args, input_fn, output):
+    cfg = _config(args)
+    try:
+        report = check_drift(cfg, db_path=args.db)
+    except Exception as err:  # noqa: BLE001 - exit 2: the check itself failed
+        if args.json:
+            output(json.dumps({"status": "error", "exit_code": 2,
+                               "error": f"{type(err).__name__}: {err}"}))
+        else:
+            output(f"Error: drift check failed: {type(err).__name__}: {err}")
+        return 2
+    if args.json:
+        output(json.dumps(report.to_json(), indent=2))
+    else:
+        for line in report.lines():
+            output(line)
+    return report.exit_code
+
+
 def cmd_report(args, input_fn, output):
     cfg = _config(args)
     schema = PolicyAdmin.from_config(cfg).schema()
@@ -536,8 +674,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="rbic-init",
         description="Onboarding toolkit: introspect the schema, suggest "
                     "column categories, record a human's approvals, define "
-                    "roles, and compile them into policy.csv. Every write "
-                    "needs your yes/no.")
+                    "roles, import workers from the IdP / HR export, compile "
+                    "them into policy.csv, and check for drift. Every write "
+                    "needs your yes/no. Guide: docs/onboarding.md.")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND",
                                 required=True)
 
@@ -672,6 +811,22 @@ def build_parser() -> argparse.ArgumentParser:
                                     "role inherits it).")
     r.add_argument("role", metavar="ROLE")
     r.set_defaults(func=cmd_roles_remove)
+    r = rsub.add_parser("all-rows", parents=[common, actor],
+                        help="acknowledge that a role reads a table on ALL "
+                             "rows (needed for high-sensitivity columns)",
+                        description="rbic-init compile refuses a role that "
+                                    "would read a high-sensitivity category "
+                                    "of TABLE with no row scope in its role "
+                                    "level, unless the role acknowledges it "
+                                    "here with a reason (recorded in the "
+                                    "generated block and the access report).")
+    r.add_argument("role", metavar="ROLE")
+    r.add_argument("table", metavar="TABLE")
+    r.add_argument("--reason", help="why this role needs every row "
+                                    "(printable ASCII, at most 200 chars)")
+    r.add_argument("--remove", action="store_true",
+                   help="remove the acknowledgement instead")
+    r.set_defaults(func=cmd_roles_all_rows)
 
     p = sub.add_parser("compile", parents=[common],
                        help="compile approved columns + roles.json into "
@@ -689,6 +844,55 @@ def build_parser() -> argparse.ArgumentParser:
                    help="where to write the access report (default: "
                         "<config-dir>/onboarding/access-report.md)")
     p.set_defaults(func=cmd_compile)
+
+    p = sub.add_parser("import-users", parents=[common],
+                       help="import workers from an IdP / HR CSV export "
+                            "(asks yes/no)",
+                       description="Import workers from an IdP / HR CSV "
+                                   "export into worker_attributes.json: the "
+                                   "HR / IdP channel, the only one that may "
+                                   "set emails. Roles come from the groups "
+                                   "column through group_map.json (first "
+                                   "mapped group wins; unmapped workers get "
+                                   "no role and are denied). Masters are "
+                                   "never touched. Shows a per-user summary "
+                                   "(emails masked), asks yes/no, applies "
+                                   "through PolicyAdmin. CSV rules: see "
+                                   "docs/onboarding.md.")
+    p.add_argument("--csv", metavar="FILE",
+                   help="the export (UTF-8; ',' or ';' delimited; header with "
+                        "username, email[, groups, employee_id, manager, "
+                        "attributes...])")
+    p.add_argument("--actor", required=True,
+                   help="master user applying the import")
+    p.add_argument("--group-map", metavar="PATH",
+                   help="IdP group -> role map (default: "
+                        "<config-dir>/onboarding/group_map.json)")
+    p.add_argument("--team-depth", choices=TEAM_DEPTHS, default="direct",
+                   help="self_and_subordinate_ids from the manager column: "
+                        "direct reports only (default) or all levels")
+    p.add_argument("--remove-missing", action="store_true",
+                   help="remove existing workers that are not in the export "
+                        "(refused while they hold personal user: rules)")
+    p.add_argument("--undo", action="store_true",
+                   help="undo the last import instead (it must be the most "
+                        "recent change)")
+    p.set_defaults(func=cmd_import_users)
+
+    p = sub.add_parser("drift", parents=[common],
+                       help="check for drift (exit 0 clean, 1 drift, 2 error)",
+                       description="Compare the live database with "
+                                   "db_schema.json, catalog coverage, the "
+                                   "generated block with its sources, "
+                                   "roles.json with the schema/catalog, and "
+                                   "workers with roles. Exit 0: clean, 1: "
+                                   "drift found, 2: error. Never prints data "
+                                   "values or emails.")
+    p.add_argument("--db", help="SQLite database (default: $RBIC_DB_PATH or "
+                                "<config-dir>/company.db)")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable output")
+    p.set_defaults(func=cmd_drift)
 
     p = sub.add_parser("report", parents=[common],
                        help="access report for the current live policy",

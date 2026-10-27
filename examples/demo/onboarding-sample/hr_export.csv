@@ -1,0 +1,6 @@
+username,email,groups,employee_id,manager,dept,site
+alice,alice@example.test,Warehouse SG,6,,,SG-01
+bob,bob@example.test,HR Staff,1,carol,engineering,
+carol,carol@example.test,HR Staff;HR Managers,2,,engineering,
+dave,dave@example.test,Finance,7,,logistics,
+erin,erin@example.test,,3,carol,engineering,
