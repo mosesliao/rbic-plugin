@@ -105,6 +105,40 @@ class _View:
         return own, extra
 
 
+RANK = {"low": 0, "medium": 1, "high": 2}
+
+
+def _inherited_warning(v: _View, role: str, table: str, high: list,
+                       warnings: list) -> None:
+    """Warn when `role` reads high-sensitivity columns of `table` limited
+    only by (non-static) row filters held by OTHER roles of its level,
+    none of which itself reads anything high-sensitivity on the table: the
+    rows were chosen for lower-sensitivity data."""
+    level = v.level(role)
+    holders = {sub for sub, rf in v.s._filters(level, table, scoped=False)
+               if not rf.static}
+    if not holders or role in holders:
+        return
+    seen = {}
+    for h in sorted(holders):
+        cols = v.s.columns_for({h}, v.schema).get(table, [])
+        sens = [v.sensitivity(table, c) for c in cols]
+        top = max((s for s in sens if s in RANK), key=RANK.get, default=None)
+        if top == "high":
+            return
+        seen[h] = top or "none"
+    filters = sorted({rf.template for sub, rf in
+                      v.s._filters(holders, table, scoped=False)})
+    warnings.append(
+        f"role {role} reads high-sensitivity {table}.({', '.join(high)}) "
+        f"limited only by row filter(s) inherited from {', '.join(seen)} "
+        f"({'; '.join(plain_filter(f) for f in filters)}), set for "
+        "lower-sensitivity data ("
+        + ", ".join(f"{h}: {s} on {table}" for h, s in seen.items())
+        + f"): check those rows are right for it, or give {role} its own "
+        "row filter")
+
+
 def _role_section(v: _View, role: str, readable_cells: set, warnings: list,
                   acks: dict) -> list:
     level = v.level(role)
@@ -132,6 +166,8 @@ def _role_section(v: _View, role: str, readable_cells: set, warnings: list,
             rows.append((table, ", ".join(v.label(table, c) for c in cols), rule))
             readable_cells.update((table, c) for c in cols)
             high = [c for c in cols if v.sensitivity(table, c) == "high"]
+            if high and base and not static:
+                _inherited_warning(v, role, table, high, warnings)
             if not base or (static and high):
                 warnings.append(
                     f"role {role} reads {table} on ALL rows ("

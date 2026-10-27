@@ -380,6 +380,45 @@ def test_cli_roles_scope_shows_the_static_warning(onboarded):
     assert any(STATIC_FILTER_WARNING in line for line in out)
 
 
+INHERITED = ("role hr_manager reads high-sensitivity employees.(salary) "
+             "limited only by row scope(s) inherited from hr_staff "
+             "(dept = '{dept}'), set for lower-sensitivity data (hr_staff: low "
+             "on employees)")
+
+
+def test_inherited_low_sensitivity_scope_is_warned_about(demo_dir):
+    # Review finding: hr_manager's salary (pay, high) on employees is limited
+    # only by hr_staff's directory-level dept filter. A warning, not a
+    # refusal: compile, the change summary and the access report say so.
+    from onboarding_demo import approve_catalog, build_roles
+    approve_catalog(demo_dir)
+    build_roles(demo_dir)
+    gen, change = compile_change(demo_dir)
+    assert any(w.startswith(INHERITED) for w in gen.warnings)
+    assert f"compile: {INHERITED}" in change.description
+    admin(demo_dir).apply(change, actor="master")
+    cfg = config(demo_dir)
+    schema, catalog, *_ = load_state(demo_dir)
+    report = report_from_bytes(
+        cfg.model_path.read_bytes(), cfg.policy_path.read_bytes(),
+        cfg.attributes_path.read_bytes(), cfg.schema_path.read_bytes(),
+        catalog)
+    assert ("role hr_manager reads high-sensitivity employees.(salary) "
+            "limited only by row filter(s) inherited from hr_staff (dept = the "
+            "user's dept), set for lower-sensitivity data (hr_staff: low on "
+            "employees)") in report
+    # hr_manager's own team filter on payroll: no such warning there
+    assert "high-sensitivity payroll" not in report
+    # its own row scope on employees silences it
+    schema, catalog, users, roles, sha = load_state(demo_dir)
+    roles, _ = add_scope(roles, "hr_manager", RowScope(
+        "employees", "id IN ({self_and_subordinate_ids})"))
+    save(demo_dir, roles, sha)
+    gen = compile_from_files(demo_dir, cfg.schema_path, cfg.attributes_path)
+    assert not any("limited only by row scope(s) inherited" in w
+                   for w in gen.warnings)
+
+
 def test_compile_refuses_unacknowledged_high_sensitivity(onboarded, capsys):
     _auditor(onboarded, ack=False)
     with pytest.raises(SystemExit) as exc:

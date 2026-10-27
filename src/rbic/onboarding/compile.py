@@ -172,6 +172,35 @@ def _sensitivity(catalog: Catalog, category) -> Optional[str]:
     return catalog.categories.get(category, {}).get("sensitivity")
 
 
+def _inherited_limit(name, table, own_high, level, roles, reads, dynamic,
+                     sens_of) -> Optional[str]:
+    """A warning when `name`'s own high-sensitivity columns of `table` are
+    limited only by row scopes it INHERITS from roles that read nothing
+    as sensitive on that table themselves (hr_manager's salary behind
+    hr_staff's directory-level `dept = '{dept}'`): the rows were chosen
+    for lower-sensitivity data."""
+    providers = sorted(r for r in level if r != name and table in dynamic[r])
+    if not providers:
+        return None
+    seen = {}
+    for r in providers:
+        sens = {sens_of(table, c) for c in reads.get(r, {}).get(table, [])}
+        if HIGH in sens:
+            return None   # a provider set this scope for high data itself
+        seen[r] = (MEDIUM if MEDIUM in sens else "low" if sens else "none")
+    scopes = sorted({s.template for r in providers
+                     for s in roles.roles[r].row_scopes
+                     if s.table == table and s.columns is None and not s.static})
+    return (f"role {name} reads high-sensitivity {table}.({', '.join(own_high)}) "
+            f"limited only by row scope(s) inherited from "
+            f"{', '.join(providers)} ({'; '.join(scopes)}), set for "
+            "lower-sensitivity data ("
+            + ", ".join(f"{r}: {s} on {table}" for r, s in seen.items())
+            + f"): check those rows are right for it, or give {name} its own "
+            f"row scope on {table} (rbic-init roles scope {name} {table} "
+            "\"TEMPLATE\")")
+
+
 def _need_ack(name, role, table, cols, why, static, refused, acks,
               acknowledged):
     """A high-sensitivity read that no user-bound row scope limits: refused
@@ -237,6 +266,9 @@ def compile_policy(catalog: Catalog, roles: Roles, schema: dict, *,
                                                 if c not in tables.get(t, []))
         limited = set().union(*(filtered.get(r, set()) for r in level))
         limited_dyn = set().union(*(dynamic.get(r, set()) for r in level))
+
+        def sens_of(table, column):
+            return _sensitivity(catalog, approved[f"{table}.{column}"])
         for table in sorted(tables, key=order.get):
             sens = {c: _sensitivity(catalog, approved[f"{table}.{c}"])
                     for c in tables[table]}
@@ -268,6 +300,11 @@ def compile_policy(catalog: Catalog, roles: Roles, schema: dict, *,
                        "user, which counts as ALL rows)")
                 _need_ack(name, role, table, f"{table}.({', '.join(high)})",
                           why, bool(static), refused, acks, acknowledged)
+            elif own_high and table not in dynamic[name]:
+                warning = _inherited_limit(name, table, own_high, level,
+                                           roles, reads, dynamic, sens_of)
+                if warning:
+                    warnings.append(warning)
         for scope in role.row_scopes:
             # A static scoped grant of high-sensitivity columns is the same
             # rows for everyone: it needs the acknowledgement as well.
