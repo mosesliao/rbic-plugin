@@ -1,0 +1,192 @@
+{
+  "realm": "rbic",
+  "displayName": "RBIC demo (test only)",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "registrationEmailAsUsername": false,
+  "editUsernameAllowed": false,
+  "resetPasswordAllowed": false,
+  "rememberMe": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "verifyEmail": false,
+  "bruteForceProtected": true,
+  "roles": {
+    "client": {
+      "open-webui": [
+        {
+          "name": "owui-user",
+          "description": "Open WebUI role 'user' (OAUTH_ALLOWED_ROLES)"
+        },
+        {
+          "name": "owui-admin",
+          "description": "Open WebUI role 'admin' (OAUTH_ADMIN_ROLES)"
+        }
+      ]
+    }
+  },
+  "clients": [
+    {
+      "clientId": "open-webui",
+      "name": "Open WebUI (RBIC demo)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "demo-only-open-webui-client-secret-change-me",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:3000/oauth/oidc/login/callback",
+        "http://localhost:3000/oauth/oidc/callback"
+      ],
+      "webOrigins": [
+        "http://localhost:3000"
+      ],
+      "attributes": {
+        "post.logout.redirect.uris": "http://localhost:3000/*"
+      },
+      "protocolMappers": [
+        {
+          "name": "open-webui roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-client-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "usermodel.clientRoleMapping.clientId": "open-webui",
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "owui-admin",
+      "enabled": true,
+      "email": "owui-admin@example.test",
+      "emailVerified": true,
+      "firstName": "Open WebUI",
+      "lastName": "Admin",
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "demo-owui-admin-pw",
+          "temporary": false
+        }
+      ],
+      "clientRoles": {
+        "open-webui": [
+          "owui-admin"
+        ]
+      }
+    },
+    {
+      "username": "bob",
+      "enabled": true,
+      "email": "bob@example.test",
+      "emailVerified": true,
+      "firstName": "Bob",
+      "lastName": "Demo",
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "demo-bob-pw",
+          "temporary": false
+        }
+      ],
+      "clientRoles": {
+        "open-webui": [
+          "owui-user"
+        ]
+      }
+    },
+    {
+      "username": "carol",
+      "enabled": true,
+      "email": "carol@example.test",
+      "emailVerified": true,
+      "firstName": "Carol",
+      "lastName": "Demo",
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "demo-carol-pw",
+          "temporary": false
+        }
+      ],
+      "clientRoles": {
+        "open-webui": [
+          "owui-user"
+        ]
+      }
+    },
+    {
+      "username": "dave",
+      "enabled": true,
+      "email": "dave@example.test",
+      "emailVerified": true,
+      "firstName": "Dave",
+      "lastName": "Demo",
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "demo-dave-pw",
+          "temporary": false
+        }
+      ],
+      "clientRoles": {
+        "open-webui": [
+          "owui-user"
+        ]
+      }
+    },
+    {
+      "username": "mallory",
+      "enabled": true,
+      "email": "mallory@example.test",
+      "emailVerified": true,
+      "firstName": "Mallory",
+      "lastName": "Demo",
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "demo-mallory-pw",
+          "temporary": false
+        }
+      ],
+      "clientRoles": {
+        "open-webui": [
+          "owui-user"
+        ]
+      }
+    }
+  ],
+  "components": {
+    "org.keycloak.userprofile.UserProfileProvider": [
+      {
+        "providerId": "declarative-user-profile",
+        "subComponents": {},
+        "config": {
+          "kc.user.profile.config": [
+            "{\"attributes\": [{\"name\": \"username\", \"displayName\": \"${username}\", \"validations\": {\"length\": {\"min\": 3, \"max\": 255}, \"username-prohibited-characters\": {}, \"up-username-not-idn-homograph\": {}}, \"permissions\": {\"view\": [\"admin\", \"user\"], \"edit\": [\"admin\"]}, \"multivalued\": false}, {\"name\": \"email\", \"displayName\": \"${email}\", \"validations\": {\"email\": {}, \"length\": {\"max\": 255}}, \"required\": {\"roles\": [\"user\"]}, \"permissions\": {\"view\": [\"admin\", \"user\"], \"edit\": [\"admin\"]}, \"multivalued\": false}, {\"name\": \"firstName\", \"displayName\": \"${firstName}\", \"validations\": {\"length\": {\"max\": 255}, \"person-name-prohibited-characters\": {}}, \"required\": {\"roles\": [\"user\"]}, \"permissions\": {\"view\": [\"admin\", \"user\"], \"edit\": [\"admin\", \"user\"]}, \"multivalued\": false}, {\"name\": \"lastName\", \"displayName\": \"${lastName}\", \"validations\": {\"length\": {\"max\": 255}, \"person-name-prohibited-characters\": {}}, \"required\": {\"roles\": [\"user\"]}, \"permissions\": {\"view\": [\"admin\", \"user\"], \"edit\": [\"admin\", \"user\"]}, \"multivalued\": false}], \"groups\": [{\"name\": \"user-metadata\", \"displayHeader\": \"User metadata\", \"displayDescription\": \"Attributes, which refer to user metadata\"}]}"
+          ]
+        }
+      }
+    ]
+  }
+}

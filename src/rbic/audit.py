@@ -35,6 +35,7 @@ logger.addHandler(logging.NullHandler())
 
 _lock = threading.Lock()
 _handler = None  # the one handler configure() manages
+_owner = None    # the owner= of the configure() call that attached it
 _warned = False
 
 
@@ -55,7 +56,7 @@ class JsonLinesFormatter(logging.Formatter):
         }, ensure_ascii=False)
 
 
-def configure(path, *, level=logging.INFO) -> logging.Handler:
+def configure(path, *, level=logging.INFO, owner=None) -> logging.Handler:
     """Send rbic.audit records at `level` and above to a JSON-lines file.
 
     Idempotent: calling it again with the same path returns the same
@@ -65,12 +66,21 @@ def configure(path, *, level=logging.INFO) -> logging.Handler:
     level is lowered to `level` if needed (records still propagate to the
     host's own handlers as usual). The file is opened in append mode,
     UTF-8.
+
+    `owner` (optional, any hashable id, e.g. one plugin instance): when it
+    is given and the current configure() handler writes to a different
+    file for a different owner (or for a call without one), that handler
+    is kept and returned unchanged. Callers detect this by comparing the
+    returned handler's `baseFilename` with the path they asked for. Without
+    `owner` the previous handler is always replaced.
     """
-    global _handler
+    global _handler, _owner
     target = os.path.abspath(os.fspath(path))
     with _lock:
         if _handler is not None and _handler.baseFilename == target:
             _handler.setLevel(level)
+        elif _handler is not None and owner is not None and owner != _owner:
+            return _handler  # another owner's file: keep it as it is
         else:
             if _handler is not None:
                 logger.removeHandler(_handler)
@@ -79,7 +89,7 @@ def configure(path, *, level=logging.INFO) -> logging.Handler:
             handler.setFormatter(JsonLinesFormatter())
             handler.setLevel(level)
             logger.addHandler(handler)
-            _handler = handler
+            _handler, _owner = handler, owner
         if logger.level == logging.NOTSET or logger.level > level:
             logger.setLevel(level)
         return _handler
@@ -87,12 +97,12 @@ def configure(path, *, level=logging.INFO) -> logging.Handler:
 
 def unconfigure() -> None:
     """Detach and close the handler configure() attached (if any)."""
-    global _handler
+    global _handler, _owner
     with _lock:
         if _handler is not None:
             logger.removeHandler(_handler)
             _handler.close()
-            _handler = None
+            _handler, _owner = None, None
 
 
 def is_configured() -> bool:

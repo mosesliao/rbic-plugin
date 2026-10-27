@@ -69,7 +69,8 @@ project/
 ├── pyproject.toml          # rbic-plugin: deps, [test] extra, entry points (hatchling, src layout)
 ├── docs/RELEASING.md       # owner checklist: Trusted Publishing, environments, tagging
 ├── .github/workflows/
-│   ├── tests.yml           # pytest (3.10/3.11/3.12) + wheel smoke; adapters (anthropic 0.86.0)
+│   ├── tests.yml           # pytest (3.10/3.11/3.12) + wheel smoke; adapters (anthropic 0.86.0, pydantic 2.13.4, Pipe tests)
+│   ├── openwebui-image.yml # non-required: build the Open WebUI image + smoke (path-filtered, no push)
 │   └── release.yml         # v*.*.* tag on main → build/test → TestPyPI → PyPI (OIDC, SHA-pinned actions)
 ├── src/rbic/               # the library: no print/input/exit/basicConfig/dotenv here
 │   ├── __init__.py         # public API: RBICEngine, Identity, Audience, AskResult, SQLGate, ...
@@ -111,7 +112,15 @@ project/
 │   ├── test_master_confirm.py  # pytest: master yes/no confirmation flow
 │   ├── test_scoped_grants.py   # pytest: 4-field p2 scoped grants
 │   ├── test_user_overrides.py  # pytest: per-user rules, deny rules, precedence
-│   └── test_gate_review_fixes.py  # pytest: security-review regressions (both dialects)
+│   ├── test_gate_review_fixes.py  # pytest: security-review regressions (both dialects)
+│   └── test_openwebui_pipe.py     # pytest: the Open WebUI Pipe (importlib-loaded, fake client)
+├── integrations/openwebui/ # Open WebUI plugin (sdist only, not in the wheel)
+│   ├── rbic_pipe.py        # the Pipe function admins import (needs only pydantic + rbic)
+│   ├── Dockerfile          # Open WebUI v0.12.4 (digest-pinned) + rbic wheel built from src/
+│   ├── requirements-*.txt  # hash-pinned casbin/simpleeval/sqlglot + wheel build tooling
+│   ├── docker-compose.yml  # test deployment: Open WebUI + Keycloak OIDC, hardening env
+│   ├── keycloak/realm-rbic.json  # test realm: open-webui client + owui-admin/owui-user roles claim; owui-admin/bob/carol/dave/mallory
+│   └── README.md           # quickstart, Valves, SSO recipes, hardening checklist, e2e script
 └── scripts/demo/           # drive.py + record.ps1: re-record docs/master-bot-demo.gif
 ```
 
@@ -133,6 +142,7 @@ rbic-chat --config-dir examples/demo alice  # chat as a worker (needs ANTHROPIC_
 rbic-chat --config-dir examples/demo bob    # hr_staff — try asking for salaries
 rbic-master --config-dir examples/demo master  # master user: change policy by chatting
 python -m rbic.cli.gate_demo --config-dir examples/demo  # any CLI also runs as a module
+cd integrations/openwebui && docker compose up --build  # Open WebUI + Keycloak test deployment (its README)
 ```
 Every CLI takes `--help`; `rbic-chat`, `rbic-master` and `rbic-gate-demo`
 also take `--audit-log PATH` (JSON lines, see Audit logging).
@@ -216,7 +226,10 @@ logging.
   `ALLOW`/`DENY` (gate), `IDENTITY_DENY`, `AUDIENCE_DENY`,
   `POLICY_UNAVAILABLE_DENY`, `POLICY_RESET`, `POLICY_CHANGED_DURING_TURN`,
   `SQL_ERROR`, `LLM_ERROR`/`ENGINE_ERROR` (engine), `POLICY_RELOAD[_FAILED]`,
-  `POLICY_CONFIRM`, `POLICY_CHANGE[_LOG_FAILED]` (master/admin). The line
+  `POLICY_CONFIRM`, `POLICY_CHANGE[_LOG_FAILED]` (master/admin),
+  `PIPE_TASK_STUB`, `PIPE_ATTACHMENT_REFUSED`, `PIPE_AUDIENCE`,
+  `PIPE_CONFIG_ERROR`, `PIPE_CONFIG_WARNING`, `PIPE_ERROR` (Open WebUI
+  Pipe; it also writes `IDENTITY_DENY … reason=not an SSO user`). The line
   formats are stable.
 - **Decision: library convention.** Importing `rbic` attaches only a
   `NullHandler` to `rbic.audit` and never touches the root logger. The
@@ -228,7 +241,9 @@ logging.
   `RBICEngine()` emits one `AuditNotConfiguredWarning` per process when
   neither happened (`audit.is_configured()`).
 - `configure()` attaches one idempotent JSON-lines `FileHandler` (same
-  path → same handler; a new path replaces it; host handlers are left
+  path → same handler; a new path replaces it — except that a call with
+  `owner=` never replaces a file configured for a different owner, or
+  without one, and returns that handler instead; host handlers are left
   alone; `unconfigure()` removes it) and lowers the logger level to
   `level` if needed. Each line: `{"ts": UTC ISO 8601, "level", "event":
   first word of the message, "message": the full audit line}`.
@@ -628,6 +643,88 @@ keyword.
     answered; shared/unknown channels get `AUDIENCE_DENY_MESSAGE` from code
     and the LLM is never called.
 
+### Open WebUI Pipe flow (integrations/openwebui/rbic_pipe.py)
+Phase 2 host, written against Open WebUI **v0.12.4** source (facts and
+file references in `integrations/openwebui/README.md`, "Verified
+against"). One model (`pipes()` → `<function id>.rbic`, "Company Data
+(RBIC)"); `async pipe(body, __user__, __metadata__, __task__, __files__,
+__event_emitter__)` returns a `str` (no streaming). In order, every
+refusal is fixed code text:
+1. **Tasks**: `__task__` (or `__metadata__["task"]`) set → a fixed,
+   data-free stub in the format Open WebUI parses (`{"title": "Company
+   data chat"}`, `{"tags": []}`, `{"follow_ups": []}`, `{"queries": []}`,
+   `{"text": ""}`, `{"operations": []}`, a fixed compaction note, else
+   `""`), audit `PIPE_TASK_STUB`; the engine is never called (Host
+   requirements below).
+2. **Config**: Valve `AUDIT_LOG_PATH` required (`rbic.audit.configure(…,
+   owner=<function id>)`, else "not configured" text; another RBIC Pipe's
+   or the host's file in the same process is kept, one
+   `PIPE_CONFIG_WARNING` per path pair — one RBIC Pipe per process);
+   `EXPECTED_RBIC_VERSION`, when set, must equal `rbic.__version__`
+   (`PIPE_CONFIG_ERROR`).
+2b. **Attachments**: non-empty `__files__`, `__metadata__` `files` /
+   `sources` / `folder_knowledge` / `user_message.files`, `body["files"]`
+   or any message's `files`/`sources`, or Open WebUI's RAG wrapper in the
+   sanitized last user turn (`<source id="`, `<context>…</context>`,
+   `<chat_history>…</chat_history>`, the default RAG template's first
+   line) → `ATTACHMENT_REFUSED_MESSAGE`, audit `PIPE_ATTACHMENT_REFUSED
+   source=<where>` (no names/ids/content), no engine call. Open WebUI runs
+   its files handler for Pipes and pastes retrieved text — a `type: chat`
+   reference is a whole old chat — into the last user turn (Host
+   requirements).
+3. **Identity**: `Identity("openwebui", __user__["id"],
+   __user__["email"])`. `IDENTITY_SOURCE="oauth"` (default) requires
+   Open WebUI's SSO marker `__user__["oauth"] = {provider: {"sub": …}}`
+   (written on every OAuth/OIDC sign-in; admin-created/local users have
+   `null`), else `DENY_MESSAGE` + `IDENTITY_DENY` with no engine call.
+   `"admin_created"` (tests only) accepts any user; the engine's
+   `JsonAttributeProvider` maps the email either way.
+4. **Audience**: `PRIVATE` only for a saved chat the user owns that is
+   not shared (share_id / shared-chat row), not in a shared or foreign
+   folder, not internal (`metadata.internal`, sub-agents/notes), not
+   `channel:` and not `temporary:`/`local:`; looked up in Open WebUI's
+   own tables in-process (`_chat_audience`, fails closed: lookup error or
+   no Open WebUI → `UNKNOWN`). Empty `chat_id` (direct API call) →
+   `UNKNOWN` unless Valve `ALLOW_API_REQUESTS` (e2e only). Non-private →
+   the engine returns `AUDIENCE_DENY_MESSAGE`; the Pipe logs
+   `PIPE_AUDIENCE` with the reason.
+5. **Answer**: `engine.aask(identity, body["messages"],
+   conversation_id=chat_id, audience=…)` → `result.text` only (never
+   `reason`, never exception text; anything unexpected → fixed text,
+   `PIPE_ERROR` class only). One "Checking access…" status event (done
+   at the end); emitter errors/timeouts are ignored.
+- One `RBICEngine` per Valves tuple (`CONFIG_DIR`, `DB_PATH`, `MODEL`),
+  built off the event loop under a lock and rebuilt when they change;
+  empty `CONFIG_DIR`/`DB_PATH` fall back to `RBIC_CONFIG_DIR`/
+  `RBIC_DB_PATH`. The Anthropic key comes only from the container env
+  (Valves are plaintext in Open WebUI's DB). `_TEST_CLIENT_FACTORY` is a
+  test-only seam; production never sets it.
+- **Plan corrections (docs/plugin-plan.md §5)**: pinned v0.12.4, not
+  v0.12.3 (security fixes); `ENABLE_LOGIN_FORM=false` only hides the
+  form — `ENABLE_PASSWORD_AUTH=false` is what closes password sign-in;
+  a non-empty `chat_id` is not proof of a private chat (0.12 shared
+  chats in "continue" mode and shared folders let other users write into
+  the owner's chat; channels use `channel:` ids), hence the ownership
+  lookup; `EXPECTED_RBIC_VERSION` refuses requests instead of failing
+  the import; more tasks than title/tags/follow-ups reach the Pipe
+  (query, autocomplete, emoji, image prompt, memory review, context
+  compaction, function calling), and a separate task model or context
+  compaction model would receive transcripts without the Pipe ever
+  seeing them (disable them; see the hardening checklist); Open WebUI
+  does not check `email_verified`, so the IdP must own emails;
+  `ENABLE_PERSISTENT_CONFIG=false` keeps the hardening env authoritative.
+- **Deployment settings the Pipe relies on** (compose + README checklist):
+  `RAG_SYSTEM_CONTEXT=true` (retrieved context → system message, which
+  `sanitize_history` drops) and no File Upload / File Context / Web
+  Search / tools / knowledge on the RBIC model; `OAUTH_UPDATE_EMAIL_ON_LOGIN=true`
+  (Open WebUI's stored email — the identity key — follows the IdP on each
+  sign-in; admins can still edit emails, so they are fully trusted);
+  Open WebUI admin from the IdP (`ENABLE_OAUTH_ROLE_MANAGEMENT`,
+  `OAUTH_ROLES_CLAIM=roles`, `OAUTH_ALLOWED_ROLES=owui-user`,
+  `OAUTH_ADMIN_ROLES=owui-admin`) plus a `WEBUI_ADMIN_EMAIL` placeholder
+  admin, because Open WebUI makes its first account admin regardless;
+  `WEBUI_SECRET_KEY` has no default; `ENABLE_OAUTH_TOKEN_EXCHANGE=false`.
+
 ### Host requirements (Phase 2 design note)
 
 - **Never paste transcripts into a user turn.** The conversation guard
@@ -638,7 +735,17 @@ keyword.
   (chat title, tags, follow-up suggestions) do exactly this. Hosts must
   route such background/task requests **away from `ask()`** (or answer
   them without data, e.g. a fixed title) and only ever call `ask()` with
-  the real chat history, one message per turn.
+  the real chat history, one message per turn. The Open WebUI Pipe does
+  this (stubs for every `__task__`); Open WebUI must also not route
+  tasks or context compaction to a *different* model (see
+  `integrations/openwebui/README.md`).
+- **Never paste retrieved context into a user turn either.** RAG over
+  files, knowledge, web search or *chat references* (an earlier chat
+  rebuilt as `#### User` / `#### Assistant` text) lands in the last user
+  turn in Open WebUI by default — the same bypass. Hosts must refuse such
+  requests or put the context where `sanitize_history` drops it (system
+  message). The Pipe refuses them (step 2b) and the compose file sets
+  `RAG_SYSTEM_CONTEXT=true`.
 
 ---
 
@@ -685,4 +792,7 @@ LLM model for text-to-SQL / summarization: `claude-sonnet-4-6`.
   admitted past the parser (invariant #2); the demo cases run in
   `test_cli.py` and the mock-client chatbot tests in `test_engine.py`
 - **Plugin roadmap**: see `docs/plugin-plan.md` (core package → Open WebUI
-  plugin with SSO → onboarding toolkit; Chainlit and master web UI deferred)
+  plugin with SSO → onboarding toolkit; Chainlit and master web UI deferred).
+  Phase 2 (Open WebUI Pipe, image, Keycloak test deployment) lives in
+  `integrations/openwebui/`; its manual end-to-end run against a live
+  deployment is still to do.

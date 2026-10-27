@@ -214,6 +214,40 @@ print(result.denied)   # True when the gate refused the SQL (hr_staff can't read
 
 ---
 
+## Use in Open WebUI
+
+`integrations/openwebui/` contains an Open WebUI **Pipe** that serves one
+model, "Company Data (RBIC)", through `RBICEngine.aask()`, along with the
+files to deploy it:
+
+- a derived Docker image: Open WebUI v0.12.4 with `rbic-plugin`
+  preinstalled
+- a `docker-compose.yml` test deployment with Keycloak as the SSO
+  (OIDC) provider
+
+The Pipe only serves users who signed in through SSO. It answers only in
+private chats the user owns: shared, temporary and channel chats are
+refused, and so are API calls without a chat. Open WebUI's background
+tasks (titles, tags, follow-ups and so on) get fixed stubs and never reach
+the engine.
+
+```bash
+rbic-seed --config-dir examples/demo
+export ANTHROPIC_API_KEY=sk-ant-...
+cd integrations/openwebui && docker compose up --build   # http://localhost:3000
+```
+
+The Open WebUI guide is
+[`integrations/openwebui/README.md`](integrations/openwebui/README.md). It
+covers:
+
+- the quickstart: importing the Pipe and setting its Valves
+- SSO recipes for Microsoft Entra ID, Google Workspace and generic OIDC
+- the admin hardening checklist
+- a manual end-to-end test script
+
+---
+
 ## Managing access (master user)
 
 All policy lives in two files — no code changes needed:
@@ -404,8 +438,9 @@ examples/demo/db_schema.json      table → columns; unknown tables/columns are 
 examples/demo/worker_attributes.json  demo users and their attributes
 examples/demo/company.db      seeded demo database (generated, gitignored)
 examples/demo/policy_changes.jsonl  changelog of applied policy changes (gitignored)
+integrations/openwebui/       Open WebUI Pipe, Dockerfile, Keycloak docker-compose test deployment, guide
 tests/                        pytest suite (conftest.py copies examples/demo to tmp)
-.github/workflows/            tests.yml (CI), release.yml (tag → TestPyPI → PyPI)
+.github/workflows/            tests.yml (CI), openwebui-image.yml (image build), release.yml (tag → TestPyPI → PyPI)
 docs/RELEASING.md             how a release is cut and published
 CLAUDE.md                     architecture notes and security invariants
 docs/master-bot-demo.gif      recording of a live policy change (master + worker)

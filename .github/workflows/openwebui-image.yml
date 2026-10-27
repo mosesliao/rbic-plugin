@@ -1,0 +1,74 @@
+name: openwebui-image
+
+# Not a required check. Builds the derived Open WebUI image
+# (integrations/openwebui/Dockerfile) and smoke-tests it: rbic imports with
+# Open WebUI's own dependency versions, and the Pipe file loads there.
+# Nothing is pushed. Runs only when the image's inputs change (the base
+# image is ~4 GB, so this takes several minutes).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "integrations/openwebui/**"
+      - "src/**"
+      - "pyproject.toml"
+      - "README.md"
+      - ".github/workflows/openwebui-image.yml"
+  pull_request:
+    paths:
+      - "integrations/openwebui/**"
+      - "src/**"
+      - "pyproject.toml"
+      - "README.md"
+      - ".github/workflows/openwebui-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  openwebui-image:
+    name: openwebui-image (build + smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the image (no push)
+        run: |
+          DOCKER_BUILDKIT=1 docker build \
+            -f integrations/openwebui/Dockerfile -t rbic-openwebui:ci .
+      - name: rbic and the Pipe load inside the image
+        run: |
+          docker run --rm --entrypoint python \
+            -v "$GITHUB_WORKSPACE/integrations/openwebui:/pipe:ro" \
+            rbic-openwebui:ci -c '
+          import importlib.util, sys
+          import anthropic, pydantic, rbic
+          print("rbic", rbic.__version__, "| anthropic", anthropic.__version__,
+                "| pydantic", pydantic.VERSION)
+          spec = importlib.util.spec_from_file_location("rbic_pipe", "/pipe/rbic_pipe.py")
+          mod = importlib.util.module_from_spec(spec)
+          sys.modules["rbic_pipe"] = mod
+          spec.loader.exec_module(mod)
+          pipe = mod.Pipe()
+          assert pipe.pipes() == [{"id": "rbic", "name": "Company Data (RBIC)"}]
+          assert pipe.valves.IDENTITY_SOURCE == "oauth"
+          print("pipe ok")
+          '
+      - name: Gate demo inside the image
+        run: |
+          docker run --rm --entrypoint sh \
+            -v "$GITHUB_WORKSPACE/examples/demo:/demo-src:ro" \
+            rbic-openwebui:ci -c '
+          cp -r /demo-src /tmp/demo && rbic-seed --config-dir /tmp/demo \
+            && rbic-gate-demo --config-dir /tmp/demo'
+      - name: Compose file is valid
+        working-directory: integrations/openwebui
+        env:
+          ANTHROPIC_API_KEY: ci-placeholder-not-a-key
+          WEBUI_SECRET_KEY: ci-placeholder-not-a-secret
+          WEBUI_BOOTSTRAP_ADMIN_PASSWORD: ci-placeholder-not-a-password
+        run: docker compose config --quiet
