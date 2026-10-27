@@ -62,6 +62,9 @@ from .gate import (
     compile_row_filter, compile_snapshot, is_user_subject, load_enforcer,
     load_snapshot, parse_scope_columns, subjects_for, user_subject,
 )
+from .onboarding import CATALOG_FILE, ONBOARDING_DIR, ROLES_FILE
+from .onboarding.block import (GENERATED_RULE_MESSAGE, BlockError,
+                               block_line_indexes)
 from .onboarding.schema import diff_schema
 
 
@@ -117,6 +120,9 @@ class Change:
     undoes: Optional[str] = None
     # sha256 of every input file at proposal time; apply() re-verifies all.
     input_hashes: dict = field(default_factory=dict)
+    # Inputs beyond the four policy files ({name: path}; e.g. the
+    # onboarding sources of a generated_policy change), hashed alongside.
+    extra_inputs: dict = field(default_factory=dict)
 
     def diff(self) -> str:
         text = "".join(difflib.unified_diff(
@@ -208,9 +214,11 @@ def _proposal(method):
         # Whatever the method checked, the files it would produce must
         # load in the gate exactly as the gate loads them.
         self._check_gate_loads(change)
-        if self._input_hashes() != before:
+        # A method with extra inputs records their hashes as it read them.
+        final = self._input_hashes(change.extra_inputs)
+        if final != {**before, **change.input_hashes}:
             raise ValueError(STALE_MESSAGE + ".")
-        change.input_hashes = before
+        change.input_hashes = final
         return change
     return wrapper
 
@@ -256,6 +264,7 @@ class PolicyAdmin:
         schema_path,
         model_path,
         changelog_path,
+        onboarding_dir=None,
     ):
         # No default paths: nothing depends on the current directory.
         self.policy_path = os.fspath(policy_path)
@@ -263,6 +272,10 @@ class PolicyAdmin:
         self.schema_path = os.fspath(schema_path)
         self.model_path = os.fspath(model_path)
         self.changelog_path = os.fspath(changelog_path)
+        # <config_dir>/onboarding (the rbic-init sources); None: no
+        # generated-policy proposals.
+        self.onboarding_dir = (None if onboarding_dir is None
+                               else os.fspath(onboarding_dir))
 
     @classmethod
     def from_config(cls, cfg: EngineConfig,
@@ -272,7 +285,8 @@ class PolicyAdmin:
         if changelog_path is None:
             changelog_path = cfg.config_dir / CHANGELOG_FILE
         return cls(cfg.policy_path, cfg.attributes_path, cfg.schema_path,
-                   cfg.model_path, changelog_path)
+                   cfg.model_path, changelog_path,
+                   onboarding_dir=cfg.config_dir / ONBOARDING_DIR)
 
     # ------------------------------------------------------------------
     # state loading
@@ -285,8 +299,9 @@ class PolicyAdmin:
     def attributes(self) -> dict:
         return json.loads(_read(self.attributes_path))
 
-    def _input_hashes(self) -> dict:
-        """sha256 of every file a proposal's analysis depends on."""
+    def _input_hashes(self, extra: Optional[dict] = None) -> dict:
+        """sha256 of every file a proposal's analysis depends on (plus
+        `extra` {name: path}; a missing extra file hashes as None)."""
         out = {}
         for name, path in (("policy", self.policy_path),
                            ("attributes", self.attributes_path),
@@ -294,6 +309,9 @@ class PolicyAdmin:
                            ("model", self.model_path)):
             with open(path, "rb") as f:
                 out[name] = hashlib.sha256(f.read()).hexdigest()
+        for name, path in (extra or {}).items():
+            out[f"extra:{name}"] = (hashlib.sha256(_read_bytes(path)).hexdigest()
+                                    if os.path.exists(path) else None)
         return out
 
     def _lock_path(self) -> str:
@@ -777,6 +795,7 @@ class PolicyAdmin:
     # ------------------------------------------------------------------
 
     def _add_line(self, text: str, fields: list) -> str:
+        self._block(text)  # malformed rbic-init markers: refuse
         line = ", ".join(fields)
         if _casbin_tokens(line) != fields:
             # Casbin's CSV has no quoting; a comma outside ()/[] or an
@@ -793,12 +812,26 @@ class PolicyAdmin:
         return text + line + nl
 
     @staticmethod
-    def _remove_line(text: str, fields: list) -> str:
+    def _block(text: str) -> set:
+        """Line indexes of policy.csv's rbic-init block (empty if none);
+        malformed markers refuse every edit (fail closed)."""
+        try:
+            return block_line_indexes(text)
+        except BlockError as err:
+            raise ValueError(f"policy.csv: {err}. Fix the rbic-init markers "
+                             "by hand before changing rules.") from None
+
+    @classmethod
+    def _remove_line(cls, text: str, fields: list) -> str:
         lines = _lines(text)
-        kept = [l for l in lines if _casbin_tokens(l) != fields]
-        if len(kept) == len(lines):
+        hits = {i for i, l in enumerate(lines) if _casbin_tokens(l) == fields}
+        if not hits:
             raise ValueError("No such rule in policy.csv.")
-        return "".join(kept)
+        if hits & cls._block(text):
+            # The onboarding sources own the block: an edit here would be
+            # silently reverted by the next compile.
+            raise ValueError(f"Refused: {GENERATED_RULE_MESSAGE}.")
+        return "".join(l for i, l in enumerate(lines) if i not in hits)
 
     def _rules(self, text: str) -> list:
         return [t for t in map(_casbin_tokens, _lines(text)) if t]
@@ -1647,6 +1680,59 @@ class PolicyAdmin:
         return change
 
     # ------------------------------------------------------------------
+    # the rbic-init block (rbic-init compile)
+    # ------------------------------------------------------------------
+
+    @_proposal
+    def propose_generated_policy(self, generated, actor=None) -> Change:
+        """Replace policy.csv's rbic-init block with `generated` (an
+        rbic.onboarding.compile.GeneratedPolicy from compile_from_files).
+
+        Lines outside the block are kept byte for byte. Refused when any
+        source the compile read (catalog.json, roles.json, db_schema.json,
+        worker_attributes.json) changed since - and, through the Change's
+        input hashes, again at apply time - when the block markers are
+        malformed, and (like every proposal) when the result would not
+        load in the gate or a user's row filters would not bind.
+        """
+        # Imported here: rbic.onboarding.compile imports this module.
+        from .onboarding.compile import build_policy_text, sources_current
+        if self.onboarding_dir is None:
+            raise ValueError("This PolicyAdmin has no onboarding directory.")
+        extra = {"catalog": os.path.join(self.onboarding_dir,
+                                         CATALOG_FILE.name),
+                 "roles": os.path.join(self.onboarding_dir, ROLES_FILE.name)}
+        hashes = self._input_hashes(extra)
+        if not sources_current(generated, {**extra,
+                                           "schema": self.schema_path,
+                                           "attributes": self.attributes_path}):
+            raise ValueError("The onboarding sources (catalog.json, roles.json, "
+                             "db_schema.json or worker_attributes.json) "
+                             "changed since this policy was compiled; run "
+                             "rbic-init compile again.")
+        before = _read(self.policy_path)
+        try:
+            after, notes = build_policy_text(before, generated)
+        except BlockError as err:
+            raise ValueError(f"policy.csv: {err}. Fix the rbic-init markers by "
+                             "hand, then compile again.") from None
+        if after == before:
+            raise ValueError("policy.csv already holds exactly this compiled "
+                             "policy; nothing to change.")
+        n = sum(1 for line in generated.body if not line.startswith("#"))
+        headline = (f"Replace the rbic-init block of policy.csv with {n} "
+                    f"rule(s) for {len(generated.roles)} role(s) compiled from "
+                    "onboarding/catalog.json and roles.json; lines outside "
+                    "the block are unchanged.")
+        change = self._policy_change(
+            "generated_policy", actor, headline, before, after,
+            [f"compile: {w}" for w in (*notes, *generated.warnings)])
+        change.extra_inputs = extra
+        change.input_hashes = {k: v for k, v in hashes.items()
+                               if k.startswith("extra:")}
+        return change
+
+    # ------------------------------------------------------------------
     # db_schema.json (rbic-init schema; validated like every other change)
     # ------------------------------------------------------------------
 
@@ -1718,8 +1804,9 @@ class PolicyAdmin:
             raise ValueError(
                 "The new schema removes table(s)/column(s) that policy rules "
                 "still reference: " + "; ".join(broken) + ". Remove or "
-                "revoke those rules first (rbic-master), then update the "
-                "schema.")
+                "revoke those rules first (rbic-master; for rules in the "
+                "rbic-init block: update onboarding/*.json and run rbic-init "
+                "compile), then update the schema.")
 
     def _schema_change(self, kind, actor, headline, before, after) -> Change:
         try:
@@ -1795,7 +1882,8 @@ class PolicyAdmin:
         target = self._managed_path(change.target)
         # The proposal's analysis (effects, scope checks, description) was
         # computed from ALL of these files; any change invalidates it.
-        if not change.input_hashes or self._input_hashes() != change.input_hashes:
+        if not change.input_hashes or \
+                self._input_hashes(change.extra_inputs) != change.input_hashes:
             raise ValueError(STALE_MESSAGE + "; nothing was written.")
         current = _read(target)
         if _sha(current) != _sha(change.before_text):

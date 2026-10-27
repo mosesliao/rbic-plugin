@@ -63,7 +63,9 @@ def test_scan_covers_the_library():
             "master.py", "identity.py", "history.py", "config.py",
             "demo/seed.py", "onboarding/__init__.py", "onboarding/catalog.py",
             "onboarding/schema.py", "onboarding/suggest.py",
-            "onboarding/roles.py", "onboarding/store.py"} <= names
+            "onboarding/block.py", "onboarding/compile.py",
+            "onboarding/report.py", "onboarding/roles.py",
+            "onboarding/store.py"} <= names
     assert not any(n.startswith("cli/") for n in names)
 
 

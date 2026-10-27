@@ -79,6 +79,7 @@ def test_wheel_has_every_module_and_cli_entry_points(wheel):
                    "history", "identity", "master", "demo/__init__",
                    "demo/seed", "onboarding/__init__", "onboarding/catalog",
                    "onboarding/schema", "onboarding/suggest",
+                   "onboarding/block", "onboarding/compile", "onboarding/report",
                    "onboarding/roles", "onboarding/store", "cli/__init__",
                    *(f"cli/{m}" for m in CLI_MODULES)):
         assert f"rbic/{module}.py" in names, module
