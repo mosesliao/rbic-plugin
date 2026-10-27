@@ -83,12 +83,15 @@ project/
 │   ├── master.py           # master tools, dispatch, email redaction, confirm flow (injected I/O)
 │   ├── admin.py            # validated, atomic, audited policy/attribute/schema editor
 │   ├── demo/seed.py        # demo company.db schema + rows (seed())
-│   ├── onboarding/         # rbic-init library: schema introspection, catalog.json, suggestions
+│   ├── onboarding/         # rbic-init library: schema, catalog.json, suggest, roles.json + packs,
+│   │                       #   compile (rbic-init block), access report
+│   │   └── packs/*.json    # starter packs (package data, in the wheel)
 │   └── cli/                # the only terminal I/O: argparse, print/input, .env, logging setup
 │       ├── chat.py         # rbic-chat: run_chatbot on RBICEngine.ask() (LocalProvider)
 │       ├── master.py       # rbic-master: interactive master session
 │       ├── gate_demo.py    # rbic-gate-demo: 15 fixed queries (6 ALLOW, 9 DENY on the demo)
-│       ├── init.py         # rbic-init: schema / suggest / status / approve / reject
+│       ├── init.py         # rbic-init: schema / suggest / status / approve / reject /
+│       │                   #   roles / compile / report
 │       └── seed.py         # rbic-seed
 ├── examples/demo/          # demo config dir (not in the wheel)
 │   ├── casbin/
@@ -116,6 +119,9 @@ project/
 │   ├── test_user_overrides.py  # pytest: per-user rules, deny rules, precedence
 │   ├── test_gate_review_fixes.py  # pytest: security-review regressions (both dialects)
 │   ├── test_onboarding_{schema,catalog,suggest}.py  # pytest: rbic.onboarding
+│   ├── test_onboarding_{roles,compile,report}.py    # pytest: roles/packs, compiler + block, report
+│   ├── test_onboarding_acceptance.py  # pytest: rbic-init reproduces the demo policy
+│   ├── onboarding_demo.py         # helpers: onboard the demo with library calls
 │   ├── test_cli_init.py           # pytest: rbic-init end to end (yes/no, audit, no values leak)
 │   └── test_openwebui_pipe.py     # pytest: the Open WebUI Pipe (importlib-loaded, fake client)
 ├── integrations/openwebui/ # Open WebUI plugin (sdist only, not in the wheel)
@@ -232,7 +238,8 @@ logging.
   `POLICY_UNAVAILABLE_DENY`, `POLICY_RESET`, `POLICY_CHANGED_DURING_TURN`,
   `SQL_ERROR`, `LLM_ERROR`/`ENGINE_ERROR` (engine), `POLICY_RELOAD[_FAILED]`,
   `POLICY_CONFIRM`, `POLICY_CHANGE[_LOG_FAILED]` (master/admin/rbic-init
-  schema), `CATALOG_SUGGEST`, `CATALOG_CONFIRM`, `CATALOG_CHANGE` (rbic-init),
+  schema and compile), `CATALOG_SUGGEST`, `CATALOG_CONFIRM`,
+  `CATALOG_CHANGE`, `ROLES_CONFIRM`, `ROLES_CHANGE` (rbic-init),
   `PIPE_TASK_STUB`, `PIPE_ATTACHMENT_REFUSED`, `PIPE_AUDIENCE`,
   `PIPE_CONFIG_ERROR`, `PIPE_CONFIG_WARNING`, `PIPE_ERROR` (Open WebUI
   Pipe; it also writes `IDENTITY_DENY … reason=not an SSO user`). The line
@@ -388,7 +395,7 @@ logging.
   first (`propose_revoke` / `propose_remove_*` / `propose_remove_user_role`),
   then the user.
 
-### rbic.onboarding / rbic.cli.init flow (rbic-init, Phase 3 step 1)
+### rbic.onboarding / rbic.cli.init flow (rbic-init, Phase 3 steps 1–2)
 The toolkit **proposes**; the organization's policy owner (a master user)
 **approves**. Plan: `docs/plugin-plan.md` §6.6.
 - `rbic-init schema [--db PATH] [--write --actor MASTER]`:
@@ -440,13 +447,107 @@ The toolkit **proposes**; the organization's policy owner (a master user)
   (name-rule:<id>|value-rule:<id>|llm-names|human), evidence (printable
   ASCII ≤ 200, never a value), confidence?, approved_by, approved_at}}}`.
   Strict validation (unknown fields/columns/categories refused); saved
-  atomically under `onboarding/.catalog.lock`, refusing a file that changed
+  atomically under `onboarding/.onboarding.lock` (`onboarding.store`, shared
+  with roles.json), refusing a file that changed
   since it was read. Default categories: directory, contact, pay,
   personal_identifier, leave, training, inventory, logistics, finance,
   safety, other.
-- Not yet (steps 2–3): `roles.json`, starter packs, `compile` into the
-  `# ---- BEGIN rbic init (generated; do not edit by hand) ----` block,
-  access report, `import-users`, `drift`, an optional names-only LLM
+- `roles.json` (`onboarding.roles`): `{"version": 1, "roles": {role:
+  {description, categories: [catalog category], inherits: [role],
+  row_scopes: [{table, template, columns?}], source: "pack:<name>"|"human"}},
+  "packs": ["<pack>@<version>"]}`. A role reads every APPROVED column of
+  its categories; a row scope without `columns` is a 3-field p2 row filter,
+  with `columns` a 4-field scoped grant. Strict validation: role names per
+  the gate/master-bot rules (never `master`, never `user:`, never a
+  username), inheritance only to roles defined here and acyclic,
+  categories in catalog.json, tables/columns in db_schema.json, templates
+  through `gate.compile_row_filter(..., strict=True)` in both dialects.
+  Saved atomically under the onboarding lock, stale writes refused.
+- **Starter packs** (`src/rbic/onboarding/packs/*.json`, package data in
+  the wheel; `rbic-init roles packs`): `hr` (hr_staff: directory, leave,
+  training by `dept`; hr_manager inherits hr_staff + pay with a team
+  filter `employee_id IN ({self_and_subordinate_ids})`), `finance`
+  (finance_analyst by `dept`), `warehouse` (warehouse_worker: inventory,
+  logistics, safety by `warehouse_id`/site, attribute `site`),
+  `staff_self_service` (employee: a scoped grant of the pay columns of
+  every table with an `employee_id` column, own rows only), `people_manager`
+  (manager: the same for self + team, IN-list attribute). Packs describe
+  ownership by COLUMN NAME (`ownership_columns`, template with `$column`)
+  and are instantiated against the actual schema and catalog (approved or
+  suggested, not rejected): a row filter goes on every table that has the
+  column and holds columns of the role's categories; a pack never scopes a
+  table lacking the column and reports every table it skipped (with "ALL
+  rows" when nothing else limits it). `roles add-pack` merges: new roles
+  added, roles this pack defined refreshed, roles a human edited or another
+  pack defined never overwritten (CONFLICT). `roles set|scope|remove` make
+  a role human-owned. Every roles write needs `--actor MASTER`, shows the
+  edit, asks `Apply? [yes/no]` (master.ask_yes_no) and is audited
+  (`ROLES_CONFIRM`, then `ROLES_CHANGE` with the new sha256).
+- **Compiler** (`onboarding.compile.compile_policy` /
+  `compile_from_files`): only approved catalog entries; one
+  `p, role, table.column, read` per approved column of each category —
+  NEVER `table.*`, so a column added later stays hidden until approved;
+  scoped grants keep only approved columns (dropped ones warned, an empty
+  one skipped); `g, role, parent`; `p2` per scope; deterministic order
+  (roles by name; g, p in schema order, p2); every rule round-trips
+  Casbin's tokenizer (`admin._casbin_tokens`). Warnings: a category with
+  no approved column; a role level reading a table on ALL rows while
+  other roles scope it; high-sensitivity columns on ALL rows; every column
+  not approved (hidden). `compile_from_files` records the sha256 of
+  catalog.json, roles.json, db_schema.json and worker_attributes.json.
+- **Generated block** (`onboarding.block`): `# ---- BEGIN rbic init
+  (generated; edit onboarding/*.json and re-run rbic-init compile) ----` …
+  `# ---- END rbic init ----`, matched as whole lines. Recompiling
+  replaces only the block; every line outside it is kept byte for byte (a
+  last line without a line end gets one). No block yet → inserted right
+  before `# ---- Changes via master chatbot ----`, else at the end. A near
+  miss marker, duplicated/unbalanced/out-of-order markers → refused by
+  compile AND by every master-bot edit (fail closed). A generated rule
+  that already exists outside the block stays outside, is left out of the
+  block, and is noted.
+- **Master bot vs the block**: `PolicyAdmin._remove_line` refuses to
+  remove (= edit) any line inside the block: "this rule is generated by
+  rbic-init from onboarding/*.json; change the catalog/roles there and run
+  rbic-init compile" (revoke, remove_row_scope, remove_inherit,
+  remove_deny…). Additions still go to the master section (after the
+  block); the master system prompt says so (a deny takes access away now).
+- **Apply**: `PolicyAdmin.propose_generated_policy(generated, actor)`
+  (kind `generated_policy`): refused unless every recorded source still
+  has its sha256; the Change's input hashes cover the four policy files
+  plus `extra:catalog` / `extra:roles` (`Change.extra_inputs`), so
+  `apply()` refuses a stale compile; then the usual machinery —
+  `gate.load_snapshot` in both dialects, every user's filters bound with
+  their real values, effect summary per role and user (the shared
+  effect-diff code), lock, changelog before replace, undo
+  (`propose_undo` restores the pre-compile policy.csv; the sources are
+  not touched).
+- **Access report** (`onboarding.report.access_report(snapshot,
+  catalog)`, `report_from_bytes`): Markdown from a PolicySnapshot (the
+  gate's own view of generated AND manual rules, via `columns_for`,
+  keyMatch, p3/p4 per level), not from roles.json: per role inherited
+  roles, users (usernames only), each readable table → columns (category,
+  sensitivity, "NOT APPROVED"), rows in plain language ("rows where dept =
+  the user's dept", `**ALL rows**` flagged), scoped grants, denies; then
+  personal rules, hidden columns (no role/user can read), warnings (ALL
+  rows, readable-but-not-approved, users lacking attributes). Never an
+  email, data value or attribute value.
+- `rbic-init compile --actor MASTER [--report PATH]`: compile, print
+  warnings, print the access report of the AFTER-state (written to PATH,
+  default `onboarding/access-report.md`, marked "proposed"), the diff and
+  effect summary, `Apply? [yes/no]`, `POLICY_CONFIRM`, apply
+  (`POLICY_CHANGE kind=generated_policy`). Nothing to change → says so.
+  `rbic-init report [--out PATH]`: the report for the live policy.
+- Demo reproduction (`tests/test_onboarding_acceptance.py`): approving
+  every suggestion, packs staff_self_service + hr + finance + warehouse,
+  base roles `--inherits employee`, and removing three pack scopes the demo
+  lacks (trainings, budgets, safety_incidents) reproduces the shipped
+  policy: the 15 gate-demo queries and 350 per-column/star/COUNT(*)
+  queries give identical decisions and rows; 344 rewritten SQL strings are
+  identical, carol's payroll filter differs only in OR order. Intentional
+  differences: named columns instead of `table.*`; no `payroll_manager`
+  role (hr_manager holds pay + the team filter); `employee` reads payroll
+  through a scoped grant. The packs' defaults are stricter than the demo.
+- Not yet (step 3): `import-users`, `drift`, an optional names-only LLM
   suggester (off by default; never values).
 
 ---
@@ -486,6 +587,12 @@ The toolkit **proposes**; the organization's policy owner (a master user)
   compare FALSE and hide nothing).
 
 ### `casbin/policy.csv`
+- **Generated block**: the lines between `# ---- BEGIN rbic init (…) ----`
+  and `# ---- END rbic init ----` are compiled by `rbic-init compile` from
+  onboarding/catalog.json + roles.json and replaced as a whole on every
+  compile; the master bot refuses to remove or edit them. Everything else
+  (hand-written rules, the master-bot section) is manual and kept byte for
+  byte. Both kinds load together; the gate makes no distinction.
 - `p` rows: RBAC grants. Column-level control works by granting named columns
   (e.g. hr_staff gets `employees.name` but not `employees.salary`).
 - `p2` rows: ABAC filter templates. `{placeholders}` are bound from the

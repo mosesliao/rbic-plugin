@@ -409,14 +409,19 @@ log.
   `catalog.json` (column → category, with status and evidence) and
   `roles.json` (roles × categories grid, inheritance, row ownership, starter
   packs used). The compiled rules live in a marked block of `policy.csv`
-  (`# ---- BEGIN rbic init (generated; do not edit by hand) ----` …
-  `# ---- END rbic init ----`); master-bot changes stay in their own
-  section, so recompiling only replaces the generated block.
+  (`# ---- BEGIN rbic init (generated; edit onboarding/*.json and re-run
+  rbic-init compile) ----` … `# ---- END rbic init ----`); master-bot
+  changes stay in their own section, so recompiling only replaces the
+  generated block, and the master bot refuses to edit generated lines.
 - **CLI:** `rbic-init` with subcommands.
   1. Step 1: `schema` (introspect, diff, validated write), `suggest`
      (local name/value rules into `catalog.json`), `status`, `approve` /
      `reject`.
-  2. Step 2: `roles`, starter packs, `compile`, `report`, apply.
+  2. Step 2 (done): `roles` (show, packs, add-pack, set, scope, remove),
+     starter packs (hr, finance, warehouse, staff_self_service,
+     people_manager), `compile` (approved columns only, named columns,
+     never `table.*`), `report`, apply through PolicyAdmin. It reproduces
+     the demo policy decision for decision.
   3. Step 3: `import-users` (IdP/HR), `drift`, documentation.
 
 ---

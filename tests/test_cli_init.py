@@ -1,6 +1,7 @@
 """rbic-init (rbic.cli.init) end to end with injected I/O on tmp copies:
 schema dry run / write with yes-no confirmation, suggest, status,
-approve/reject, actor checks, audit lines and --help everywhere."""
+approve/reject, roles (packs, set, scope, remove), compile and report,
+actor checks, audit lines and --help everywhere."""
 
 import json
 import logging
@@ -10,11 +11,15 @@ import sys
 
 import pytest
 
+from onboarding_demo import MANUAL_POLICY
 from rbic import audit
 from rbic.cli import init as init_cli
-from rbic.onboarding import catalog_path
+from rbic.onboarding import catalog_path, report_path, roles_path
+from rbic.onboarding.block import BEGIN_MARKER
 
-SUBCOMMANDS = ("schema", "suggest", "status", "approve", "reject")
+SUBCOMMANDS = ("schema", "suggest", "status", "approve", "reject", "roles",
+               "compile", "report")
+ROLES_ACTIONS = ("show", "packs", "add-pack", "set", "scope", "remove")
 
 
 @pytest.fixture
@@ -57,7 +62,8 @@ def audit_lines(path):
 
 # ---- help ----------------------------------------------------------------------
 
-@pytest.mark.parametrize("argv", [["--help"], *([c, "--help"] for c in SUBCOMMANDS)])
+@pytest.mark.parametrize("argv", [["--help"], *([c, "--help"] for c in SUBCOMMANDS),
+                                  *(["roles", a, "--help"] for a in ROLES_ACTIONS)])
 def test_help(argv, capsys):
     with pytest.raises(SystemExit) as exc:
         init_cli.main(argv)
@@ -258,3 +264,222 @@ def test_invalid_catalog_is_reported(demo_dir, capsys):
         run(["status", "--config-dir", str(demo_dir)])
     assert exc.value.code == 1
     assert "catalog.json" in capsys.readouterr().err
+
+
+# ---- roles ------------------------------------------------------------------------
+
+def approved(d):
+    run(["suggest", "--config-dir", str(d), "--no-values"])
+    run(["approve", "--config-dir", str(d), "--actor", "master",
+         "--all-suggested"], ["y"])
+
+
+def roles_doc(d):
+    return json.loads(roles_path(d).read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("answers, applied, reasks", [
+    (["y"], True, 0), (["NO"], False, 0), (["x", "", "Yes"], True, 2),
+    ([EOFError], False, 0), ([KeyboardInterrupt], False, 0),
+])
+def test_roles_add_pack_confirmation(demo_dir, tmp_path, audit_on, answers,
+                                     applied, reasks):
+    approved(demo_dir)
+    log = tmp_path / "audit.jsonl"
+    code, out = run(["roles", "add-pack", "hr", "--config-dir", str(demo_dir),
+                     "--actor", "master", "--audit-log", str(log)], answers)
+    assert code == 0
+    assert "  - add pack hr@1" in out
+    assert "      hr_staff: rows of employees where dept = '{dept}'" in out
+    assert any(l.startswith("  - skipped: hr_manager: no row scope on "
+                            "employees") for l in out)
+    assert out.count("Please type yes or no.") == reasks
+    assert roles_path(demo_dir).exists() is applied
+    messages = audit_lines(log)
+    confirms = [m for m in messages if m.startswith("ROLES_CONFIRM")]
+    assert confirms == [f"ROLES_CONFIRM actor=master action=add-pack decision="
+                        f"{'confirmed' if applied else 'declined'}"]
+    assert any(m.startswith("ROLES_CHANGE ") for m in messages) is applied
+
+
+def test_roles_edit_cycle(demo_dir, capsys):
+    approved(demo_dir)
+    _, out = run(["roles", "show", "--config-dir", str(demo_dir)])
+    assert out[0].startswith("No roles yet")
+    _, out = run(["roles", "packs", "--config-dir", str(demo_dir)])
+    assert "staff_self_service@1: " in "\n".join(out)
+    for pack in ("staff_self_service", "warehouse"):
+        run(["roles", "add-pack", pack, "--config-dir", str(demo_dir),
+             "--actor", "master"], ["y"])
+    run(["roles", "set", "warehouse_worker", "--inherits", "employee",
+         "--config-dir", str(demo_dir), "--actor", "master"], ["y"])
+    run(["roles", "scope", "warehouse_worker", "safety_incidents",
+         "warehouse_id = '{site}'", "--remove", "--config-dir", str(demo_dir),
+         "--actor", "master"], ["y"])
+    run(["roles", "set", "auditor", "--categories", "finance,safety",
+         "--description", "Auditors", "--config-dir", str(demo_dir),
+         "--actor", "master"], ["y"])
+    run(["roles", "scope", "auditor", "invoices", "status = 'unpaid'",
+         "--columns", "id,amount", "--config-dir", str(demo_dir),
+         "--actor", "master"], ["y"])
+    doc = roles_doc(demo_dir)
+    ww = doc["roles"]["warehouse_worker"]
+    assert ww["source"] == "human" and ww["inherits"] == ["employee"]
+    assert [s["table"] for s in ww["row_scopes"]] == ["inventory", "shipments"]
+    assert doc["roles"]["auditor"]["row_scopes"] == [
+        {"table": "invoices", "template": "status = 'unpaid'",
+         "columns": ["id", "amount"]}]
+    assert doc["packs"] == ["staff_self_service@1", "warehouse@1"]
+    # re-adding the pack does not overwrite the human edit
+    with pytest.raises(SystemExit):
+        run(["roles", "add-pack", "warehouse", "--config-dir", str(demo_dir),
+             "--actor", "master"], ["y"])
+    assert "CONFLICT warehouse_worker: already edited by a human" in (
+        capsys.readouterr().err)
+    assert roles_doc(demo_dir)["roles"]["warehouse_worker"] == ww
+    run(["roles", "remove", "auditor", "--config-dir", str(demo_dir),
+         "--actor", "master"], ["y"])
+    _, out = run(["roles", "show", "--config-dir", str(demo_dir)])
+    assert "auditor" not in "\n".join(out)
+    assert "warehouse_worker  [human]" in "\n".join(out)
+
+
+@pytest.mark.parametrize("argv, message", [
+    (["roles", "add-pack", "hr", "--actor", "alice"], "not a master user"),
+    (["roles", "add-pack", "nope", "--actor", "master"], "unknown starter pack"),
+    (["roles", "set", "hr_staff", "--actor", "master"], "--categories"),
+    (["roles", "set", "x1", "--categories", "perks", "--actor", "master"],
+     "unknown category"),
+    (["roles", "set", "master", "--categories", "", "--actor", "master"],
+     "master"),
+    (["roles", "set", "bob", "--categories", "", "--actor", "master"],
+     "username"),
+    (["roles", "set", "x1", "--categories", "", "--inherits", "ghost",
+      "--actor", "master"], "does not define"),
+    (["roles", "scope", "employee", "payroll", "id IN (SELECT 1)",
+      "--actor", "master"], "subqueries"),
+    (["roles", "scope", "employee", "payroll", "1 = 1", "--actor", "master"],
+     "compare"),
+    (["roles", "remove", "employee", "--actor", "master"], "inherited by"),
+])
+def test_roles_refusals(demo_dir, capsys, argv, message):
+    approved(demo_dir)
+    run(["roles", "add-pack", "staff_self_service", "--config-dir",
+         str(demo_dir), "--actor", "master"], ["y"])
+    run(["roles", "set", "hr_staff", "--categories", "directory", "--inherits",
+         "employee", "--config-dir", str(demo_dir), "--actor", "master"], ["y"])
+    before = roles_path(demo_dir).read_bytes()
+    with pytest.raises(SystemExit) as exc:
+        run([*argv, "--config-dir", str(demo_dir)], ["y"])
+    assert exc.value.code == 1
+    assert message in capsys.readouterr().err
+    assert roles_path(demo_dir).read_bytes() == before
+
+
+def test_add_pack_needs_a_catalog(demo_dir, capsys):
+    with pytest.raises(SystemExit):
+        run(["roles", "add-pack", "hr", "--config-dir", str(demo_dir),
+             "--actor", "master"], ["y"])
+    assert "catalog.json does not exist yet" in capsys.readouterr().err
+    assert not roles_path(demo_dir).exists()
+
+
+# ---- compile / report -------------------------------------------------------------
+
+def onboarding_sources(d):
+    approved(d)
+    for pack in ("staff_self_service", "hr", "finance", "warehouse"):
+        run(["roles", "add-pack", pack, "--config-dir", str(d), "--actor",
+             "master"], ["y"])
+    for role in ("warehouse_worker", "hr_staff", "finance_analyst"):
+        run(["roles", "set", role, "--inherits", "employee", "--config-dir",
+             str(d), "--actor", "master"], ["y"])
+    (d / "casbin" / "policy.csv").write_text(MANUAL_POLICY, encoding="utf-8",
+                                             newline="")
+
+
+@pytest.mark.parametrize("answers, applied", [
+    (["y"], True), (["n"], False), (["?", "y"], True), ([EOFError], False),
+])
+def test_compile_confirmation(demo_dir, tmp_path, audit_on, answers, applied):
+    onboarding_sources(demo_dir)
+    log = tmp_path / "audit.jsonl"
+    policy = demo_dir / "casbin" / "policy.csv"
+    code, out = run(["compile", "--config-dir", str(demo_dir), "--actor",
+                     "master", "--audit-log", str(log)], answers)
+    assert code == 0
+    text = "\n".join(out)
+    assert text.startswith("Compiled 61 rule(s) for 5 role(s)")
+    assert "# Access report (proposed policy)" in text
+    assert "### Role `hr_manager`" in text
+    assert "(generated_policy) ---" in text and BEGIN_MARKER in text
+    assert "example.test" not in text  # no worker email, anywhere
+    assert report_path(demo_dir).read_text(encoding="utf-8").startswith(
+        "# Access report (proposed policy)")
+    assert (BEGIN_MARKER in policy.read_text(encoding="utf-8")) is applied
+    messages = audit_lines(log)
+    assert [m for m in messages if m.startswith("POLICY_CONFIRM")][0].endswith(
+        "confirmed" if applied else "declined")
+    assert any(m.startswith("POLICY_CHANGE ") and "kind=generated_policy" in m
+               for m in messages) is applied
+    if applied:
+        code, out = run(["compile", "--config-dir", str(demo_dir), "--actor",
+                         "master"])
+        assert out[-1].startswith("policy.csv already holds exactly")
+
+
+def test_compile_report_path_and_warnings(demo_dir, tmp_path):
+    onboarding_sources(demo_dir)
+    run(["roles", "set", "hr_staff", "--categories", "directory,leave,training,"
+         "contact", "--config-dir", str(demo_dir), "--actor", "master"], ["y"])
+    target = tmp_path / "signoff.md"
+    _, out = run(["compile", "--config-dir", str(demo_dir), "--actor",
+                  "master", "--report", str(target)], ["n"])
+    assert "warning: role hr_staff: category contact has no approved column " \
+           "(it grants nothing yet)" in out
+    assert target.exists() and not report_path(demo_dir).exists()
+
+
+@pytest.mark.parametrize("setup, message", [
+    ("no-roles", "roles.json does not exist yet"),
+    ("markers", "at most one rbic-init block"),
+    ("actor", "not a master user"),
+])
+def test_compile_refusals(demo_dir, capsys, setup, message):
+    actor = "master"
+    if setup == "no-roles":
+        approved(demo_dir)
+    else:
+        onboarding_sources(demo_dir)
+    if setup == "markers":
+        (demo_dir / "casbin" / "policy.csv").write_text(
+            MANUAL_POLICY + BEGIN_MARKER + "\n", encoding="utf-8")
+    if setup == "actor":
+        actor = "carol"
+    before = (demo_dir / "casbin" / "policy.csv").read_bytes()
+    with pytest.raises(SystemExit) as exc:
+        run(["compile", "--config-dir", str(demo_dir), "--actor", actor], ["y"])
+    assert exc.value.code == 1
+    assert message in capsys.readouterr().err
+    assert (demo_dir / "casbin" / "policy.csv").read_bytes() == before
+
+
+def test_report_command(demo_dir, tmp_path):
+    out_file = tmp_path / "r.md"
+    code, out = run(["report", "--config-dir", str(demo_dir), "--out",
+                     str(out_file)])
+    assert code == 0
+    assert out[0].startswith("# Access report (current policy)")
+    assert "### Role `payroll_manager`" in out[0]
+    assert out_file.read_text(encoding="utf-8") == out[0]
+    assert "@" not in out[0]  # no worker email
+
+
+def test_report_on_a_broken_policy(demo_dir, capsys):
+    policy = demo_dir / "casbin" / "policy.csv"
+    policy.write_text(policy.read_text(encoding="utf-8")
+                      + "p, user:ghost, employees.id, read\n", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        run(["report", "--config-dir", str(demo_dir)])
+    assert exc.value.code == 1
+    assert "does not load in the SQL gate" in capsys.readouterr().err

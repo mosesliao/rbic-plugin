@@ -5,27 +5,46 @@
     rbic-init status  --config-dir DIR
     rbic-init approve --config-dir DIR --actor NAME (COLUMN [CATEGORY] | --all-suggested)
     rbic-init reject  --config-dir DIR --actor NAME COLUMN [COLUMN ...]
+    rbic-init roles show|packs --config-dir DIR
+    rbic-init roles add-pack NAME --config-dir DIR --actor NAME
+    rbic-init roles set ROLE [--categories a,b] [--inherits x,y]
+                             [--description TEXT] --config-dir DIR --actor NAME
+    rbic-init roles scope ROLE TABLE "TEMPLATE" [--columns a,b] [--remove]
+                             --config-dir DIR --actor NAME
+    rbic-init roles remove ROLE --config-dir DIR --actor NAME
+    rbic-init compile --config-dir DIR --actor NAME [--report PATH]
+    rbic-init report  --config-dir DIR [--out PATH]
 
 Every write is shown first and needs a typed yes/y (any case); no/n
 declines, anything else re-asks, EOF declines, and the decision is
-audited. db_schema.json is written only through PolicyAdmin (validated
-with the gate's loader, locked, changelogged before replace). No data
-value is ever printed: suggestions show rule ids, names and counts only.
+audited. db_schema.json and policy.csv are written only through
+PolicyAdmin (validated with the gate's loader, locked, changelogged
+before replace). No data value is ever printed: suggestions show rule
+ids, names and counts only; the access report names roles, usernames,
+columns and rule templates, never a value or an email.
 """
 
 import argparse
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from ..admin import MASTER_ROLE, PolicyAdmin
 from ..audit import logger as audit
 from ..config import ConfigError, resolve_config
 from ..master import ask_yes_no
-from ..onboarding import catalog_path
+from ..onboarding import catalog_path, report_path, roles_path
+from ..onboarding.block import BlockError
 from ..onboarding.catalog import (CatalogError, apply_decisions, catalog_status,
                                   check_against_schema, load_catalog,
                                   merge_suggestions, plan_approvals,
                                   plan_rejections, save_catalog)
+from ..onboarding.compile import (CompileError, build_policy_text,
+                                  compile_from_files)
+from ..onboarding.report import report_from_bytes
+from ..onboarding.roles import (RolesError, RowScope, add_scope, list_packs,
+                                load_pack, load_roles, merge_pack, remove_role,
+                                remove_scope, save_roles, set_role)
 from ..onboarding.schema import diff_schema, introspect_sqlite, ordered_like
 from ..onboarding.suggest import suggest_categories
 from . import add_audit_log_argument, setup_logging
@@ -239,6 +258,261 @@ def cmd_reject(args, input_fn, output):
 
 
 # ----------------------------------------------------------------------
+# roles.json
+# ----------------------------------------------------------------------
+
+def _roles_state(cfg):
+    """(admin, schema, catalog, catalog sha, usernames, path, roles, sha)."""
+    admin = PolicyAdmin.from_config(cfg)
+    schema, _, catalog, csha = _load(cfg)
+    usernames = sorted(admin.attributes())
+    path = roles_path(cfg.config_dir)
+    try:
+        roles, sha = load_roles(path, catalog=catalog, schema=schema,
+                                usernames=usernames)
+    except RolesError as err:
+        raise CommandError(f"{path}: {err}") from None
+    return admin, schema, catalog, csha, usernames, path, roles, sha
+
+
+def _show_role(name, role, output):
+    output(f"{name}  [{role.source}]  {role.description}".rstrip())
+    output(f"  categories: {', '.join(role.categories) or '-'}")
+    output(f"  inherits:   {', '.join(role.inherits) or '-'}")
+    for scope in role.row_scopes:
+        output(f"  scope:      {scope.describe()}")
+
+
+def cmd_roles_show(args, input_fn, output):
+    cfg = _config(args)
+    *_, path, roles, sha = _roles_state(cfg)
+    if sha is None:
+        output(f"No roles yet ({path}). Start with: rbic-init roles add-pack "
+               f"NAME (packs: {', '.join(list_packs())})")
+        return 0
+    output(f"{path}: {len(roles.roles)} role(s); packs: "
+           f"{', '.join(sorted(roles.packs)) or 'none'}")
+    for name in sorted(roles.roles):
+        _show_role(name, roles.roles[name], output)
+    return 0
+
+
+def cmd_roles_packs(args, input_fn, output):
+    for name in list_packs():
+        try:
+            pack = load_pack(name)
+        except RolesError as err:
+            raise CommandError(str(err)) from None
+        output(f"{pack.ref}: {pack.description}")
+        for rname, r in pack.roles.items():
+            extra = f", inherits {', '.join(r.inherits)}" if r.inherits else ""
+            output(f"  {rname}: categories {', '.join(r.categories) or '-'}"
+                   f"{extra}")
+            for rule in r.scopes:
+                kind = (f"scoped grant of {', '.join(rule.grant_categories)}"
+                        if rule.grant_categories else "row filter")
+                output(f"    {kind} on tables with column "
+                       f"{'/'.join(rule.ownership_columns)}: {rule.template}")
+    return 0
+
+
+def _roles_write(args, input_fn, output, plan):
+    """Show a roles.json edit, ask yes/no, save it (stale-safe), audit."""
+    cfg = _config(args)
+    admin, schema, catalog, csha, usernames, path, roles, sha = _roles_state(cfg)
+    _owner(admin, args.actor)
+    try:
+        new, lines = plan(roles, catalog, csha, schema, usernames)
+    except RolesError as err:
+        raise CommandError(str(err)) from None
+    output(f"Proposed change to {path}:")
+    for line in lines:
+        output(f"      {line.strip()}" if line.startswith("  ") else f"  - {line}")
+    confirmed = ask_yes_no(input_fn, output, APPLY_PROMPT)
+    audit.info("ROLES_CONFIRM actor=%s action=%s decision=%s", args.actor,
+               args.roles_command, "confirmed" if confirmed else "declined")
+    if not confirmed:
+        output("Declined; nothing was written.")
+        return 0
+    try:
+        new_sha = save_roles(path, new, sha, catalog=catalog, schema=schema,
+                             usernames=usernames)
+    except RolesError as err:
+        raise CommandError(f"Nothing was written: {err}") from None
+    audit.info("ROLES_CHANGE actor=%s action=%s roles=%d file=%s sha256=%s",
+               args.actor, args.roles_command, len(new.roles), path, new_sha)
+    output(f"APPLIED: {path} updated. Nothing changes in policy.csv until "
+           "you run: rbic-init compile --actor NAME")
+    return 0
+
+
+def _csv(text):
+    return [] if text is None or not text.strip() else \
+        [x.strip() for x in text.split(",") if x.strip()]
+
+
+def cmd_roles_add_pack(args, input_fn, output):
+    def plan(roles, catalog, csha, schema, usernames):
+        if csha is None:
+            raise RolesError("onboarding/catalog.json does not exist yet: run "
+                             "rbic-init suggest (and approve) first - a pack's "
+                             "row scopes are derived from the catalog")
+        pack = load_pack(args.name)
+        new, merge = merge_pack(roles, pack, catalog, schema, usernames)
+        lines = [f"add pack {pack.ref}"]
+        for name in merge.added:
+            lines.append(f"add role {name}")
+        for name in merge.updated:
+            lines.append(f"refresh role {name} (defined by this pack)")
+        for name in merge.unchanged:
+            lines.append(f"role {name} unchanged")
+        for name, why in merge.conflicts:
+            lines.append(f"CONFLICT role {name}: {why}")
+        for name in [*merge.added, *merge.updated]:
+            role = new.roles[name]
+            lines.append(f"  {name}: categories {', '.join(role.categories) or '-'}"
+                         f"; inherits {', '.join(role.inherits) or '-'}")
+            lines += [f"  {name}: {s.describe()}" for s in role.row_scopes]
+        lines += [f"skipped: {n}" for n in merge.notes]
+        if new.to_json() == roles.to_json():
+            raise RolesError(f"pack {pack.ref} is already in roles.json with "
+                             "nothing to change"
+                             + ("".join(f"; CONFLICT {n}: {w}"
+                                        for n, w in merge.conflicts)))
+        return new, lines
+    return _roles_write(args, input_fn, output, plan)
+
+
+def cmd_roles_set(args, input_fn, output):
+    def plan(roles, catalog, csha, schema, usernames):
+        if args.categories is None and args.inherits is None \
+                and args.description is None:
+            raise RolesError("give --categories, --inherits and/or "
+                             "--description")
+        return set_role(roles, args.role,
+                        categories=None if args.categories is None
+                        else _csv(args.categories),
+                        inherits=None if args.inherits is None
+                        else _csv(args.inherits),
+                        description=args.description)
+    return _roles_write(args, input_fn, output, plan)
+
+
+def cmd_roles_scope(args, input_fn, output):
+    def plan(roles, catalog, csha, schema, usernames):
+        columns = _csv(args.columns) if args.columns is not None else None
+        if columns == []:
+            raise RolesError("--columns needs at least one column")
+        scope = RowScope(args.table, args.template.strip(),
+                         tuple(columns) if columns else None)
+        return (remove_scope if args.remove else add_scope)(roles, args.role,
+                                                             scope)
+    return _roles_write(args, input_fn, output, plan)
+
+
+def cmd_roles_remove(args, input_fn, output):
+    return _roles_write(args, input_fn, output,
+                        lambda roles, *_: remove_role(roles, args.role))
+
+
+# ----------------------------------------------------------------------
+# compile / report
+# ----------------------------------------------------------------------
+
+def _catalog_or_none(cfg, schema):
+    path = catalog_path(cfg.config_dir)
+    if not path.exists():
+        return None
+    try:
+        return load_catalog(path, schema)[0]
+    except CatalogError as err:
+        raise CommandError(f"{path}: {err}") from None
+
+
+def _bytes(path) -> bytes:
+    return Path(path).read_bytes()
+
+
+def cmd_compile(args, input_fn, output):
+    cfg = _config(args)
+    admin = PolicyAdmin.from_config(cfg)
+    _owner(admin, args.actor)
+    try:
+        generated = compile_from_files(cfg.config_dir, cfg.schema_path,
+                                       cfg.attributes_path)
+    except (CompileError, CatalogError, RolesError) as err:
+        raise CommandError(f"Cannot compile: {err}") from None
+    schema = admin.schema()
+    catalog = _catalog_or_none(cfg, schema)
+    with open(cfg.policy_path, encoding="utf-8", newline="") as f:
+        before = f.read()  # exactly as PolicyAdmin reads it (CRLF kept)
+    try:
+        after, notes = build_policy_text(before, generated)
+    except BlockError as err:
+        raise CommandError(f"policy.csv: {err}") from None
+    rules = sum(1 for line in generated.body if not line.startswith("#"))
+    output(f"Compiled {rules} rule(s) for {len(generated.roles)} role(s) from "
+           "approved catalog columns and roles.json.")
+    for w in (*notes, *generated.warnings):
+        output(f"warning: {w}")
+    if after == before:
+        output("policy.csv already holds exactly this compiled policy; "
+               "nothing to change.")
+        return 0
+    try:
+        change = admin.propose_generated_policy(generated, actor=args.actor)
+    except ValueError as err:
+        raise CommandError(f"Refused: {err}") from None
+    report = report_from_bytes(
+        _bytes(cfg.model_path), change.after_text.encode("utf-8"),
+        _bytes(cfg.attributes_path), _bytes(cfg.schema_path), catalog,
+        dialect=cfg.dialect, title="Access report (proposed policy)",
+        status=f"Proposed change {change.id}: not in force unless a master "
+               "user confirmed it (see policy_changes.jsonl).")
+    out_path = Path(args.report) if args.report else report_path(cfg.config_dir)
+    output("\n" + report)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(report, encoding="utf-8")
+    output(f"(access report written to {out_path})")
+    output(f"\n--- Proposed change {change.id} ({change.kind}) ---")
+    output(change.description)
+    output(change.diff() or "(no textual difference)")
+    confirmed = ask_yes_no(input_fn, output, APPLY_PROMPT)
+    audit.info("POLICY_CONFIRM change=%s actor=%s decision=%s", change.id,
+               args.actor, "confirmed" if confirmed else "declined")
+    if not confirmed:
+        output(f"Change {change.id} declined; nothing was written.")
+        return 0
+    try:
+        admin.apply(change, actor=args.actor)
+    except (ValueError, OSError) as err:
+        raise CommandError(f"Change {change.id} was NOT applied: {err}") from None
+    output(f"Change {change.id} APPLIED. The gate enforces the new policy on "
+           "its next request.")
+    return 0
+
+
+def cmd_report(args, input_fn, output):
+    cfg = _config(args)
+    schema = PolicyAdmin.from_config(cfg).schema()
+    catalog = _catalog_or_none(cfg, schema)
+    try:
+        report = report_from_bytes(
+            _bytes(cfg.model_path), _bytes(cfg.policy_path),
+            _bytes(cfg.attributes_path), _bytes(cfg.schema_path), catalog,
+            dialect=cfg.dialect, title="Access report (current policy)")
+    except Exception as err:  # noqa: BLE001 - whatever the gate refuses
+        raise CommandError(f"The current policy does not load in the SQL gate "
+                           f"(the gate denies everyone): {type(err).__name__}: "
+                           f"{err}") from None
+    output(report)
+    if args.out:
+        Path(args.out).write_text(report, encoding="utf-8")
+        output(f"(written to {args.out})")
+    return 0
+
+
+# ----------------------------------------------------------------------
 # argument parsing
 # ----------------------------------------------------------------------
 
@@ -261,8 +535,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="rbic-init",
         description="Onboarding toolkit: introspect the schema, suggest "
-                    "column categories, and record a human's approvals. "
-                    "Every write needs your yes/no.")
+                    "column categories, record a human's approvals, define "
+                    "roles, and compile them into policy.csv. Every write "
+                    "needs your yes/no.")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND",
                                 required=True)
 
@@ -332,6 +607,97 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--actor", required=True,
                    help="master user rejecting (recorded as approved_by)")
     p.set_defaults(func=cmd_reject)
+
+    roles = sub.add_parser(
+        "roles", help="edit onboarding/roles.json (roles x categories, "
+                      "inheritance, row scopes, starter packs)",
+        description="Show or edit onboarding/roles.json. Every write asks "
+                    "yes/no and needs --actor (a master user); nothing "
+                    "changes in policy.csv until rbic-init compile.")
+    rsub = roles.add_subparsers(dest="roles_command", metavar="ACTION",
+                                required=True)
+    r = rsub.add_parser("show", parents=[common], help="show roles.json",
+                        description="Show every role in roles.json.")
+    r.set_defaults(func=cmd_roles_show)
+    r = rsub.add_parser("packs", parents=[common],
+                        help="list the starter packs shipped with rbic",
+                        description="List the starter packs and what they "
+                                    "define.")
+    r.set_defaults(func=cmd_roles_packs)
+    actor = argparse.ArgumentParser(add_help=False)
+    actor.add_argument("--actor", required=True,
+                       help="master user making the change")
+    r = rsub.add_parser("add-pack", parents=[common, actor],
+                        help="merge a starter pack into roles.json",
+                        description="Instantiate a starter pack against "
+                                    "db_schema.json and catalog.json (scopes "
+                                    "only on tables that have the ownership "
+                                    "column; skipped tables are reported) "
+                                    "and merge it. Roles a human edited or "
+                                    "another pack defined are never "
+                                    "overwritten (reported as conflicts).")
+    r.add_argument("name", metavar="NAME", help="pack name (see roles packs)")
+    r.set_defaults(func=cmd_roles_add_pack)
+    r = rsub.add_parser("set", parents=[common, actor],
+                        help="create or update a role",
+                        description="Create a role (--categories required, "
+                                    "may be empty) or update one; the role "
+                                    "becomes human-owned (packs never "
+                                    "overwrite it).")
+    r.add_argument("role", metavar="ROLE")
+    r.add_argument("--categories", metavar="A,B",
+                   help="comma-separated catalog categories (replaces the list)")
+    r.add_argument("--inherits", metavar="X,Y",
+                   help="comma-separated parent roles (replaces the list)")
+    r.add_argument("--description", help="what the role is for")
+    r.set_defaults(func=cmd_roles_set)
+    r = rsub.add_parser("scope", parents=[common, actor],
+                        help="add (or --remove) a row scope of a role",
+                        description="Add a row filter on TABLE (a p2 template "
+                                    "such as \"dept = '{dept}'\"), or with "
+                                    "--columns a scoped grant (those columns, "
+                                    "for those rows). Templates follow the "
+                                    "master bot's strict rules.")
+    r.add_argument("role", metavar="ROLE")
+    r.add_argument("table", metavar="TABLE")
+    r.add_argument("template", metavar="TEMPLATE")
+    r.add_argument("--columns", metavar="A,B",
+                   help="make it a scoped grant of these columns")
+    r.add_argument("--remove", action="store_true",
+                   help="remove this exact scope instead of adding it")
+    r.set_defaults(func=cmd_roles_scope)
+    r = rsub.add_parser("remove", parents=[common, actor],
+                        help="remove a role from roles.json",
+                        description="Remove a role (refused while another "
+                                    "role inherits it).")
+    r.add_argument("role", metavar="ROLE")
+    r.set_defaults(func=cmd_roles_remove)
+
+    p = sub.add_parser("compile", parents=[common],
+                       help="compile approved columns + roles.json into "
+                            "policy.csv's rbic-init block (asks yes/no)",
+                       description="Compile approved catalog columns and "
+                                   "roles.json into the rbic-init block of "
+                                   "policy.csv (named columns, never "
+                                   "table.*; lines outside the block are "
+                                   "kept), print warnings, the access report "
+                                   "and the diff with its effect summary, "
+                                   "and apply through PolicyAdmin on yes.")
+    p.add_argument("--actor", required=True,
+                   help="master user applying the change")
+    p.add_argument("--report", metavar="PATH",
+                   help="where to write the access report (default: "
+                        "<config-dir>/onboarding/access-report.md)")
+    p.set_defaults(func=cmd_compile)
+
+    p = sub.add_parser("report", parents=[common],
+                       help="access report for the current live policy",
+                       description="Print the plain-language access report "
+                                   "for the policy in force (no changes): "
+                                   "what each role reads, which rows, "
+                                   "denies, hidden columns, warnings.")
+    p.add_argument("--out", metavar="PATH", help="also write it to PATH")
+    p.set_defaults(func=cmd_report)
     return parser
 
 
