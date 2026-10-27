@@ -6,6 +6,7 @@ __pycache__/
 company.db
 policy_changes.jsonl
 .policy.lock
+.catalog.lock
 *.code-workspace
 build/
 dist/

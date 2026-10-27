@@ -111,7 +111,7 @@ rbic-chat --config-dir examples/demo dave    # finance_analyst, dept logistics
 ```
 
 Type `exit` to quit. Every command takes `--help`; `rbic-chat`,
-`rbic-master` and `rbic-gate-demo` also take `--audit-log PATH` to append
+`rbic-master`, `rbic-gate-demo` and `rbic-init` also take `--audit-log PATH` to append
 the audit records as JSON lines. Each command also runs as a module, e.g.
 `python -m rbic.cli.chat --config-dir examples/demo alice`.
 
@@ -121,6 +121,7 @@ the audit records as JSON lines. Each command also runs as a module, e.g.
 | `rbic-master USER` | `rbic.cli.master` | change access policy by chatting (master users only) |
 | `rbic-gate-demo` | `rbic.cli.gate_demo` | gate decisions for fixed queries, no API key |
 | `rbic-seed` | `rbic.cli.seed` | (re)create the demo SQLite database |
+| `rbic-init COMMAND` | `rbic.cli.init` | onboarding: introspect the schema, suggest column categories, record approvals (`schema`, `suggest`, `status`, `approve`, `reject`) |
 
 ### Demo users
 
@@ -431,7 +432,8 @@ src/rbic/config.py            configuration resolution (args > RBIC_* env > defa
 src/rbic/master.py            master chatbot: tools, propose, human confirms (no terminal I/O)
 src/rbic/admin.py             validated, atomic, audited policy/attribute editor
 src/rbic/demo/seed.py         demo database schema and rows
-src/rbic/cli/                 rbic-chat, rbic-master, rbic-gate-demo, rbic-seed (all terminal I/O)
+src/rbic/onboarding/          rbic-init library: schema introspection, catalog.json, category suggestions
+src/rbic/cli/                 rbic-chat, rbic-master, rbic-gate-demo, rbic-seed, rbic-init (all terminal I/O)
 examples/demo/casbin/model.conf   Casbin model (RBAC matcher + p2 ABAC definition)
 examples/demo/casbin/policy.csv   grants, role hierarchy, row-filter templates
 examples/demo/db_schema.json      table → columns; unknown tables/columns are denied

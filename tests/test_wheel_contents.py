@@ -17,7 +17,7 @@ import pytest
 import rbic
 
 ROOT = Path(__file__).resolve().parent.parent
-CLI_MODULES = ("chat", "master", "gate_demo", "seed")
+CLI_MODULES = ("chat", "master", "gate_demo", "seed", "init")
 
 
 def _has(module: str) -> bool:
@@ -70,11 +70,13 @@ def test_wheel_has_every_module_and_cli_entry_points(wheel):
     names = set(z.namelist())
     for module in ("__init__", "admin", "audit", "config", "engine", "gate",
                    "history", "identity", "master", "demo/__init__",
-                   "demo/seed", "cli/__init__",
+                   "demo/seed", "onboarding/__init__", "onboarding/catalog",
+                   "onboarding/schema", "onboarding/suggest", "cli/__init__",
                    *(f"cli/{m}" for m in CLI_MODULES)):
         assert f"rbic/{module}.py" in names, module
     entry_points = z.read(
         f"rbic_plugin-{rbic.__version__}.dist-info/entry_points.txt").decode()
     for script, module in (("rbic-chat", "chat"), ("rbic-master", "master"),
-                           ("rbic-gate-demo", "gate_demo"), ("rbic-seed", "seed")):
+                           ("rbic-gate-demo", "gate_demo"), ("rbic-seed", "seed"),
+                           ("rbic-init", "init")):
         assert f"{script} = rbic.cli.{module}:main" in entry_points

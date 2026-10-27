@@ -1,7 +1,8 @@
 """Command-line entry points: the only place rbic does terminal I/O.
 
 rbic-chat (rbic.cli.chat), rbic-master (rbic.cli.master), rbic-gate-demo
-(rbic.cli.gate_demo) and rbic-seed (rbic.cli.seed). Code here may print,
+(rbic.cli.gate_demo), rbic-seed (rbic.cli.seed) and rbic-init
+(rbic.cli.init). Code here may print,
 read stdin, exit, load .env and configure logging; the library modules
 never do (tests/test_library_hygiene.py enforces it).
 """

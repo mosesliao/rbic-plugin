@@ -81,12 +81,14 @@ project/
 │   ├── identity.py         # Identity, AttributeProvider, JsonAttributeProvider, LocalProvider
 │   ├── history.py          # sanitize_history: untrusted host history → text-only turns
 │   ├── master.py           # master tools, dispatch, email redaction, confirm flow (injected I/O)
-│   ├── admin.py            # validated, atomic, audited policy/attribute editor
+│   ├── admin.py            # validated, atomic, audited policy/attribute/schema editor
 │   ├── demo/seed.py        # demo company.db schema + rows (seed())
+│   ├── onboarding/         # rbic-init library: schema introspection, catalog.json, suggestions
 │   └── cli/                # the only terminal I/O: argparse, print/input, .env, logging setup
 │       ├── chat.py         # rbic-chat: run_chatbot on RBICEngine.ask() (LocalProvider)
 │       ├── master.py       # rbic-master: interactive master session
 │       ├── gate_demo.py    # rbic-gate-demo: 15 fixed queries (6 ALLOW, 9 DENY on the demo)
+│       ├── init.py         # rbic-init: schema / suggest / status / approve / reject
 │       └── seed.py         # rbic-seed
 ├── examples/demo/          # demo config dir (not in the wheel)
 │   ├── casbin/
@@ -113,6 +115,8 @@ project/
 │   ├── test_scoped_grants.py   # pytest: 4-field p2 scoped grants
 │   ├── test_user_overrides.py  # pytest: per-user rules, deny rules, precedence
 │   ├── test_gate_review_fixes.py  # pytest: security-review regressions (both dialects)
+│   ├── test_onboarding_{schema,catalog,suggest}.py  # pytest: rbic.onboarding
+│   ├── test_cli_init.py           # pytest: rbic-init end to end (yes/no, audit, no values leak)
 │   └── test_openwebui_pipe.py     # pytest: the Open WebUI Pipe (importlib-loaded, fake client)
 ├── integrations/openwebui/ # Open WebUI plugin (sdist only, not in the wheel)
 │   ├── rbic_pipe.py        # the Pipe function admins import (needs only pydantic + rbic)
@@ -141,11 +145,12 @@ python -m pytest -q                         # all tests (work on tmp copies)
 rbic-chat --config-dir examples/demo alice  # chat as a worker (needs ANTHROPIC_API_KEY)
 rbic-chat --config-dir examples/demo bob    # hr_staff — try asking for salaries
 rbic-master --config-dir examples/demo master  # master user: change policy by chatting
+rbic-init suggest --config-dir examples/demo  # onboarding: suggest column categories (see rbic-init flow)
 python -m rbic.cli.gate_demo --config-dir examples/demo  # any CLI also runs as a module
 cd integrations/openwebui && docker compose up --build  # Open WebUI + Keycloak test deployment (its README)
 ```
-Every CLI takes `--help`; `rbic-chat`, `rbic-master` and `rbic-gate-demo`
-also take `--audit-log PATH` (JSON lines, see Audit logging).
+Every CLI takes `--help`; `rbic-chat`, `rbic-master`, `rbic-gate-demo` and
+`rbic-init` also take `--audit-log PATH` (JSON lines, see Audit logging).
 
 ### RBICEngine.ask() flow (engine.py)
 `ask(identity, messages, *, conversation_id=None, audience=PRIVATE) ->
@@ -226,7 +231,8 @@ logging.
   `ALLOW`/`DENY` (gate), `IDENTITY_DENY`, `AUDIENCE_DENY`,
   `POLICY_UNAVAILABLE_DENY`, `POLICY_RESET`, `POLICY_CHANGED_DURING_TURN`,
   `SQL_ERROR`, `LLM_ERROR`/`ENGINE_ERROR` (engine), `POLICY_RELOAD[_FAILED]`,
-  `POLICY_CONFIRM`, `POLICY_CHANGE[_LOG_FAILED]` (master/admin),
+  `POLICY_CONFIRM`, `POLICY_CHANGE[_LOG_FAILED]` (master/admin/rbic-init
+  schema), `CATALOG_SUGGEST`, `CATALOG_CONFIRM`, `CATALOG_CHANGE` (rbic-init),
   `PIPE_TASK_STUB`, `PIPE_ATTACHMENT_REFUSED`, `PIPE_AUDIENCE`,
   `PIPE_CONFIG_ERROR`, `PIPE_CONFIG_WARNING`, `PIPE_ERROR` (Open WebUI
   Pipe; it also writes `IDENTITY_DENY … reason=not an SSO user`). The line
@@ -381,6 +387,67 @@ logging.
   *everyone* until fixed (fail closed, by design). Remove the user's rules
   first (`propose_revoke` / `propose_remove_*` / `propose_remove_user_role`),
   then the user.
+
+### rbic.onboarding / rbic.cli.init flow (rbic-init, Phase 3 step 1)
+The toolkit **proposes**; the organization's policy owner (a master user)
+**approves**. Plan: `docs/plugin-plan.md` §6.6.
+- `rbic-init schema [--db PATH] [--write --actor MASTER]`:
+  `onboarding.schema.introspect_sqlite` reads only the catalog
+  (`sqlite_master`, `pragma_table_info`) over `engine.readonly_uri` +
+  `PRAGMA query_only`, tables sorted by name, columns in declared order,
+  types normalized to int/text/numeric/date/timestamp (unknown/empty/BLOB →
+  text + note). `sqlite_*` tables are skipped, and so are names that are not
+  lowercase identifiers (`IDENTIFIER_RE`): sqlglot lowercases unquoted
+  names, so the gate can't address mixed-case tables at all (fail closed).
+  `diff_schema` / `ordered_like` (keep db_schema.json's order → smallest
+  diff). `--write` calls `PolicyAdmin.propose_schema_update` (kind
+  `schema_update`): the result must load through `gate.load_snapshot` in
+  both dialects, every user's filters must still bind, and no p/p3/p2/p4
+  rule may name a table/column the new schema removes (a grant left on a
+  vanished column would come back to life if the name reappeared). The
+  description warns when a new column is readable at once through an
+  existing grant (`inventory.*`), and when an existing rule names something
+  that only now exists. Then the master yes/no prompt (`master.ask_yes_no`,
+  `Apply? [yes/no]`, `POLICY_CONFIRM`), `PolicyAdmin.apply()` (lock, all
+  input hashes, master actor, changelog before replace, `POLICY_CHANGE`).
+  `propose_undo` can undo a schema change.
+- `rbic-init suggest [--no-values] [--sample-rows N]`: `onboarding.suggest`
+  name rules (whole tokens of column/table names, declarative `NAME_RULES`
+  with ids) and, unless `--no-values`, value rules (`VALUE_RULES`: email,
+  SG NRIC/FIN, phone E.164/SG, Luhn card numbers, birth-date-like dates)
+  over at most N non-null **text** values per column, read-only. Values
+  are only counted: evidence is "value-rule:email matched 37/40 sampled
+  values". Precedence: never downgrade sensitivity (a column rule beats the
+  table's category only if more sensitive; id columns inherit the table's
+  dominant category; a value rule wins only at ≥ the name guess's
+  sensitivity). Columns db_schema.json lists but the DB lacks are not
+  sampled (SQLite reads an unknown `"name"` as a string literal). No LLM
+  call. Results merge into `<config_dir>/onboarding/catalog.json` as
+  `suggested`; approved, rejected and `suggested_by: human` entries are
+  never overwritten. Audit `CATALOG_SUGGEST` (counts only).
+- `rbic-init status`: approved / suggested / rejected / unlabelled counts,
+  fully approved tables. Everything not approved is hidden from everyone
+  by the generated policy (step 2 compiles approved entries only).
+- `rbic-init approve --actor MASTER (COLUMN [CATEGORY] | --all-suggested)`
+  and `rbic-init reject --actor MASTER COLUMN...`: the actor must be a
+  master user; the plan is shown, `Apply? [yes/no]` (same semantics),
+  `CATALOG_CONFIRM`, then `CATALOG_CHANGE`. `approved_by`/`approved_at`
+  record who decided (for rejections too); a category other than the
+  suggestion becomes `suggested_by: human`.
+- `catalog.json` (`onboarding.catalog`): `{"version": 1, "categories":
+  {name: {description, sensitivity low|medium|high}}, "columns":
+  {"table.column": {category|null, status, suggested_by
+  (name-rule:<id>|value-rule:<id>|llm-names|human), evidence (printable
+  ASCII ≤ 200, never a value), confidence?, approved_by, approved_at}}}`.
+  Strict validation (unknown fields/columns/categories refused); saved
+  atomically under `onboarding/.catalog.lock`, refusing a file that changed
+  since it was read. Default categories: directory, contact, pay,
+  personal_identifier, leave, training, inventory, logistics, finance,
+  safety, other.
+- Not yet (steps 2–3): `roles.json`, starter packs, `compile` into the
+  `# ---- BEGIN rbic init (generated; do not edit by hand) ----` block,
+  access report, `import-users`, `drift`, an optional names-only LLM
+  suggester (off by default; never values).
 
 ---
 
