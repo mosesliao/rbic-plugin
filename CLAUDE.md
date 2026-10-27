@@ -795,4 +795,5 @@ LLM model for text-to-SQL / summarization: `claude-sonnet-4-6`.
   plugin with SSO → onboarding toolkit; Chainlit and master web UI deferred).
   Phase 2 (Open WebUI Pipe, image, Keycloak test deployment) lives in
   `integrations/openwebui/`; its manual end-to-end run against a live
-  deployment is still to do.
+  deployment is still to do. Phase 3 (onboarding toolkit, `rbic-init`) is
+  in progress (plan §6.6); LibreChat is the second platform (plan §2.1).
