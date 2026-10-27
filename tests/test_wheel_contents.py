@@ -18,6 +18,8 @@ import rbic
 
 ROOT = Path(__file__).resolve().parent.parent
 CLI_MODULES = ("chat", "master", "gate_demo", "seed", "init")
+PACK_DIR = "rbic/onboarding/packs/"
+PACKS = ("finance", "hr", "people_manager", "staff_self_service", "warehouse")
 
 
 def _has(module: str) -> bool:
@@ -60,9 +62,14 @@ def test_wheel_contains_only_the_package_and_metadata(wheel):
     assert stray == []
     forbidden = ("examples/", "tests/", "company.db", ".env",
                  "policy_changes.jsonl", ".policy.lock", "worker_attributes.json",
-                 "policy.csv", "model.conf", "db_schema.json", "conftest")
+                 "policy.csv", "model.conf", "db_schema.json", "conftest",
+                 "catalog.json", "roles.json", "access-report.md",
+                 ".onboarding.lock")
     assert [n for n in names if any(f in n for f in forbidden)] == []
-    assert all(n.endswith(".py") for n in names if n.startswith("rbic/"))
+    # Python modules, plus the starter packs (package data, JSON).
+    data = [n for n in names if n.startswith("rbic/") and not n.endswith(".py")]
+    assert data and all(n.startswith(PACK_DIR) and n.endswith(".json")
+                        for n in data), data
 
 
 def test_wheel_has_every_module_and_cli_entry_points(wheel):
@@ -71,9 +78,12 @@ def test_wheel_has_every_module_and_cli_entry_points(wheel):
     for module in ("__init__", "admin", "audit", "config", "engine", "gate",
                    "history", "identity", "master", "demo/__init__",
                    "demo/seed", "onboarding/__init__", "onboarding/catalog",
-                   "onboarding/schema", "onboarding/suggest", "cli/__init__",
+                   "onboarding/schema", "onboarding/suggest",
+                   "onboarding/roles", "onboarding/store", "cli/__init__",
                    *(f"cli/{m}" for m in CLI_MODULES)):
         assert f"rbic/{module}.py" in names, module
+    for pack in PACKS:
+        assert f"{PACK_DIR}{pack}.json" in names, pack
     entry_points = z.read(
         f"rbic_plugin-{rbic.__version__}.dist-info/entry_points.txt").decode()
     for script, module in (("rbic-chat", "chat"), ("rbic-master", "master"),

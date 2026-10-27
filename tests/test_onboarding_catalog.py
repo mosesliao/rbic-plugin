@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 
 import pytest
 
+from rbic.onboarding import ONBOARDING_LOCK
 from rbic.onboarding.catalog import (
-    LOCK_NAME, CatalogError, ColumnEntry, apply_decisions, catalog_status,
+    CatalogError, ColumnEntry, apply_decisions, catalog_status,
     load_catalog, merge_suggestions, new_catalog, parse_catalog,
     plan_approvals, plan_rejections, save_catalog)
 from rbic.onboarding.suggest import Suggestion
@@ -212,7 +213,7 @@ def test_save_is_atomic_and_refuses_stale(tmp_path):
     path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     with pytest.raises(CatalogError, match="changed since"):
         save_catalog(path, new_catalog(), sha)
-    assert not (path.parent / LOCK_NAME).exists()
+    assert not (path.parent / ONBOARDING_LOCK).exists()
     assert [p.name for p in path.parent.iterdir()] == ["catalog.json"]
 
 
@@ -220,7 +221,7 @@ def test_save_waits_for_the_lock(tmp_path, monkeypatch):
     from rbic import admin
     monkeypatch.setattr(admin, "LOCK_TIMEOUT_S", 0.2)
     path = tmp_path / "catalog.json"
-    (tmp_path / LOCK_NAME).write_text("1\n")
+    (tmp_path / ONBOARDING_LOCK).write_text("1\n")
     with pytest.raises(ValueError, match="Another catalog change"):
         save_catalog(path, new_catalog(), None)
     assert not path.exists()

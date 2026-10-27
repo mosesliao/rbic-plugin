@@ -1,0 +1,21 @@
+{
+  "format": 1,
+  "name": "staff_self_service",
+  "version": "1",
+  "description": "Every employee: their own pay records only (a scoped grant on tables with an employee_id column).",
+  "roles": {
+    "employee": {
+      "description": "Staff self-service: each user reads only their own pay rows. Other roles inherit it.",
+      "categories": [],
+      "inherits": [],
+      "row_scopes": [
+        {
+          "ownership_columns": ["employee_id"],
+          "template": "$column = '{employee_id}'",
+          "grant_categories": ["pay"],
+          "explain": "the user's own rows (attribute employee_id)"
+        }
+      ]
+    }
+  }
+}

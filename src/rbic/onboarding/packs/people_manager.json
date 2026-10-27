@@ -1,0 +1,21 @@
+{
+  "format": 1,
+  "name": "people_manager",
+  "version": "1",
+  "description": "People managers: pay records of themselves and their direct and indirect reports.",
+  "roles": {
+    "manager": {
+      "description": "People managers: pay rows of the user and their team only.",
+      "categories": [],
+      "inherits": [],
+      "row_scopes": [
+        {
+          "ownership_columns": ["employee_id"],
+          "template": "$column IN ({self_and_subordinate_ids})",
+          "grant_categories": ["pay"],
+          "explain": "rows of the user and their team (attribute self_and_subordinate_ids: a comma-separated list of employee ids)"
+        }
+      ]
+    }
+  }
+}

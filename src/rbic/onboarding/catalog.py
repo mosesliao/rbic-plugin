@@ -26,22 +26,20 @@ names and counts; printable ASCII, at most EVIDENCE_MAX characters).
 Merging new suggestions never overwrites a human decision.
 
 Library code: no terminal I/O. Saving is atomic (temp file + os.replace)
-under an exclusive lock file, and refuses to overwrite a catalog that
-changed since it was loaded.
+under the onboarding lock (rbic.onboarding.store), and refuses to
+overwrite a catalog that changed since it was loaded.
 """
 
 import copy
-import hashlib
 import json
-import os
 import re
-import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
 
-from ..admin import USER_RE, exclusive_lock
+from ..admin import USER_RE
+from .store import atomic_save, sha256_text
 
 CATALOG_VERSION = 1
 STATUSES = ("suggested", "approved", "rejected")
@@ -54,7 +52,6 @@ COLUMN_KEY_RE = re.compile(r"([a-z_][a-z0-9_]{0,62})\.([a-z_][a-z0-9_]{0,62})\Z"
                            re.ASCII)
 EVIDENCE_MAX = 200
 DESCRIPTION_MAX = 200
-LOCK_NAME = ".catalog.lock"
 
 DEFAULT_CATEGORIES = {
     "directory": ("Who works here: names, departments, job titles, start "
@@ -266,10 +263,6 @@ def check_against_schema(catalog: Catalog, schema: dict) -> None:
             + ", ".join(unknown) + " (remove them, or update db_schema.json)")
 
 
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 def load_catalog(path, schema: Optional[dict] = None) -> tuple:
     """(Catalog, sha256 of the file text) - or (a new default catalog,
     None) when the file does not exist yet."""
@@ -286,29 +279,10 @@ def save_catalog(path, catalog: Catalog, expected_sha: Optional[str]) -> str:
     `expected_sha` is the sha256 load_catalog returned (None: the file must
     not exist yet). If the file changed meanwhile, nothing is written.
     """
-    path = Path(path)
     text = catalog.to_text()
     parse_catalog(text)  # never write a catalog we would refuse to load
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with exclusive_lock(path.parent / LOCK_NAME, what="catalog change"):
-        current = (sha256_text(path.read_text(encoding="utf-8"))
-                   if path.exists() else None)
-        if current != expected_sha:
-            raise CatalogError("catalog.json changed since it was read; "
-                               "nothing was written. Run the command again.")
-        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp_",
-                                   suffix=".json")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                f.write(text)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-            raise
-    return sha256_text(text)
+    return atomic_save(path, text, expected_sha, what="catalog",
+                       error=CatalogError)
 
 
 # ----------------------------------------------------------------------

@@ -6,8 +6,9 @@ __pycache__/
 company.db
 policy_changes.jsonl
 .policy.lock
-.catalog.lock
+.onboarding.lock
 *.code-workspace
 build/
 dist/
 *.egg-info/
+examples/demo/onboarding/
