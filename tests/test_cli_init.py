@@ -177,8 +177,11 @@ def test_suggest_then_status(demo_dir):
     assert row.split()[:3] == ["payroll.salary", "suggested", "pay"]
     assert any("47 added, 0 updated, 0 human decision(s) kept" in l
                for l in out)
-    assert any(l.startswith("47 column(s) not approved: hidden from everyone "
-                            "until approved") for l in out)
+    assert any(l.startswith("47 column(s) not approved: not granted by the "
+                            "generated policy until approved") for l in out)
+    # the shipped hand-written rules still grant them: never "hidden"
+    assert any(l.startswith("WARNING: 47 not-approved column(s) are READABLE")
+               for l in out)
     _, out = run(["status", "--config-dir", str(demo_dir)])
     assert "  suggested:  47 (awaiting approval)" in out
     assert "Fully approved tables: none" in out

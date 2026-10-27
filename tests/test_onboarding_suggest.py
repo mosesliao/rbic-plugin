@@ -234,7 +234,8 @@ def test_cli_suggest_leaks_no_values(demo_dir, tmp_path, capsys, audit_on):
                           "--audit-log", str(log)], output=out.append) == 0
     printed = "\n".join(out)
     assert "contacts.ref" in printed and "value-rule:email" in printed
-    assert "hidden from everyone until approved" in printed
+    assert "not granted by the generated policy until approved" in printed
+    assert "contacts.ref" not in next(l for l in out if l.startswith("WARNING"))
     catalog = catalog_path(demo_dir).read_text(encoding="utf-8")
     assert json.loads(catalog)["columns"]["contacts.ident"]["category"] == \
         "personal_identifier"

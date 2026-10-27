@@ -335,7 +335,7 @@ class Decision:
 
     def describe(self) -> str:
         what = (f"approve as {self.category}" if self.action == "approve"
-                else "reject (stays hidden from everyone)")
+                else "reject (never granted by the generated policy)")
         return f"{self.column}: {self.before} -> {what}"
 
 
@@ -443,7 +443,9 @@ class CatalogStatus:
 
     @property
     def hidden(self) -> int:
-        """Columns the generated policy will hide from everyone."""
+        """Columns the generated policy does not grant (hidden from
+        everyone only if no rule outside the rbic-init block grants them:
+        see rbic.onboarding.report.readable_columns)."""
         return self.suggested + self.rejected + self.unlabelled
 
 

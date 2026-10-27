@@ -4,9 +4,13 @@ Checks (each "ok", "drift" or "skipped"; findings name tables, columns,
 roles and usernames only - never a data value or an email):
 - schema: the live database (introspected read-only, catalog only) vs
   db_schema.json (diff_schema).
-- catalog: columns with no approved category (unlabelled or still
-  suggested: hidden from everyone) and catalog entries for columns that no
-  longer exist. Rejected columns are a human decision: listed as info.
+- catalog: columns with no approved category and catalog entries for
+  columns that no longer exist. A column that is not approved (unlabelled,
+  suggested or rejected) but that some role or user CAN read - through a
+  rule outside the generated block, e.g. a hand-written `inventory.*`
+  grant, computed from the gate's snapshot as the access report does -
+  is drift naming who reads it; otherwise it is hidden from everyone
+  (rejected and hidden: info).
 - generated_block: the rbic-init block vs its sources (block_state):
   out of date, edited by hand, undone, missing, malformed.
 - roles: roles.json entries naming categories, tables, columns or parent
@@ -33,10 +37,12 @@ from .catalog import CatalogError, parse_catalog
 from .compile import (CompileError, block_body, block_header,
                       build_policy_text, compile_from_files,
                       current_fingerprint, HEADER_RE)
+from .report import readable_from_files
 from .roles import Roles, RolesError, _role
 from .schema import diff_schema, introspect_sqlite
 
 CHECKS = ("schema", "catalog", "generated_block", "roles", "workers")
+READABLE_VIA = '(through a rule that does not come from approved catalog columns: a hand-written rule such as a table.* grant, or an out-of-date generated block)'
 OK, DRIFT, SKIPPED, ERROR = "ok", "drift", "skipped", "error"
 # block_state() states that are not drift
 IN_SYNC, NOT_ONBOARDED = "in_sync", "not_onboarded"
@@ -194,6 +200,18 @@ def _read_catalog(cfg):
     return parse_catalog(path.read_text(encoding="utf-8"))
 
 
+def _readers(cfg) -> Optional[dict]:
+    """readable_columns of the live policy, or None when it does not load
+    (then the gate denies everyone; the workers check says so)."""
+    try:
+        return readable_from_files(
+            Path(cfg.model_path).read_bytes(), Path(cfg.policy_path).read_bytes(),
+            Path(cfg.attributes_path).read_bytes(),
+            Path(cfg.schema_path).read_bytes(), dialect=cfg.dialect)
+    except Exception:  # noqa: BLE001 - whatever the gate refuses
+        return None
+
+
 def _catalog_check(cfg, schema: dict, catalog) -> Check:
     c = Check("catalog")
     if catalog is None:
@@ -205,17 +223,33 @@ def _catalog_check(cfg, schema: dict, catalog) -> Check:
         if column not in schema.get(table, {}):
             c.drift(f"{key}: catalog entry for a column that no longer exists "
                     "in db_schema.json")
+    readers = _readers(cfg) or {}
     rejected = []
     for table, cols in schema.items():
         for col in cols:
             e = catalog.columns.get(f"{table}.{col}")
-            if e is None:
-                c.drift(f"{table}.{col}: unlabelled - hidden from everyone "
-                        "until approved")
-            elif e.status == "suggested":
-                c.drift(f"{table}.{col}: suggested ({e.category or 'no category'}), not approved - hidden from everyone")
+            who = readers.get((table, col))
+            if e is None or e.status == "suggested":
+                state = ("unlabelled" if e is None else
+                         f"suggested ({e.category or 'no category'}), not "
+                         "approved")
+                if who:
+                    c.drift(f"{table}.{col}: {state} - but READABLE by "
+                            f"{', '.join(who)} {READABLE_VIA}: approve or "
+                            "reject it, and remove that rule if it should be "
+                            "hidden")
+                elif e is None:
+                    c.drift(f"{table}.{col}: unlabelled - hidden from everyone "
+                            "until approved")
+                else:
+                    c.drift(f"{table}.{col}: {state} - hidden from everyone")
             elif e.status == "rejected":
-                rejected.append(f"{table}.{col}")
+                if who:
+                    c.drift(f"{table}.{col}: rejected in catalog.json - but "
+                            f"READABLE by {', '.join(who)} {READABLE_VIA}: "
+                            "remove that rule")
+                else:
+                    rejected.append(f"{table}.{col}")
     if rejected:
         c.info.append("rejected (hidden from everyone by decision): "
                       + ", ".join(rejected))

@@ -127,10 +127,16 @@ def test_catalog_coverage(onboarded):
     text = "\n".join(c.findings)
     assert "inventory.ghost: catalog entry for a column that no longer exists" \
         in text
-    assert "inventory.qty: suggested (inventory), not approved - hidden" in text
-    assert "shipments.status: unlabelled - hidden from everyone" in text
-    assert "shipments.eta" not in text
-    assert "rejected (hidden from everyone by decision): shipments.eta" in c.info
+    # still granted by the (now out-of-date) generated block: not hidden
+    assert "inventory.qty: suggested (inventory), not approved - but READABLE " \
+        "by warehouse_worker" in text
+    # the block (compiled before these edits) still grants both
+    assert "shipments.status: unlabelled - but READABLE by warehouse_worker" \
+        in text
+    assert "shipments.eta: rejected in catalog.json - but READABLE by " \
+        "warehouse_worker" in text
+    assert not any("shipments.eta" in i for i in c.info)
+    assert "hidden from everyone" not in text
 
 
 def test_roles_referencing_missing_things(onboarded):
@@ -417,6 +423,54 @@ def test_inherited_low_sensitivity_scope_is_warned_about(demo_dir):
     gen = compile_from_files(demo_dir, cfg.schema_path, cfg.attributes_path)
     assert not any("limited only by row scope(s) inherited" in w
                    for w in gen.warnings)
+
+
+def test_readable_but_not_approved_is_drift_naming_the_roles(demo_dir):
+    # Review finding: drift/status called columns "hidden from everyone"
+    # that the demo's hand-written `inventory.*` grant still exposes.
+    run(["suggest", "--config-dir", str(demo_dir), "--no-values"])
+    run(["approve", "--config-dir", str(demo_dir), "--actor", "master",
+         "--all-suggested"], ("yes",))
+    run(["reject", "--config-dir", str(demo_dir), "--actor", "master",
+         "inventory.qty"], ("yes",))
+    path = catalog_path(demo_dir)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["columns"]["inventory.sku"] = {"category": "inventory",
+                                       "status": "suggested",
+                                       "suggested_by": "human", "evidence": ""}
+    del raw["columns"]["shipments.eta"]
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    c = findings(check_drift(config(demo_dir)), "catalog")
+    text = "\n".join(c.findings)
+    assert ("inventory.qty: rejected in catalog.json - but READABLE by "
+            "warehouse_worker") in text
+    assert ("inventory.sku: suggested (inventory), not approved - but READABLE "
+            "by warehouse_worker") in text
+    assert "shipments.eta: unlabelled - but READABLE by warehouse_worker" in text
+    assert "hidden from everyone" not in text
+    assert not any("inventory.qty" in i for i in c.info)
+    _, out = run(["status", "--config-dir", str(demo_dir)])
+    warn = next(l for l in out if l.startswith("WARNING: 3 not-approved"))
+    assert "inventory.qty (warehouse_worker)" in warn
+    assert "0 not-approved column(s) are hidden from everyone (no role or user " \
+        "can read them)." in out
+    # remove the wildcard grants: now they really are hidden from everyone
+    policy = demo_dir / "casbin" / "policy.csv"
+    policy.write_text("\n".join(
+        l for l in policy.read_text(encoding="utf-8").split("\n")
+        if not l.startswith(("p, warehouse_worker, inventory.*",
+                             "p, warehouse_worker, shipments.*"))),
+        encoding="utf-8")
+    c = findings(check_drift(config(demo_dir)), "catalog")
+    text = "\n".join(c.findings)
+    assert "inventory.sku: suggested (inventory), not approved - hidden from " \
+        "everyone" in text
+    assert "shipments.eta: unlabelled - hidden from everyone" in text
+    assert "rejected (hidden from everyone by decision): inventory.qty" in c.info
+    _, out = run(["status", "--config-dir", str(demo_dir)])
+    assert not any(l.startswith("WARNING: ") for l in out)
+    assert "3 not-approved column(s) are hidden from everyone (no role or user " \
+        "can read them)." in out
 
 
 def test_compile_refuses_unacknowledged_high_sensitivity(onboarded, capsys):

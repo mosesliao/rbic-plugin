@@ -51,8 +51,9 @@ from ..onboarding.catalog import (CatalogError, apply_decisions, catalog_status,
                                   plan_rejections, save_catalog)
 from ..onboarding.compile import (CompileError, build_policy_text,
                                   compile_from_files)
-from ..onboarding.drift import IN_SYNC, NOT_ONBOARDED, block_state, check_drift
-from ..onboarding.report import report_from_bytes
+from ..onboarding.drift import (IN_SYNC, NOT_ONBOARDED, READABLE_VIA,
+                                block_state, check_drift)
+from ..onboarding.report import readable_from_files, report_from_bytes
 from ..onboarding.roles import (RolesError, RowScope, add_scope, list_packs,
                                 load_pack, load_roles, merge_pack,
                                 remove_all_rows, remove_role, remove_scope,
@@ -65,7 +66,7 @@ from ..onboarding.suggest import suggest_categories
 from . import add_audit_log_argument, setup_logging
 
 APPLY_PROMPT = "Apply? [yes/no]: "
-HIDDEN_NOTE = ("hidden from everyone until approved (the generated policy "
+HIDDEN_NOTE = ("not granted by the generated policy until approved (it "
                "grants approved columns only)")
 
 
@@ -199,7 +200,39 @@ def cmd_suggest(args, input_fn, output):
     output(f"{st.hidden} column(s) not approved: {HIDDEN_NOTE}. Review them, "
            "then: rbic-init approve --actor NAME (COLUMN [CATEGORY] | "
            "--all-suggested)")
+    _readable_note(cfg, merged, schema, output)
     return 0
+
+
+def _readable_note(cfg, catalog, schema, output):
+    """Which not-approved columns are readable anyway (rules outside the
+    rbic-init block, from the gate's snapshot) and which are hidden from
+    everyone - never claim "hidden" for a column a role can read."""
+    try:
+        readers = readable_from_files(
+            _bytes(cfg.model_path), _bytes(cfg.policy_path),
+            _bytes(cfg.attributes_path), _bytes(cfg.schema_path),
+            dialect=cfg.dialect)
+    except Exception:  # noqa: BLE001 - whatever the gate refuses
+        output("The current policy does not load in the SQL gate: everyone "
+               "is denied (run rbic-init drift).")
+        return
+    readable, hidden = [], 0
+    for table, cols in schema.items():
+        for column in cols:
+            e = catalog.columns.get(f"{table}.{column}")
+            if e is not None and e.status == "approved":
+                continue
+            who = readers.get((table, column))
+            if who:
+                readable.append(f"{table}.{column} ({', '.join(who)})")
+            else:
+                hidden += 1
+    if readable:
+        output(f"WARNING: {len(readable)} not-approved column(s) are READABLE "
+               f"now {READABLE_VIA}: " + "; ".join(readable))
+    output(f"{hidden} not-approved column(s) are hidden from everyone (no "
+           "role or user can read them).")
 
 
 def cmd_status(args, input_fn, output):
@@ -215,6 +248,7 @@ def cmd_status(args, input_fn, output):
     output(f"  rejected:   {st.rejected}")
     output(f"  unlabelled: {st.unlabelled}")
     output(f"{st.hidden} column(s) {HIDDEN_NOTE}.")
+    _readable_note(cfg, catalog, schema, output)
     output("Fully approved tables: "
            + (", ".join(st.approved_tables) or "none"))
     if st.partial_tables:
@@ -740,8 +774,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("reject", parents=[common],
                        help="reject column suggestions (asks yes/no)",
-                       description="Reject the suggestion for columns: they "
-                                   "stay hidden from everyone, and later "
+                       description="Reject the suggestion for columns: the "
+                                   "generated policy never grants them, and later "
                                    "suggestions never overwrite the decision.")
     p.add_argument("columns", nargs="+", metavar="COLUMN",
                    help="table.column to reject")

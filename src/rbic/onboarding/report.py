@@ -205,12 +205,21 @@ def _role_section(v: _View, role: str, readable_cells: set, warnings: list,
     return out
 
 
-def _personal_section(v: _View, readable_cells: set) -> list:
+def _personal_section(v: _View, readable_cells: set,
+                      holders: Optional[dict] = None) -> list:
+    """Per-user rules; columns they make readable go to `readable_cells`
+    (and, with `holders`, holders[(table, column)] gets `user:<name>`)."""
     out = []
     for user in sorted(v.attrs):
         if v.attrs[user].get("role") == MASTER_ROLE:
             continue
         subj = user_subject(user)
+
+        def mark(cells, subj=subj):
+            for cell in cells:
+                readable_cells.add(cell)
+                if holders is not None:
+                    holders.setdefault(cell, set()).add(subj)
         grants = sorted(obj for sub, obj in v.s.allow_grants if sub == subj)
         denies = sorted(obj for sub, obj in v.s.deny_grants if sub == subj)
         scopes = [rf for sub, rf in v.s.row_filters if sub == subj]
@@ -227,14 +236,14 @@ def _personal_section(v: _View, readable_cells: set) -> list:
             for c in v.schema.get(table, []):
                 if v.s._grant(((subj, obj),), {subj}, table, c) \
                         and not v.denied({subj}, table, c):
-                    readable_cells.add((table, c))
+                    mark([(table, c)])
             rows = (v.s.user_base_filters(subjects, table)[0]
                     if subjects else [])
             out.append(f"  - personal grant {_cell(obj)}: {_cell(_rows(rows))}")
         for rf in scopes:
             if rf.scoped:
-                readable_cells.update((rf.table, c) for c in rf.columns
-                                      if not v.denied({subj}, rf.table, c))
+                mark([(rf.table, c) for c in rf.columns
+                      if not v.denied({subj}, rf.table, c)])
                 out.append(f"  - personal scoped grant on {rf.table}."
                            f"({', '.join(rf.columns)}): {_cell(_rows([rf]))}")
             else:
@@ -247,6 +256,31 @@ def _personal_section(v: _View, readable_cells: set) -> list:
             out.append(f"  - rows of {rf.table} where "
                        f"{_cell(plain_filter(rf.template))} hidden{when}")
     return out
+
+
+def readable_columns(snapshot: PolicySnapshot) -> dict:
+    """{(table, column): sorted holders} - every column some role (role
+    name) or personal rule (`user:<name>`) can read, computed exactly as
+    the access report computes it (from the gate's snapshot: generated
+    AND hand-written rules, keyMatch, scoped grants, column denies).
+    A column missing here is hidden from everyone."""
+    v = _View(snapshot, None)
+    holders: dict = {}
+    for role in v.roles():
+        cells: set = set()
+        _role_section(v, role, cells, [], {})
+        for cell in cells:
+            holders.setdefault(cell, set()).add(role)
+    _personal_section(v, set(), holders)
+    return {cell: sorted(h) for cell, h in holders.items()}
+
+
+def readable_from_files(model: bytes, policy: bytes, attributes: bytes,
+                        schema: bytes, *, dialect: str = "sqlite") -> dict:
+    """readable_columns over files' bytes (raises what load_snapshot
+    refuses)."""
+    return readable_columns(load_snapshot(model, policy, attributes, schema,
+                                          dialect=dialect))
 
 
 def access_report(snapshot: PolicySnapshot, catalog: Optional[Catalog] = None,
