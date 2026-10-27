@@ -798,7 +798,10 @@ def build_parser() -> argparse.ArgumentParser:
                                     "such as \"dept = '{dept}'\"), or with "
                                     "--columns a scoped grant (those columns, "
                                     "for those rows). Templates follow the "
-                                    "master bot's strict rules.")
+                                    "master bot's strict rules; a template "
+                                    "without a {placeholder} is static (the "
+                                    "same rows for every user) and is "
+                                    "warned about.")
     r.add_argument("role", metavar="ROLE")
     r.add_argument("table", metavar="TABLE")
     r.add_argument("template", metavar="TEMPLATE")
@@ -818,8 +821,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "rows (needed for high-sensitivity columns)",
                         description="rbic-init compile refuses a role that "
                                     "would read a high-sensitivity category "
-                                    "of TABLE with no row scope in its role "
-                                    "level, unless the role acknowledges it "
+                                    "of TABLE with no row scope bound from "
+                                    "the user's attributes in its role level "
+                                    "(none, or only static ones such as "
+                                    "'id > 0'), or through a static scoped "
+                                    "grant, unless the role acknowledges it "
                                     "here with a reason (recorded in the "
                                     "generated block and the access report).")
     r.add_argument("role", metavar="ROLE")

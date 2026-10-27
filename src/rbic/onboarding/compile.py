@@ -15,7 +15,12 @@ Guarantees (tests: tests/test_onboarding_compile.py):
   include a column of a HIGH-sensitivity category on a table that no row
   scope of its role level limits is refused (CompileError), unless the
   role's roles.json entry acknowledges that table under `all_rows` with a
-  reason. The reason is written into the block as a comment
+  reason. Only scopes bound from the user's attributes count as a limit:
+  a level whose scopes on the table are all STATIC (no placeholder, e.g.
+  `employee_id > 0`, `status = 'unpaid'`: the same rows for every user)
+  is treated as unlimited, and so is a static scoped grant (4-field) of
+  high-sensitivity columns - both need the acknowledgement too. Every
+  static scope is warned about (gate.STATIC_FILTER_WARNING). The reason is written into the block as a comment
   (`# all_rows <role> <table>: <reason>`), shown in the access report and
   in the change's effect summary. (A role that only INHERITS such columns
   needs no acknowledgement of its own: the ancestor granting them reads
@@ -43,7 +48,7 @@ from typing import Iterable, Optional
 
 from ..admin import CHANGES_HEADER, _casbin_tokens
 from ..gate import (PTYPE_ALLOW_COLUMNS, PTYPE_ALLOW_ROWS, SCOPE_COLUMN_SEP,
-                    check_schema)
+                    STATIC_FILTER_WARNING, check_schema)
 from . import catalog_path, roles_path
 from .block import find_block, outside_lines, replace_block, split_lines
 from .catalog import Catalog, load_catalog
@@ -167,6 +172,25 @@ def _sensitivity(catalog: Catalog, category) -> Optional[str]:
     return catalog.categories.get(category, {}).get("sensitivity")
 
 
+def _need_ack(name, role, table, cols, why, static, refused, acks,
+              acknowledged):
+    """A high-sensitivity read that no user-bound row scope limits: refused
+    unless roles.json acknowledges `table` for the role."""
+    reason = role.acknowledged(table)
+    if reason is None:
+        refused.append(
+            f"role {name} would read high-sensitivity column(s) {cols} on ALL "
+            f"rows{why}. Add a row scope bound from the user's attributes "
+            f"(rbic-init roles scope {name} {table} \"TEMPLATE\"), or "
+            f"acknowledge it (rbic-init roles all-rows {name} {table} "
+            "--reason \"WHY\")")
+        return
+    acks.setdefault(name, {})[table] = reason
+    acknowledged.append(f"role {name} reads high-sensitivity column(s) {cols} "
+                        f"on ALL rows{why if static else ''} - acknowledged "
+                        f"in roles.json: {reason}")
+
+
 def compile_policy(catalog: Catalog, roles: Roles, schema: dict, *,
                    usernames: Iterable = ()) -> GeneratedPolicy:
     try:
@@ -178,6 +202,8 @@ def compile_policy(catalog: Catalog, roles: Roles, schema: dict, *,
     body, rules, warnings, acknowledged = [], [], [], []
     reads: dict = {}     # role -> {table: [columns]} (own p grants)
     filtered: dict = {}  # role -> {tables with a 3-field scope}
+    dynamic: dict = {}   # role -> {tables with a 3-field scope bound from
+    #                      the user's attributes (not static)}
     scoped_any: dict = {}  # table -> {roles with any scope on it}
     acks: dict = {}      # role -> {table: reason} actually needed
 
@@ -189,8 +215,14 @@ def compile_policy(catalog: Catalog, roles: Roles, schema: dict, *,
                     own.setdefault(table, []).append(c)
         reads[name] = own
         filtered[name] = {s.table for s in role.row_scopes if s.columns is None}
+        dynamic[name] = {s.table for s in role.row_scopes
+                         if s.columns is None and not s.static}
         for s in role.row_scopes:
             scoped_any.setdefault(s.table, set()).add(name)
+            if s.static:
+                warnings.append(
+                    f"role {name}: row scope on {s.table} ({s.template}): "
+                    f"{STATIC_FILTER_WARNING}")
 
     # Row-scope analysis per role LEVEL (the role and what it inherits):
     # same-table 3-field filters OR together across the level in the gate.
@@ -204,41 +236,54 @@ def compile_policy(catalog: Catalog, roles: Roles, schema: dict, *,
                 tables.setdefault(t, []).extend(c for c in cols
                                                 if c not in tables.get(t, []))
         limited = set().union(*(filtered.get(r, set()) for r in level))
+        limited_dyn = set().union(*(dynamic.get(r, set()) for r in level))
         for table in sorted(tables, key=order.get):
-            if table in limited:
-                continue
-            others = sorted(scoped_any.get(table, set()) - set(level))
-            if others:
-                warnings.append(
-                    f"role {name} reads {table} on ALL rows (no row scope in "
-                    f"its role level), while {', '.join(others)} "
-                    f"{'has' if len(others) == 1 else 'have'} a row scope "
-                    f"on {table}")
             sens = {c: _sensitivity(catalog, approved[f"{table}.{c}"])
                     for c in tables[table]}
             high = [c for c in tables[table] if sens[c] == HIGH]
             own_high = [c for c in reads[name].get(table, []) if sens[c] == HIGH]
             medium = [c for c in tables[table] if sens[c] == MEDIUM]
-            if own_high:
-                reason = role.acknowledged(table)
-                cols = f"{table}.({', '.join(high)})"
-                if reason is None:
-                    refused.append(
-                        f"role {name} would read high-sensitivity column(s) "
-                        f"{cols} on ALL rows (no row scope in its role "
-                        "level). Add a row scope (rbic-init roles scope "
-                        f"{name} {table} \"TEMPLATE\"), or acknowledge it "
-                        f"(rbic-init roles all-rows {name} {table} --reason "
-                        "\"WHY\")")
-                else:
-                    acks.setdefault(name, {})[table] = reason
-                    acknowledged.append(
-                        f"role {name} reads high-sensitivity column(s) {cols} "
-                        f"on ALL rows - acknowledged in roles.json: {reason}")
-            if medium:
-                warnings.append(
-                    f"role {name} reads medium-sensitivity column(s) "
-                    f"{table}.({', '.join(medium)}) on ALL rows (no row scope)")
+            if table not in limited:
+                others = sorted(scoped_any.get(table, set()) - set(level))
+                if others:
+                    warnings.append(
+                        f"role {name} reads {table} on ALL rows (no row scope "
+                        f"in its role level), while {', '.join(others)} "
+                        f"{'has' if len(others) == 1 else 'have'} a row scope "
+                        f"on {table}")
+                if medium:
+                    warnings.append(
+                        f"role {name} reads medium-sensitivity column(s) "
+                        f"{table}.({', '.join(medium)}) on ALL rows (no row "
+                        "scope)")
+            if own_high and table not in limited_dyn:
+                # No scope bound from the user's attributes: ALL rows, or
+                # only static scopes (the same rows for every user).
+                static = sorted({s.template for r in level
+                                 for s in roles.roles[r].row_scopes
+                                 if s.table == table and s.columns is None})
+                why = (" (no row scope in its role level)" if not static else
+                       " (only STATIC row scope(s) in its role level: "
+                       + "; ".join(static) + " - the same rows for every "
+                       "user, which counts as ALL rows)")
+                _need_ack(name, role, table, f"{table}.({', '.join(high)})",
+                          why, bool(static), refused, acks, acknowledged)
+        for scope in role.row_scopes:
+            # A static scoped grant of high-sensitivity columns is the same
+            # rows for everyone: it needs the acknowledgement as well.
+            if scope.columns is None or not scope.static:
+                continue
+            high = [c for c in scope.columns
+                    if f"{scope.table}.{c}" in approved
+                    and _sensitivity(catalog,
+                                     approved[f"{scope.table}.{c}"]) == HIGH]
+            if high:
+                _need_ack(name, role, scope.table,
+                          f"{scope.table}.({', '.join(high)})",
+                          " (through a STATIC scoped grant: rows where "
+                          f"{scope.template} - the same rows for every user, "
+                          "which counts as ALL rows)",
+                          True, refused, acks, acknowledged)
         for a in role.all_rows:
             if a.table not in acks.get(name, {}):
                 warnings.append(

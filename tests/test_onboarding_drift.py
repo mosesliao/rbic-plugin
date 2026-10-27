@@ -15,11 +15,14 @@ from onboarding_demo import (admin, compile_and_apply, compile_change, config,
 from rbic.admin import SOURCES_NOT_REVERTED
 from rbic.onboarding import catalog_path, roles_path
 from rbic.onboarding.block import END_MARKER
-from rbic.onboarding.compile import (HEADER_PREFIX, acknowledgements,
-                                     block_header, compile_from_files)
+from rbic.gate import STATIC_FILTER_WARNING
+from rbic.onboarding.compile import (HEADER_PREFIX, CompileError,
+                                     acknowledgements, block_header,
+                                     compile_from_files)
 from rbic.onboarding.drift import block_state, check_drift
 from rbic.onboarding.report import report_from_bytes
-from rbic.onboarding.roles import set_all_rows, set_role
+from rbic.onboarding.roles import (RowScope, add_scope, remove_all_rows,
+                                   remove_scope, set_all_rows, set_role)
 from test_cli_init import audit_lines, run
 
 logging.disable(logging.CRITICAL)
@@ -272,6 +275,109 @@ def _auditor(d, ack=True):
         for table in ("payroll", "employees"):
             roles, _ = set_all_rows(roles, "auditor", table, REASON)
     save(d, roles, sha)
+
+
+AUDITOR_STATIC = (("payroll", "employee_id > 0"), ("employees", "id <> -1"))
+
+
+def _static_auditor(d, scopes=AUDITOR_STATIC, ack=()):
+    schema, catalog, users, roles, sha = load_state(d)
+    roles, _ = set_role(roles, "auditor", categories=["pay"])
+    for table, template in scopes:
+        roles, lines = add_scope(roles, "auditor", RowScope(table, template))
+        assert any(STATIC_FILTER_WARNING in line for line in lines)
+    for table in ack:
+        roles, _ = set_all_rows(roles, "auditor", table, REASON)
+    save(d, roles, sha)
+
+
+def test_static_scopes_do_not_count_as_a_row_limit(onboarded, capsys):
+    # Review finding: `employee_id > 0` / `id <> -1` (the same rows for every
+    # user) passed the all-rows refusal for high-sensitivity columns.
+    _static_auditor(onboarded)
+    with pytest.raises(SystemExit) as exc:
+        run(["compile", "--config-dir", str(onboarded), "--actor", "master"])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert ("role auditor would read high-sensitivity column(s) payroll.(id, "
+            "employee_id, salary, effective_date) on ALL rows (only STATIC row "
+            "scope(s) in its role level: employee_id > 0") in err
+    assert "role auditor would read high-sensitivity column(s) " \
+        "employees.(salary) on ALL rows (only STATIC" in err
+
+
+def test_static_scope_with_acknowledgement_compiles_with_warnings(onboarded):
+    _static_auditor(onboarded, ack=("payroll", "employees"))
+    gen, change = compile_change(onboarded)
+    assert any("role auditor: row scope on payroll (employee_id > 0): "
+               + STATIC_FILTER_WARNING == w for w in gen.warnings)
+    assert ("compile: role auditor reads high-sensitivity column(s) "
+            "payroll.(id, employee_id, salary, effective_date) on ALL rows "
+            "(only STATIC row scope(s)") in change.description
+    assert f"acknowledged in roles.json: {REASON}" in change.description
+    admin(onboarded).apply(change, actor="master")
+    cfg = config(onboarded)
+    schema, catalog, *_ = load_state(onboarded)
+    report = report_from_bytes(
+        cfg.model_path.read_bytes(), cfg.policy_path.read_bytes(),
+        cfg.attributes_path.read_bytes(), cfg.schema_path.read_bytes(),
+        catalog)
+    assert ("rows where employee_id > 0 (STATIC: the same rows for every "
+            f"user) (acknowledged: {REASON})") in report
+    assert ("role auditor reads payroll on ALL rows (only static row filters "
+            "in its role level: STATIC: the same rows for every user), "
+            "including high-sensitivity id, employee_id, salary, "
+            f"effective_date - acknowledged in roles.json: {REASON}") in report
+
+
+def test_static_status_filter_is_static_too(onboarded):
+    # a constant comparison on any column is static: `status = 'unpaid'`
+    schema, catalog, users, roles, sha = load_state(onboarded)
+    roles, _ = set_role(roles, "payslip_clerk", categories=["pay"])
+    roles, lines = add_scope(roles, "payslip_clerk",
+                             RowScope("payroll", "effective_date > '2000-01-01'"))
+    save(onboarded, roles, sha)
+    with pytest.raises(CompileError, match="payslip_clerk would read "
+                                           "high-sensitivity"):
+        compile_from_files(onboarded, config(onboarded).schema_path,
+                           config(onboarded).attributes_path)
+
+
+def test_static_scoped_grant_of_high_columns_needs_acknowledgement(onboarded):
+    schema, catalog, users, roles, sha = load_state(onboarded)
+    roles, _ = set_role(roles, "auditor", categories=[])
+    roles, lines = add_scope(roles, "auditor", RowScope(
+        "payroll", "employee_id > 0", ("employee_id", "salary")))
+    assert any(STATIC_FILTER_WARNING in line for line in lines)
+    save(onboarded, roles, sha)
+    cfg = config(onboarded)
+    with pytest.raises(CompileError, match=r"role auditor would read "
+                       r"high-sensitivity column\(s\) payroll.\(employee_id, "
+                       r"salary\) on ALL rows \(through a STATIC scoped grant"):
+        compile_from_files(onboarded, cfg.schema_path, cfg.attributes_path)
+    schema, catalog, users, roles, sha = load_state(onboarded)
+    roles, _ = set_all_rows(roles, "auditor", "payroll", REASON)
+    save(onboarded, roles, sha)
+    gen = compile_from_files(onboarded, cfg.schema_path, cfg.attributes_path)
+    assert f"# all_rows auditor payroll: {REASON}" in gen.body
+    # a scoped grant bound from the user's attributes needs none
+    schema, catalog, users, roles, sha = load_state(onboarded)
+    roles, _ = remove_all_rows(roles, "auditor", "payroll")
+    roles, _ = remove_scope(roles, "auditor", RowScope(
+        "payroll", "employee_id > 0", ("employee_id", "salary")))
+    roles, lines = add_scope(roles, "auditor", RowScope(
+        "payroll", "employee_id = '{employee_id}'", ("employee_id", "salary")))
+    assert not any(STATIC_FILTER_WARNING in line for line in lines)
+    save(onboarded, roles, sha)
+    compile_from_files(onboarded, cfg.schema_path, cfg.attributes_path)
+
+
+def test_cli_roles_scope_shows_the_static_warning(onboarded):
+    code, out = run(["roles", "scope", "hr_staff", "employees", "id > 0",
+                     "--config-dir", str(onboarded), "--actor", "master"],
+                    ("no",))
+    assert code == 0
+    assert any(STATIC_FILTER_WARNING in line for line in out)
 
 
 def test_compile_refuses_unacknowledged_high_sensitivity(onboarded, capsys):

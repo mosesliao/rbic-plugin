@@ -33,10 +33,13 @@ every dialect. Saved atomically under the onboarding lock, refusing a
 file that changed since it was read.
 
 `all_rows` is the explicit acknowledgement the compiler demands before a
-role may read a HIGH-sensitivity category on a table without any row
-scope in its role level (else `rbic-init compile` refuses): one entry per
-table, with a non-empty printable-ASCII reason that is recorded in the
-generated block and shown in the access report. Packs never set it.
+role may read a HIGH-sensitivity category on a table without a row scope
+bound from the user's attributes in its role level (none at all, or only
+STATIC ones such as `employee_id > 0`, which give every user the same
+rows), or through a static scoped grant (else `rbic-init compile`
+refuses): one entry per table, with a non-empty printable-ASCII reason
+that is recorded in the generated block and shown in the access report.
+Packs never set it.
 
 Starter packs (rbic/onboarding/packs/*.json, shipped in the wheel)
 describe row ownership by COLUMN NAME ("scope tables that have a column
@@ -58,8 +61,9 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from ..admin import FILTER_DIALECTS, MASTER_ROLE, ROLE_RE
-from ..gate import (SCOPE_COLUMN_SEP, USER_PREFIX, FilterError,
-                    compile_row_filter, parse_scope_columns)
+from ..gate import (SCOPE_COLUMN_SEP, STATIC_FILTER_WARNING, USER_PREFIX,
+                    FilterError, _placeholder_names, compile_row_filter,
+                    parse_scope_columns)
 from .catalog import CATEGORY_RE, Catalog
 from .store import atomic_save, sha256_text
 
@@ -91,6 +95,13 @@ class RowScope:
         if self.columns is not None:
             out["columns"] = list(self.columns)
         return out
+
+    @property
+    def static(self) -> bool:
+        """No {placeholder}: the same rows for every user (`employee_id >
+        0`, `status = 'unpaid'`) - it does not limit anyone to their own
+        rows, so it never counts as a row limit for high-sensitivity data."""
+        return not _placeholder_names(self.template)
 
     def describe(self) -> str:
         if self.columns is None:
@@ -464,7 +475,14 @@ def add_scope(roles: Roles, name: str, scope: RowScope) -> tuple:
         raise RolesError(f"role {name} already has {scope.describe()}")
     role.row_scopes.append(scope)
     role.source = HUMAN
-    return out, [f"role {name}: add {scope.describe()}"]
+    lines = [f"role {name}: add {scope.describe()}"]
+    if scope.static:
+        lines.append(f"{STATIC_FILTER_WARNING} A static scope does not count "
+                     "as a row limit for high-sensitivity columns: rbic-init "
+                     "compile still needs a scope bound from the user's "
+                     f"attributes, or an all-rows acknowledgement for "
+                     f"{scope.table}.")
+    return out, lines
 
 
 def remove_scope(roles: Roles, name: str, scope: RowScope) -> tuple:

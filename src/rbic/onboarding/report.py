@@ -25,6 +25,7 @@ from .catalog import Catalog
 
 _PLACEHOLDER = re.compile(r"'\{([a-z][a-z0-9_]{0,40})\}'|\{([a-z][a-z0-9_]{0,40})\}")
 ALL_ROWS = "**ALL rows**"
+STATIC_ROWS = "STATIC: the same rows for every user"
 
 
 def plain_filter(template: str) -> str:
@@ -40,9 +41,12 @@ def _cell(text: str) -> str:
 def _rows(filters) -> str:
     if not filters:
         return ALL_ROWS
-    return "rows where " + " OR ".join(
+    text = "rows where " + " OR ".join(
         f"({plain_filter(rf.template)})" if len(filters) > 1
         else plain_filter(rf.template) for rf in filters)
+    if all(rf.static for rf in filters):
+        text += f" ({STATIC_ROWS})"
+    return text
 
 
 class _View:
@@ -117,18 +121,23 @@ def _role_section(v: _View, role: str, readable_cells: set, warnings: list,
         base = v.filters(level, table, scoped=False)
         if cols:
             rule = _rows(base)
-            reason = None if base else next(
+            # static filters only = the same rows for every user: for
+            # high-sensitivity data that counts as ALL rows
+            static = bool(base) and all(rf.static for rf in base)
+            reason = None if base and not static else next(
                 (acks[(r, table)] for r in sorted(level) if (r, table) in acks),
                 None)
             if reason is not None:
                 rule += f" (acknowledged: {reason})"
             rows.append((table, ", ".join(v.label(table, c) for c in cols), rule))
             readable_cells.update((table, c) for c in cols)
-            if not base:
-                high = [c for c in cols if v.sensitivity(table, c) == "high"]
+            high = [c for c in cols if v.sensitivity(table, c) == "high"]
+            if not base or (static and high):
                 warnings.append(
-                    f"role {role} reads {table} on ALL rows (no row filter in "
-                    "its role level)"
+                    f"role {role} reads {table} on ALL rows ("
+                    + ("no row filter in its role level" if not base else
+                       "only static row filters in its role level: "
+                       + STATIC_ROWS) + ")"
                     + (f", including high-sensitivity {', '.join(high)}"
                        if high else "")
                     + (f" - acknowledged in roles.json: {reason}"

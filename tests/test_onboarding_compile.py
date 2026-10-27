@@ -46,7 +46,8 @@ def test_only_approved_columns_and_never_table_star():
                                      "template": "dept = '{dept}'"}]},
         "payroll_clerk": {"categories": ["pay"], "inherits": ["hr_staff"],
                           "row_scopes": [{"table": "payroll",
-                                          "template": "id = 1"}],
+                                          "template": "employee_id IN "
+                                                      "({team_ids})"}],
                           "all_rows": [{"table": "bonuses",
                                         "reason": "clerks pay every bonus"}]}})
     gen = compile_policy(CAT, roles, SCHEMA)
