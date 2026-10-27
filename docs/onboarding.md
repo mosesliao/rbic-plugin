@@ -3,8 +3,9 @@
 This guide takes a new organization from an empty config directory to a
 signed-off access policy, and keeps it correct afterwards. The toolkit
 **proposes**; the organization's policy owner (a *master* user) **approves**
-every write with a typed `yes`. Nothing grants access until a master
-approves it, and anything not approved stays hidden from everyone.
+every write with a typed `yes`. The generated policy grants nothing
+until a master approves it; `status`, `drift` and the access report tell
+you when a hand-written rule still exposes a column that is not approved.
 
 ## 1. Prerequisites
 
@@ -60,8 +61,13 @@ rbic-init schema --config-dir $D --write --actor master      # write it (yes/no)
 ```
 
 Tables and columns whose names are not lowercase identifiers are skipped
-(the gate could not address them). Anything not in `db_schema.json` is
-denied to everyone.
+(the gate could not address them), and so are tables or columns named
+`master` (reserved for the policy owner's role) and the internal shadow
+tables of full-text and R*Tree virtual tables (`<name>_content`, `_data`,
+`_idx`, `_docsize`, `_config`, `_segments`, `_segdir`, `_stat`, ...).
+Each skip is noted; names are printed with escapes, so an unusual name
+never breaks the console. Anything not in `db_schema.json` is denied to
+everyone.
 
 ## 4. Categories: `suggest`, `status`, `approve`, `reject`
 
@@ -81,6 +87,26 @@ No LLM is involved and no value is shown: evidence reads like
 sensitivity (`low`, `medium`, `high`); `pay` and `personal_identifier` are
 high. Review every suggestion: only **approved** columns are ever compiled.
 
+Sensitivities of the built-in categories are minimums: a `catalog.json`
+that lowers one (say `pay` to `low`) is refused by every command. You can
+raise them, and define your own categories with any sensitivity.
+Approving a column as a *less* sensitive category than the suggestion is
+a downgrade and needs a reason:
+
+```bash
+rbic-init approve --config-dir $D --actor master payroll.band directory \
+          --downgrade-reason "salary bands, not individual pay"
+```
+
+The reason is stored with the column, audited (`CATALOG_DOWNGRADE`), and
+shown by `compile` and in the access report.
+
+`status` shows how many columns are not approved. The generated policy
+never grants them, but a hand-written rule outside the generated block
+(such as `p, warehouse_worker, inventory.*, read`) still can: `status`
+then prints a WARNING naming the roles that can read them, and only the
+rest are reported as hidden from everyone.
+
 ## 5. Roles: `roles add-pack / set / scope / all-rows`
 
 ```bash
@@ -95,12 +121,17 @@ rbic-init roles show --config-dir $D
 A role reads every approved column of its categories. Row scopes become
 row filters bound from each worker's attributes (`dept = '{dept}'`). Packs
 place them by column name and list every table they had to skip. A role a
-human edited is never overwritten by a pack.
+human edited is never overwritten by a pack. A scope without a
+`{placeholder}` (`id > 0`, `status = 'unpaid'`) is *static*: every user
+gets the same rows. `roles scope` and `compile` warn about it.
 
 **High-sensitivity data on all rows is refused.** If a role would read a
 column of a high-sensitivity category on a table that no row scope of its
-role level limits, `compile` refuses. Either add a row scope, or record
-why that role needs every row:
+role level limits, `compile` refuses. Static scopes do not count as a
+limit here: a level whose scopes on the table are all static is treated
+as all rows, and so is a static scoped grant of high-sensitivity columns.
+Either add a row scope bound from the user's attributes, or record why
+that role needs every row:
 
 ```bash
 rbic-init roles all-rows auditor payroll --reason "auditors reconcile every payslip" \
@@ -114,6 +145,13 @@ summary. `--remove` takes it back. Medium-sensitivity data on all rows is
 a warning only. A role that only inherits such columns needs no
 acknowledgement of its own, because the ancestor that grants them had to
 give one.
+
+`compile` also warns when a role's high-sensitivity columns are limited
+only by a scope it *inherits* from a role that reads nothing that
+sensitive on the table. In the `hr` pack, `hr_manager` reads
+`employees.salary` within `hr_staff`'s `dept = '{dept}'`, a scope chosen
+for directory data. Check that those rows are right, or give the role its
+own scope.
 
 ## 6. Workers: `rbic-init import-users`
 
@@ -142,7 +180,11 @@ rbic-init import-users --config-dir $D --undo --actor master    # undo the last 
 - `email` must be a plain ASCII address. Non-ASCII and lookalike
   characters are refused. Emails are stored lowercased and must be unique,
   including against workers the import keeps. `employee_id` is digits
-  only and unique. `manager` is the username of another row.
+  only and unique across the resulting worker set, including workers the
+  import keeps and masters: a row reusing a kept worker's id would read
+  that worker's rows, so it is refused (the gate also refuses any two
+  workers sharing an `employee_id`). `manager` is the username of another
+  row.
 - Values may only contain letters, digits, spaces and `. , @ : / _ -`
   (at most 200 characters). Spreadsheet formulas such as `=…` or `+…` are
   refused. `-5` or `@team` are stored as plain text. Nothing is ever
@@ -175,7 +217,10 @@ With a `manager` column, every worker with an `employee_id` gets
 `self_and_subordinate_ids`: their own id plus their direct reports'
 (`--team-depth direct`, the default) or all their reports' (`all`) ids,
 for example `"1, 2, 3"`. A manager cycle is refused. The value must fit in
-200 characters.
+200 characters. Without a `manager` column, existing
+`self_and_subordinate_ids` values are kept unchanged and the summary warns
+that they may be stale; pass `--clear-team-ids` to remove them from the
+workers in the export instead.
 
 The summary names users, roles and attribute names only. Emails appear as
 `<email set>` / `<email changed>` / `<email removed>`. The file diff is not
@@ -213,8 +258,12 @@ user, then asks yes/no.
 **How the block and the master chatbot coexist.** Recompiling replaces
 only the block. Every line outside it is kept byte for byte: your
 hand-written rules and the master chatbot's section
-(`# ---- Changes via master chatbot ----`). The chatbot refuses to edit or
-remove a generated line. Change `catalog.json` / `roles.json` and
+(`# ---- Changes via master chatbot ----`). Every generated rule is written
+inside the block, even if the same rule also exists outside it; the
+generated copy is authoritative, and compile notes the duplicate. The
+chatbot refuses to edit or remove a generated line, and also refuses to
+remove a hand-written copy of one outside the block, because that would
+change nothing. Change `catalog.json` / `roles.json` and
 recompile instead. Its own additions, such as personal rules and denies,
 go below the block and take effect alongside it. A deny always wins.
 Undoing a compile restores the previous `policy.csv` but **not** the
@@ -228,7 +277,10 @@ as the gate enforces it (generated and manual rules together). Check:
 
 - every role's readable columns, especially high-sensitivity ones;
 - every **ALL rows** entry: is it intended? A high-sensitivity one must
-  carry an acknowledgement and its reason;
+  carry an acknowledgement and its reason. Rows marked "STATIC: the same
+  rows for every user" count as all rows;
+- every "sensitivity DOWNGRADE" and every high-sensitivity column limited
+  only by an inherited scope;
 - the users of each role, and users listed with no usable role or missing
   attributes (they are denied the queries those rules cover);
 - personal rules and denies;
@@ -239,11 +291,16 @@ as the gate enforces it (generated and manual rules together). Check:
 
 ## 9. Fail-closed rules (summary)
 
-- Unapproved, rejected or unlabelled columns are hidden from everyone.
+- Unapproved, rejected or unlabelled columns are never granted by the
+  generated policy. `status` and `drift` flag any that a hand-written rule
+  still grants.
+- Built-in category sensitivities cannot be lowered, and a downgrade needs
+  a recorded reason.
+- Two workers can never share an `employee_id` or an email.
 - A new database column is hidden until it is in `db_schema.json` and
   approved.
 - High-sensitivity data on all rows is refused unless acknowledged with a
-  reason.
+  reason. Static scopes count as all rows.
 - Unmapped workers have no role and are denied everything.
 - A policy, schema or worker file the gate would not load is never written.
   A stale proposal, where any input changed since it was shown, is
@@ -260,7 +317,7 @@ rbic-init drift --config-dir $D [--db PATH] [--json]
 | Check | Reports |
 | --- | --- |
 | `schema` | database vs `db_schema.json` (new/removed tables and columns, type changes) |
-| `catalog` | columns not approved (unlabelled or suggested: hidden from everyone); entries for columns that no longer exist. Rejected columns are listed as info |
+| `catalog` | columns not approved (unlabelled or suggested); not-approved or rejected columns that a role can still read (named, "READABLE by …"); entries for columns that no longer exist. Rejected columns nobody can read are listed as info |
 | `generated_block` | block out of date (sources changed), edited by hand, undone, missing or malformed |
 | `roles` | roles.json naming missing categories, tables, columns, parent roles; scopes that no longer compile |
 | `workers` | workers with no role or an unknown role; roles nobody holds; a policy that does not load (CRITICAL) |
