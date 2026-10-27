@@ -171,6 +171,83 @@ def test_approve_refusals(columns, message):
         plan_approvals(suggested_catalog(), SCHEMA, columns)
 
 
+# ---- sensitivity floors and downgrades (review finding) -------------------------
+
+@pytest.mark.parametrize("name, low", [("pay", "low"), ("pay", "medium"),
+                                       ("personal_identifier", "low"),
+                                       ("contact", "low"), ("finance", "low")])
+def test_built_in_category_sensitivity_cannot_be_lowered(name, low):
+    raw = new_catalog().to_json()
+    raw["categories"][name]["sensitivity"] = low
+    with pytest.raises(CatalogError, match=f"category '{name}': sensitivity "
+                                           f"{low} is below the built-in "
+                                           "minimum"):
+        parse_catalog(json.dumps(raw))
+
+
+def test_built_in_category_may_be_raised_and_custom_ones_set_freely():
+    raw = new_catalog().to_json()
+    raw["categories"]["directory"]["sensitivity"] = "high"
+    raw["categories"]["perks"] = {"description": "Perks.", "sensitivity": "low"}
+    c = parse_catalog(json.dumps(raw))
+    assert c.categories["directory"]["sensitivity"] == "high"
+    assert c.categories["perks"]["sensitivity"] == "low"
+
+
+def test_downgrade_needs_a_reason_and_is_recorded():
+    c = suggested_catalog()
+    with pytest.raises(CatalogError, match=r"approving payroll.salary as "
+                       r"directory \(low\) lowers its sensitivity below the "
+                       r"suggested pay \(high\): give --downgrade-reason"):
+        plan_approvals(c, SCHEMA, {"payroll.salary": "directory"})
+    plan = plan_approvals(c, SCHEMA, {"payroll.salary": "directory"},
+                          downgrade_reason="banded, not individual pay")
+    assert plan[0].downgraded_from == "pay"
+    assert "DOWNGRADE from pay: banded, not individual pay" in plan[0].describe()
+    out = apply_decisions(c, plan, "master", NOW)
+    e = out.columns["payroll.salary"]
+    assert (e.category, e.downgraded_from, e.downgrade_reason) == (
+        "directory", "pay", "banded, not individual pay")
+    again = parse_catalog(out.to_text())
+    assert again.columns["payroll.salary"] == e
+    assert again.downgrades() == [
+        "payroll.salary approved as directory (low), downgraded from pay "
+        "(high) by master: banded, not individual pay"]
+    # moving to another category still below pay needs a new reason; back
+    # up to pay clears the record
+    with pytest.raises(CatalogError, match="give --downgrade-reason"):
+        plan_approvals(out, SCHEMA, {"payroll.salary": "contact"})
+    up = apply_decisions(out, plan_approvals(out, SCHEMA,
+                                             {"payroll.salary": "pay"}),
+                         "master", NOW)
+    assert up.columns["payroll.salary"].downgraded_from is None
+    assert "downgraded_from" not in up.to_text()
+
+
+def test_downgrade_reason_rules():
+    c = suggested_catalog()
+    with pytest.raises(CatalogError, match="no approval lowers"):
+        plan_approvals(c, SCHEMA, {"payroll.salary": None},
+                       downgrade_reason="why")
+    for bad in ("", "   ", "caf\u00e9", "x" * 201, "a\nb"):
+        with pytest.raises(CatalogError, match="downgrade reason must be"):
+            plan_approvals(c, SCHEMA, {"payroll.salary": "directory"},
+                           downgrade_reason=bad)
+    # same or higher sensitivity needs no reason
+    plan_approvals(c, SCHEMA, {"employees.name": "contact"})
+    raw = json.loads(apply_decisions(c, plan_approvals(
+        c, SCHEMA, {"payroll.salary": "directory"}, downgrade_reason="ok"),
+        "master", NOW).to_text())
+    bad = json.loads(json.dumps(raw))
+    del bad["columns"]["payroll.salary"]["downgrade_reason"]
+    with pytest.raises(CatalogError, match="go together"):
+        parse_catalog(json.dumps(bad))
+    bad = json.loads(json.dumps(raw))
+    bad["columns"]["payroll.salary"]["downgraded_from"] = "perks"
+    with pytest.raises(CatalogError, match="downgraded_from must be"):
+        parse_catalog(json.dumps(bad))
+
+
 def test_already_approved_and_reject():
     c = apply_decisions(suggested_catalog(), plan_approvals(
         suggested_catalog(), SCHEMA, {"payroll.salary": None}), "master", NOW)

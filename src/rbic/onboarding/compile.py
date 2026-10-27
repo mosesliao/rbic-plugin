@@ -371,6 +371,8 @@ def compile_policy(catalog: Catalog, roles: Roles, schema: dict, *,
                   SCOPE_COLUMN_SEP.join(keep)])
         for table in sorted(acks.get(name, {}), key=order.get):
             body.append(f"# all_rows {name} {table}: {acks[name][table]}")
+    for line in catalog.downgrades(schema):
+        warnings.append(f"sensitivity DOWNGRADE: {line}")
     hidden = []
     for table, cols in schema.items():
         for c in cols:

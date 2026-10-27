@@ -80,6 +80,10 @@ class _View:
             status = "unlabelled" if e is None else e.status
             return f"{column} (NOT APPROVED: {status})"
         sens = self.catalog.categories.get(e.category, {}).get("sensitivity", "?")
+        if e.downgraded_from is not None:
+            return (f"{column} ({e.category}, {sens}; DOWNGRADED from "
+                    f"{self.catalog.label(e.downgraded_from)}: "
+                    f"{e.downgrade_reason})")
         return f"{column} ({e.category}, {sens})"
 
     def sensitivity(self, table: str, column: str) -> Optional[str]:
@@ -323,6 +327,8 @@ def access_report(snapshot: PolicySnapshot, catalog: Optional[Catalog] = None,
             hidden.append(f"- {table}.{c}{why}")
     out += hidden or ["- none"]
     if catalog is not None:
+        warnings += [f"sensitivity DOWNGRADE: {line}"
+                     for line in catalog.downgrades(v.schema)]
         for table, c in sorted(readable):
             e = catalog.columns.get(f"{table}.{c}")
             if e is None or e.status != "approved":

@@ -4,6 +4,7 @@
     rbic-init suggest --config-dir DIR [--no-values] [--sample-rows N]
     rbic-init status  --config-dir DIR
     rbic-init approve --config-dir DIR --actor NAME (COLUMN [CATEGORY] | --all-suggested)
+                      [--downgrade-reason TEXT]
     rbic-init reject  --config-dir DIR --actor NAME COLUMN [COLUMN ...]
     rbic-init roles show|packs --config-dir DIR
     rbic-init roles add-pack NAME --config-dir DIR --actor NAME
@@ -291,6 +292,11 @@ def _decide(args, input_fn, output, decisions, action):
         raise CommandError(f"Nothing was written: {err}") from None
     audit.info("CATALOG_CHANGE actor=%s action=%s columns=%d file=%s "
                "sha256=%s", args.actor, action, len(plan), path, new_sha)
+    for d in plan:
+        if d.downgraded_from is not None:
+            audit.warning("CATALOG_DOWNGRADE actor=%s column=%s from=%s to=%s "
+                          "reason=%s", args.actor, d.column, d.downgraded_from,
+                          d.category, d.downgrade_reason)
     output(f"APPLIED: {len(plan)} column(s) {action}d in {path}. Only "
            "approved columns will be compiled into policy.csv (rbic-init "
            "compile, the next onboarding step).")
@@ -302,8 +308,9 @@ def cmd_approve(args, input_fn, output):
         raise CommandError("Give a COLUMN (table.column) or --all-suggested.")
     columns = {args.column: args.category} if args.column else {}
     return _decide(args, input_fn, output,
-                   lambda c, s: plan_approvals(c, s, columns,
-                                               all_suggested=args.all_suggested),
+                   lambda c, s: plan_approvals(
+                       c, s, columns, all_suggested=args.all_suggested,
+                       downgrade_reason=args.downgrade_reason),
                    "approve")
 
 
@@ -768,6 +775,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="category to approve it as (default: the suggestion)")
     p.add_argument("--all-suggested", action="store_true",
                    help="approve every suggested column that has a category")
+    p.add_argument("--downgrade-reason", metavar="TEXT",
+                   help="required when CATEGORY is less sensitive than the "
+                        "suggested one (printable ASCII, at most 200 chars; "
+                        "recorded in catalog.json, the audit log, compile "
+                        "output and the access report)")
     p.add_argument("--actor", required=True,
                    help="master user approving (recorded as approved_by)")
     p.set_defaults(func=cmd_approve)

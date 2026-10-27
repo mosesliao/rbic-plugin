@@ -14,13 +14,24 @@
           "evidence": "column name token 'salary'",
           "confidence": 0.9,                 # optional, 0..1
           "approved_by": "master",           # who decided (approved OR rejected)
-          "approved_at": "2026-10-27T12:00:00+00:00"
+          "approved_at": "2026-10-27T12:00:00+00:00",
+          "downgraded_from": "pay",          # optional, approved only: the
+          "downgrade_reason": "why"          #   more sensitive suggestion
         }
       }
     }
 
 Only APPROVED entries ever become policy (the compiler, step 2, reads
 nothing else): a suggested, rejected or unlisted column grants nothing.
+
+Sensitivity floors: the built-in categories (DEFAULT_CATEGORIES) keep at
+least their default sensitivity - a catalog.json that lowers one (`pay`
+to low) is refused; custom categories may set any. Approving a column as
+a category LESS sensitive than its suggested (or currently recorded)
+category is a downgrade: it needs a reason (`rbic-init approve
+--downgrade-reason TEXT`), recorded in the entry as `downgraded_from` /
+`downgrade_reason`, audited (CATALOG_DOWNGRADE) and shown by compile and
+the access report.
 Evidence never holds a data value (the suggesters only write rule ids,
 names and counts; printable ASCII, at most EVIDENCE_MAX characters).
 Merging new suggestions never overwrites a human decision.
@@ -86,6 +97,8 @@ class ColumnEntry:
     confidence: Optional[float] = None
     approved_by: Optional[str] = None
     approved_at: Optional[str] = None
+    downgraded_from: Optional[str] = None   # approved below this category
+    downgrade_reason: Optional[str] = None
 
     def to_json(self) -> dict:
         out = {"category": self.category, "status": self.status,
@@ -94,6 +107,9 @@ class ColumnEntry:
             out["confidence"] = self.confidence
         out["approved_by"] = self.approved_by
         out["approved_at"] = self.approved_at
+        if self.downgraded_from is not None:  # omitted: older files stay stable
+            out["downgraded_from"] = self.downgraded_from
+            out["downgrade_reason"] = self.downgrade_reason
         return out
 
     @property
@@ -124,6 +140,26 @@ class Catalog:
         """Rank of a category's sensitivity (-1 for none/unknown)."""
         info = self.categories.get(category) if category else None
         return SENSITIVITY_RANK.get(info["sensitivity"], -1) if info else -1
+
+    def label(self, category: Optional[str]) -> str:
+        info = self.categories.get(category) if category else None
+        return f"{category} ({info['sensitivity']})" if info else str(category)
+
+    def downgrades(self, schema: Optional[dict] = None) -> list:
+        """"table.column approved as X (low), downgraded from Y (high) by
+        WHO: REASON" for every approved downgrade (columns in `schema`)."""
+        out = []
+        for key in sorted(self.columns):
+            e = self.columns[key]
+            if e.status != "approved" or e.downgraded_from is None:
+                continue
+            table, _, column = key.partition(".")
+            if schema is not None and column not in schema.get(table, {}):
+                continue
+            out.append(f"{key} approved as {self.label(e.category)}, "
+                       f"downgraded from {self.label(e.downgraded_from)} by "
+                       f"{e.approved_by}: {e.downgrade_reason}")
+        return out
 
     def copy(self) -> "Catalog":
         return copy.deepcopy(self)
@@ -157,7 +193,8 @@ def _entry(key: str, raw, categories: dict) -> ColumnEntry:
     if not isinstance(raw, dict):
         raise CatalogError(f"{where} must be an object")
     allowed = {"category", "status", "suggested_by", "evidence", "confidence",
-               "approved_by", "approved_at"}
+               "approved_by", "approved_at", "downgraded_from",
+               "downgrade_reason"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise CatalogError(f"{where}: unknown field(s) {', '.join(unknown)}")
@@ -196,9 +233,31 @@ def _entry(key: str, raw, categories: dict) -> ColumnEntry:
                            "approved_at")
     if status == "approved" and category is None:
         raise CatalogError(f"{where}: an approved column needs a category")
+    downgraded_from = raw.get("downgraded_from")
+    reason = raw.get("downgrade_reason")
+    if ("downgraded_from" in raw) != ("downgrade_reason" in raw):
+        raise CatalogError(f"{where}: downgraded_from and downgrade_reason go "
+                           "together")
+    if downgraded_from is not None or reason is not None:
+        if status != "approved":
+            raise CatalogError(f"{where}: only an approved column records a "
+                               "downgrade")
+        if downgraded_from not in categories:
+            raise CatalogError(f"{where}: downgraded_from must be a category "
+                               "defined in categories")
+        check_downgrade_reason(reason, where)
     return ColumnEntry(category, status, by, evidence,
                        None if confidence is None else float(confidence),
-                       approved_by, approved_at)
+                       approved_by, approved_at, downgraded_from, reason)
+
+
+def check_downgrade_reason(reason, where: str = "downgrade reason") -> str:
+    """Non-empty printable ASCII, at most EVIDENCE_MAX characters."""
+    if not isinstance(reason, str) or not _printable(reason) \
+            or not reason.strip() or len(reason) > EVIDENCE_MAX:
+        raise CatalogError(f"{where}: the downgrade reason must be non-empty "
+                           f"printable ASCII, at most {EVIDENCE_MAX} characters")
+    return reason.strip()
 
 
 def parse_catalog(text: str, schema: Optional[dict] = None) -> Catalog:
@@ -236,6 +295,15 @@ def parse_catalog(text: str, schema: Optional[dict] = None) -> Catalog:
         if info["sensitivity"] not in SENSITIVITIES:
             raise CatalogError(f"category {name!r}: sensitivity must be one "
                                f"of {', '.join(SENSITIVITIES)}")
+        floor = DEFAULT_CATEGORIES.get(name, (None, None))[1]
+        if floor is not None and SENSITIVITY_RANK[info["sensitivity"]] \
+                < SENSITIVITY_RANK[floor]:
+            raise CatalogError(
+                f"category {name!r}: sensitivity {info['sensitivity']} is "
+                f"below the built-in minimum {floor} for this category (a "
+                "built-in category can only be made MORE sensitive; define a "
+                "custom category instead, and approve columns into it with "
+                "rbic-init approve ... --downgrade-reason)")
         categories[name] = {"description": info["description"],
                             "sensitivity": info["sensitivity"]}
     cols = raw.get("columns")
@@ -332,10 +400,15 @@ class Decision:
     action: str            # "approve" | "reject"
     category: Optional[str]
     before: str            # human-readable previous state
+    downgraded_from: Optional[str] = None   # approve below this category
+    downgrade_reason: Optional[str] = None
 
     def describe(self) -> str:
         what = (f"approve as {self.category}" if self.action == "approve"
                 else "reject (never granted by the generated policy)")
+        if self.downgraded_from is not None:
+            what += (f" - DOWNGRADE from {self.downgraded_from}: "
+                     f"{self.downgrade_reason}")
         return f"{self.column}: {self.before} -> {what}"
 
 
@@ -345,11 +418,24 @@ def _state(entry: Optional[ColumnEntry]) -> str:
     return f"{entry.status} {entry.category or '(no category)'}"
 
 
+def _baseline(e: Optional[ColumnEntry]) -> Optional[str]:
+    """The category a new approval is compared with for a downgrade: the
+    one an earlier downgrade came from, else the recorded category."""
+    if e is None:
+        return None
+    return e.downgraded_from or e.category
+
+
 def plan_approvals(catalog: Catalog, schema: dict, columns: Optional[dict] = None,
-                   *, all_suggested: bool = False) -> list:
+                   *, all_suggested: bool = False,
+                   downgrade_reason: Optional[str] = None) -> list:
     """Decisions for approving `columns` ({table.column: category or None:
     keep the suggested category}) and/or every suggested column that has
-    a category. Validates everything; changes nothing."""
+    a category. Approving a column as a category less sensitive than its
+    suggested / recorded one is refused without `downgrade_reason`.
+    Validates everything; changes nothing."""
+    if downgrade_reason is not None:
+        downgrade_reason = check_downgrade_reason(downgrade_reason)
     decisions = []
     if all_suggested:
         for key in sorted(catalog.columns):
@@ -369,13 +455,28 @@ def plan_approvals(catalog: Catalog, schema: dict, columns: Optional[dict] = Non
                                f"{', '.join(sorted(catalog.categories))}")
         if e is not None and e.status == "approved" and e.category == category:
             raise CatalogError(f"{key} is already approved as {category}")
+        base = _baseline(e)
+        down = (base is not None and base != category
+                and catalog.sensitivity(category) < catalog.sensitivity(base))
+        if down and downgrade_reason is None:
+            raise CatalogError(
+                f"approving {key} as {catalog.label(category)} lowers its "
+                f"sensitivity below the suggested {catalog.label(base)}: give "
+                "--downgrade-reason TEXT (recorded in catalog.json, the audit "
+                "log, compile output and the access report)")
+        decision = Decision(key, "approve", category, _state(e),
+                            base if down else None,
+                            downgrade_reason if down else None)
         if not any(d.column == key for d in decisions):
-            decisions.append(Decision(key, "approve", category, _state(e)))
+            decisions.append(decision)
         else:
-            decisions = [Decision(key, "approve", category, _state(e))
-                         if d.column == key else d for d in decisions]
+            decisions = [decision if d.column == key else d for d in decisions]
     if not decisions:
         raise CatalogError("Nothing to approve.")
+    if downgrade_reason is not None and not any(d.downgraded_from
+                                                for d in decisions):
+        raise CatalogError("--downgrade-reason was given, but no approval "
+                           "lowers a column's sensitivity")
     return decisions
 
 
@@ -416,7 +517,8 @@ def apply_decisions(catalog: Catalog, decisions: list, actor: str,
                                 evidence="category chosen by a human")
             out.columns[d.column] = ColumnEntry(
                 d.category, "approved", e.suggested_by, e.evidence,
-                e.confidence, actor, stamp)
+                e.confidence, actor, stamp, d.downgraded_from,
+                d.downgrade_reason)
         else:
             e = e or ColumnEntry(None, suggested_by="human",
                                  evidence="rejected by a human")

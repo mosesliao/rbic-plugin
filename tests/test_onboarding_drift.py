@@ -473,6 +473,49 @@ def test_readable_but_not_approved_is_drift_naming_the_roles(demo_dir):
         "can read them)." in out
 
 
+def test_cli_downgrade_needs_reason_and_reaches_audit_compile_report(
+        onboarded, audit_on, capsys):
+    log = onboarded / "audit.jsonl"
+    with pytest.raises(SystemExit):
+        run(["approve", "--config-dir", str(onboarded), "--actor", "master",
+             "payroll.salary", "directory"], ("yes",))
+    assert "give --downgrade-reason" in capsys.readouterr().err
+    code, out = run(["approve", "--config-dir", str(onboarded), "--actor",
+                     "master", "payroll.salary", "directory",
+                     "--downgrade-reason", "pay bands only",
+                     "--audit-log", str(log)], ("yes",))
+    assert code == 0
+    assert any("DOWNGRADE from pay: pay bands only" in l for l in out)
+    assert ("CATALOG_DOWNGRADE actor=master column=payroll.salary from=pay "
+            "to=directory reason=pay bands only") in audit_lines(log)
+    gen, change = compile_change(onboarded)
+    line = ("sensitivity DOWNGRADE: payroll.salary approved as directory (low), "
+            "downgraded from pay (high) by master: pay bands only")
+    assert line in gen.warnings
+    assert f"compile: {line}" in change.description
+    cfg = config(onboarded)
+    schema, catalog, *_ = load_state(onboarded)
+    report = report_from_bytes(
+        cfg.model_path.read_bytes(), cfg.policy_path.read_bytes(),
+        cfg.attributes_path.read_bytes(), cfg.schema_path.read_bytes(),
+        catalog)
+    assert "salary (directory, low; DOWNGRADED from pay (high): pay bands " \
+        "only)" in report
+    assert f"- {line}" in report
+
+
+def test_lowered_built_in_sensitivity_fails_every_command(onboarded, capsys):
+    path = catalog_path(onboarded)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["categories"]["pay"]["sensitivity"] = "low"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        run(["compile", "--config-dir", str(onboarded), "--actor", "master"])
+    assert "below the built-in minimum high" in capsys.readouterr().err
+    c = findings(check_drift(config(onboarded)), "catalog")
+    assert c.status == "drift" and "below the built-in minimum" in c.findings[0]
+
+
 def test_compile_refuses_unacknowledged_high_sensitivity(onboarded, capsys):
     _auditor(onboarded, ack=False)
     with pytest.raises(SystemExit) as exc:
