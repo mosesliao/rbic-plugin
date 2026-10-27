@@ -9,6 +9,10 @@ used for labels (category, sensitivity, approval status).
 
 It names roles, usernames, tables, columns and rule templates. It never
 contains a data value, an email address or any other attribute value.
+The all-rows acknowledgements (`# all_rows <role> <table>: <reason>`
+comments inside the rbic-init block) are shown next to the ALL rows they
+justify. The report itself is sensitive (usernames and policy structure):
+keep it with the config directory, out of version control.
 """
 
 import re
@@ -97,7 +101,8 @@ class _View:
         return own, extra
 
 
-def _role_section(v: _View, role: str, readable_cells: set, warnings: list) -> list:
+def _role_section(v: _View, role: str, readable_cells: set, warnings: list,
+                  acks: dict) -> list:
     level = v.level(role)
     inherited = sorted(level - {role})
     own, extra = v.users_of(role)
@@ -112,6 +117,11 @@ def _role_section(v: _View, role: str, readable_cells: set, warnings: list) -> l
         base = v.filters(level, table, scoped=False)
         if cols:
             rule = _rows(base)
+            reason = None if base else next(
+                (acks[(r, table)] for r in sorted(level) if (r, table) in acks),
+                None)
+            if reason is not None:
+                rule += f" (acknowledged: {reason})"
             rows.append((table, ", ".join(v.label(table, c) for c in cols), rule))
             readable_cells.update((table, c) for c in cols)
             if not base:
@@ -120,7 +130,9 @@ def _role_section(v: _View, role: str, readable_cells: set, warnings: list) -> l
                     f"role {role} reads {table} on ALL rows (no row filter in "
                     "its role level)"
                     + (f", including high-sensitivity {', '.join(high)}"
-                       if high else ""))
+                       if high else "")
+                    + (f" - acknowledged in roles.json: {reason}"
+                       if reason is not None else ""))
         for rf in v.filters(level, table, scoped=True):
             usable = [c for c in rf.columns if not v.denied(level, table, c)]
             if not usable:
@@ -194,8 +206,12 @@ def _personal_section(v: _View, readable_cells: set) -> list:
 
 def access_report(snapshot: PolicySnapshot, catalog: Optional[Catalog] = None,
                   *, title: str = "Access report",
-                  status: Optional[str] = None) -> str:
-    """The Markdown access report for `snapshot` (see the module doc)."""
+                  status: Optional[str] = None,
+                  acks: Optional[dict] = None) -> str:
+    """The Markdown access report for `snapshot` (see the module doc).
+    `acks`: {(role, table): reason} all-rows acknowledgements (from the
+    rbic-init block, rbic.onboarding.compile.acknowledgements)."""
+    acks = acks or {}
     v = _View(snapshot, catalog)
     warnings: list = []
     readable: set = set()
@@ -207,7 +223,7 @@ def access_report(snapshot: PolicySnapshot, catalog: Optional[Catalog] = None,
             "user's attributes at query time; a user lacking one is denied "
             "the queries that rule covers.", "", "## Roles", ""]
     for role in v.roles():
-        out += _role_section(v, role, readable, warnings)
+        out += _role_section(v, role, readable, warnings, acks)
     personal = _personal_section(v, readable)
     if personal:
         out += ["## Personal rules", "",
@@ -260,5 +276,7 @@ def report_from_bytes(model: bytes, policy: bytes, attributes: bytes,
                       dialect: str = "sqlite", **kwargs) -> str:
     """access_report over files' bytes, loaded with the gate's own loader
     (raises whatever load_snapshot refuses)."""
+    from .compile import acknowledgements  # compile imports rbic.admin too
     snap = load_snapshot(model, policy, attributes, schema, dialect=dialect)
-    return access_report(snap, catalog, **kwargs)
+    acks = acknowledgements(policy.decode("utf-8", errors="replace"))
+    return access_report(snap, catalog, acks=acks, **kwargs)

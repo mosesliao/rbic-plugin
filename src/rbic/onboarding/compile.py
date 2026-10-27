@@ -11,6 +11,20 @@ Guarantees (tests: tests/test_onboarding_compile.py):
   with `|`-joined columns). Deterministic order: roles by name, then g,
   p (schema order), p2 (schema order of the table, then template).
 - Every rule round-trips Casbin's own tokenizer (rbic.admin's check).
+- FAIL CLOSED for sensitive data on all rows: a role whose OWN grants
+  include a column of a HIGH-sensitivity category on a table that no row
+  scope of its role level limits is refused (CompileError), unless the
+  role's roles.json entry acknowledges that table under `all_rows` with a
+  reason. The reason is written into the block as a comment
+  (`# all_rows <role> <table>: <reason>`), shown in the access report and
+  in the change's effect summary. (A role that only INHERITS such columns
+  needs no acknowledgement of its own: the ancestor granting them reads
+  the table on all rows too, so it had to acknowledge it.) Medium
+  sensitivity on all rows is a warning.
+- compile_from_files puts a sources header first in the block:
+  `# sources: catalog.json, roles.json, db_schema.json sha256=<fp> rbic=<v>`
+  (sources_fingerprint), so `rbic-init status`/`drift` can tell a block
+  that is out of date, edited by hand, or undone.
 - Nothing is written here: PolicyAdmin.propose_generated_policy turns the
   result into a Change (validated with the gate's loader, effect
   summary, stale-source refusal) that a human confirms.
@@ -20,22 +34,36 @@ rbic.onboarding.report, describes what the gate will actually enforce,
 manual rules included).
 """
 
+import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 from ..admin import CHANGES_HEADER, _casbin_tokens
 from ..gate import (PTYPE_ALLOW_COLUMNS, PTYPE_ALLOW_ROWS, SCOPE_COLUMN_SEP,
                     check_schema)
 from . import catalog_path, roles_path
-from .block import find_block, outside_lines, replace_block
+from .block import find_block, outside_lines, replace_block, split_lines
 from .catalog import Catalog, load_catalog
 from .roles import Roles, RolesError, load_roles, validate_roles
 from .store import file_sha, sha256_text
 
 READ = "read"
 HIGH = "high"
+MEDIUM = "medium"
+# The sources a block is compiled from, in fingerprint order. (worker_
+# attributes.json is also read - usernames only, for validation - and its
+# hash is checked before applying, but it is not part of the fingerprint:
+# importing users does not make the generated block stale.)
+FINGERPRINT_SOURCES = ("catalog", "roles", "schema")
+HEADER_PREFIX = "# sources: catalog.json, roles.json, db_schema.json"
+HEADER_RE = re.compile(
+    r"# sources: catalog\.json, roles\.json, db_schema\.json "
+    r"sha256=([0-9a-f]{64}) rbic=(\S+)\Z", re.ASCII)
+ACK_RE = re.compile(r"# all_rows ([a-z][a-z0-9_]{1,40}) ([a-z_][a-z0-9_]{0,62}): "
+                    r"([ -~]+)\Z", re.ASCII)
 
 
 class CompileError(ValueError):
@@ -48,12 +76,72 @@ class GeneratedPolicy:
     rules: list                # [[ptype, *fields]] in block order
     warnings: list = field(default_factory=list)
     hidden: list = field(default_factory=list)    # "table.column (status)"
-    # sha256 (text) of the source files compiled from: catalog, roles, schema
+    # sha256 (text) of the source files compiled from: catalog, roles,
+    # schema, attributes
     sources: dict = field(default_factory=dict)
+    # "role R reads high-sensitivity T.(...) on ALL rows - acknowledged: why"
+    acknowledged: list = field(default_factory=list)
 
     @property
     def roles(self) -> list:
         return sorted({r[1] for r in self.rules})
+
+    @property
+    def fingerprint(self) -> Optional[str]:
+        return sources_fingerprint(self.sources)
+
+
+def sources_fingerprint(shas: dict) -> Optional[str]:
+    """sha256 over the sha256 of each source's text (catalog.json,
+    roles.json, db_schema.json; length-prefixed labels), or None when one
+    is missing."""
+    if any(not shas.get(k) for k in FINGERPRINT_SOURCES):
+        return None
+    h = hashlib.sha256(b"rbic-init-sources-v1\0")
+    for k in FINGERPRINT_SOURCES:
+        h.update(f"{k}\0{shas[k]}\0".encode("ascii"))
+    return h.hexdigest()
+
+
+def header_line(fingerprint: str) -> str:
+    from .. import __version__  # rbic/__init__ imports the engine
+    return f"{HEADER_PREFIX} sha256={fingerprint} rbic={__version__}"
+
+
+def block_body(policy_text: str) -> Optional[list]:
+    """The lines between the block markers (no line ends), or None when
+    policy.csv has no block. Raises BlockError on malformed markers."""
+    span = find_block(policy_text)
+    if span is None:
+        return None
+    lines = split_lines(policy_text)[span[0] + 1:span[1]]
+    return [line.rstrip("\r\n") for line in lines]
+
+
+def block_header(policy_text: str) -> Optional[tuple]:
+    """(fingerprint, rbic version) recorded in the block's sources header,
+    or None (no block, or no header)."""
+    body = block_body(policy_text) or []
+    for line in body:
+        m = HEADER_RE.fullmatch(line.strip())
+        if m:
+            return m.group(1), m.group(2)
+    return None
+
+
+def acknowledgements(policy_text: str) -> dict:
+    """{(role, table): reason} from the `# all_rows` comments inside the
+    block (only there: a comment elsewhere acknowledges nothing)."""
+    try:
+        body = block_body(policy_text) or []
+    except ValueError:
+        return {}
+    out = {}
+    for line in body:
+        m = ACK_RE.fullmatch(line.strip())
+        if m:
+            out[(m.group(1), m.group(2))] = m.group(3)
+    return out
 
 
 def _line(fields: list) -> str:
@@ -75,6 +163,10 @@ def _approved(catalog: Catalog, schema: dict) -> dict:
     return out
 
 
+def _sensitivity(catalog: Catalog, category) -> Optional[str]:
+    return catalog.categories.get(category, {}).get("sensitivity")
+
+
 def compile_policy(catalog: Catalog, roles: Roles, schema: dict, *,
                    usernames: Iterable = ()) -> GeneratedPolicy:
     try:
@@ -83,59 +175,29 @@ def compile_policy(catalog: Catalog, roles: Roles, schema: dict, *,
         raise CompileError(f"roles.json: {err}") from None
     approved = _approved(catalog, schema)
     order = {t: i for i, t in enumerate(schema)}
-    body, rules, warnings = [], [], []
+    body, rules, warnings, acknowledged = [], [], [], []
     reads: dict = {}     # role -> {table: [columns]} (own p grants)
     filtered: dict = {}  # role -> {tables with a 3-field scope}
     scoped_any: dict = {}  # table -> {roles with any scope on it}
+    acks: dict = {}      # role -> {table: reason} actually needed
 
-    def emit(fields):
-        body.append(_line(fields))
-        rules.append(fields)
-
-    for name in sorted(roles.roles):
-        role = roles.roles[name]
-        body.append(f"# role {name} ({role.source})")
-        for parent in sorted(role.inherits):
-            emit(["g", name, parent])
+    for name, role in roles.roles.items():
         own: dict = {}
-        for cat in role.categories:
-            if not any(c == cat for c in approved.values()):
-                warnings.append(f"role {name}: category {cat} has no approved "
-                                "column (it grants nothing yet)")
         for table, cols in schema.items():
             for c in cols:
                 if approved.get(f"{table}.{c}") in role.categories:
-                    emit([PTYPE_ALLOW_COLUMNS, name, f"{table}.{c}", READ])
                     own.setdefault(table, []).append(c)
         reads[name] = own
-        filtered[name] = set()
-        for scope in sorted(role.row_scopes,
-                            key=lambda s: (order[s.table], s.template,
-                                           s.columns or ())):
-            scoped_any.setdefault(scope.table, set()).add(name)
-            if scope.columns is None:
-                filtered[name].add(scope.table)
-                emit([PTYPE_ALLOW_ROWS, name, scope.table, scope.template])
-                continue
-            keep = [c for c in scope.columns
-                    if f"{scope.table}.{c}" in approved]
-            dropped = [c for c in scope.columns if c not in keep]
-            if dropped:
-                warnings.append(
-                    f"role {name}: scoped grant on {scope.table} (rows where "
-                    f"{scope.template}) leaves out not-approved column(s) "
-                    f"{', '.join(dropped)}")
-            if not keep:
-                warnings.append(f"role {name}: scoped grant on {scope.table} "
-                                "has no approved column and is skipped")
-                continue
-            emit([PTYPE_ALLOW_ROWS, name, scope.table, scope.template,
-                  SCOPE_COLUMN_SEP.join(keep)])
+        filtered[name] = {s.table for s in role.row_scopes if s.columns is None}
+        for s in role.row_scopes:
+            scoped_any.setdefault(s.table, set()).add(name)
 
-    # Row-scope warnings per role LEVEL (the role and what it inherits):
+    # Row-scope analysis per role LEVEL (the role and what it inherits):
     # same-table 3-field filters OR together across the level in the gate.
+    refused = []
     for name in sorted(roles.roles):
         level = roles.level(name)
+        role = roles.roles[name]
         tables = {}
         for r in level:
             for t, cols in reads.get(r, {}).items():
@@ -152,13 +214,81 @@ def compile_policy(catalog: Catalog, roles: Roles, schema: dict, *,
                     f"its role level), while {', '.join(others)} "
                     f"{'has' if len(others) == 1 else 'have'} a row scope "
                     f"on {table}")
-            high = [c for c in tables[table]
-                    if catalog.categories.get(approved[f"{table}.{c}"], {})
-                    .get("sensitivity") == HIGH]
-            if high:
+            sens = {c: _sensitivity(catalog, approved[f"{table}.{c}"])
+                    for c in tables[table]}
+            high = [c for c in tables[table] if sens[c] == HIGH]
+            own_high = [c for c in reads[name].get(table, []) if sens[c] == HIGH]
+            medium = [c for c in tables[table] if sens[c] == MEDIUM]
+            if own_high:
+                reason = role.acknowledged(table)
+                cols = f"{table}.({', '.join(high)})"
+                if reason is None:
+                    refused.append(
+                        f"role {name} would read high-sensitivity column(s) "
+                        f"{cols} on ALL rows (no row scope in its role "
+                        "level). Add a row scope (rbic-init roles scope "
+                        f"{name} {table} \"TEMPLATE\"), or acknowledge it "
+                        f"(rbic-init roles all-rows {name} {table} --reason "
+                        "\"WHY\")")
+                else:
+                    acks.setdefault(name, {})[table] = reason
+                    acknowledged.append(
+                        f"role {name} reads high-sensitivity column(s) {cols} "
+                        f"on ALL rows - acknowledged in roles.json: {reason}")
+            if medium:
                 warnings.append(
-                    f"role {name} reads high-sensitivity column(s) "
-                    f"{table}.({', '.join(high)}) on ALL rows (no row scope)")
+                    f"role {name} reads medium-sensitivity column(s) "
+                    f"{table}.({', '.join(medium)}) on ALL rows (no row scope)")
+        for a in role.all_rows:
+            if a.table not in acks.get(name, {}):
+                warnings.append(
+                    f"role {name}: the all-rows acknowledgement for {a.table} "
+                    "is not needed (no high-sensitivity column of it is read "
+                    "on all rows through this role's own categories); "
+                    "consider removing it")
+    if refused:
+        raise CompileError(
+            "refused - high-sensitivity data on ALL rows needs a row scope or "
+            "an explicit acknowledgement: " + "; ".join(refused))
+
+    def emit(fields):
+        body.append(_line(fields))
+        rules.append(fields)
+
+    for name in sorted(roles.roles):
+        role = roles.roles[name]
+        body.append(f"# role {name} ({role.source})")
+        for parent in sorted(role.inherits):
+            emit(["g", name, parent])
+        for cat in role.categories:
+            if not any(c == cat for c in approved.values()):
+                warnings.append(f"role {name}: category {cat} has no approved "
+                                "column (it grants nothing yet)")
+        for table, cols in schema.items():
+            for c in reads[name].get(table, []):
+                emit([PTYPE_ALLOW_COLUMNS, name, f"{table}.{c}", READ])
+        for scope in sorted(role.row_scopes,
+                            key=lambda s: (order[s.table], s.template,
+                                           s.columns or ())):
+            if scope.columns is None:
+                emit([PTYPE_ALLOW_ROWS, name, scope.table, scope.template])
+                continue
+            keep = [c for c in scope.columns
+                    if f"{scope.table}.{c}" in approved]
+            dropped = [c for c in scope.columns if c not in keep]
+            if dropped:
+                warnings.append(
+                    f"role {name}: scoped grant on {scope.table} (rows where "
+                    f"{scope.template}) leaves out not-approved column(s) "
+                    f"{', '.join(dropped)}")
+            if not keep:
+                warnings.append(f"role {name}: scoped grant on {scope.table} "
+                                "has no approved column and is skipped")
+                continue
+            emit([PTYPE_ALLOW_ROWS, name, scope.table, scope.template,
+                  SCOPE_COLUMN_SEP.join(keep)])
+        for table in sorted(acks.get(name, {}), key=order.get):
+            body.append(f"# all_rows {name} {table}: {acks[name][table]}")
     hidden = []
     for table, cols in schema.items():
         for c in cols:
@@ -173,7 +303,8 @@ def compile_policy(catalog: Catalog, roles: Roles, schema: dict, *,
     if hidden:
         warnings.append(f"{len(hidden)} column(s) not approved - hidden from "
                         "every generated rule: " + ", ".join(hidden))
-    return GeneratedPolicy(body, rules, warnings, hidden)
+    return GeneratedPolicy(body, rules, warnings, hidden,
+                           acknowledged=acknowledged)
 
 
 def build_policy_text(policy_text: str, generated: GeneratedPolicy) -> tuple:
@@ -232,7 +363,16 @@ def compile_from_files(config_dir, schema_path, attributes_path) -> GeneratedPol
     generated.sources = {"catalog": csha, "roles": rsha,
                          "schema": sha256_text(texts["schema"]),
                          "attributes": sha256_text(texts["attributes"])}
+    generated.body.insert(0, header_line(generated.fingerprint))
     return generated
+
+
+def current_fingerprint(config_dir, schema_path) -> Optional[str]:
+    """The sources fingerprint of the files as they are now (None when
+    catalog.json or roles.json does not exist)."""
+    paths = {"catalog": catalog_path(config_dir),
+             "roles": roles_path(config_dir), "schema": Path(schema_path)}
+    return sources_fingerprint({k: file_sha(p) for k, p in paths.items()})
 
 
 def sources_current(generated: GeneratedPolicy, paths: dict) -> bool:

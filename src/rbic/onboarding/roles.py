@@ -12,6 +12,9 @@
             {"table": "payroll", "template": "employee_id = '{employee_id}'",
              "columns": ["id", "employee_id", "salary"]}     # scoped grant
           ],
+          "all_rows": [                                      # optional
+            {"table": "invoices", "reason": "AP clerks settle every invoice"}
+          ],
           "source": "pack:hr"                                # or "human"
         }
       },
@@ -28,6 +31,12 @@ acyclic, categories exist in catalog.json, tables/columns exist in
 db_schema.json, templates compile with the master bot's strict rules in
 every dialect. Saved atomically under the onboarding lock, refusing a
 file that changed since it was read.
+
+`all_rows` is the explicit acknowledgement the compiler demands before a
+role may read a HIGH-sensitivity category on a table without any row
+scope in its role level (else `rbic-init compile` refuses): one entry per
+table, with a non-empty printable-ASCII reason that is recorded in the
+generated block and shown in the access report. Packs never set it.
 
 Starter packs (rbic/onboarding/packs/*.json, shipped in the wheel)
 describe row ownership by COLUMN NAME ("scope tables that have a column
@@ -90,6 +99,17 @@ class RowScope:
                 f"for rows where {self.template}")
 
 
+@dataclass(frozen=True)
+class AllRows:
+    """A human's acknowledgement that a role reads a high-sensitivity
+    category of `table` on ALL rows (no row scope)."""
+    table: str
+    reason: str
+
+    def to_json(self) -> dict:
+        return {"table": self.table, "reason": self.reason}
+
+
 @dataclass
 class RoleDef:
     description: str = ""
@@ -97,13 +117,22 @@ class RoleDef:
     inherits: list = field(default_factory=list)
     row_scopes: list = field(default_factory=list)  # [RowScope]
     source: str = HUMAN
+    all_rows: list = field(default_factory=list)    # [AllRows]
 
     def to_json(self) -> dict:
-        return {"description": self.description,
-                "categories": list(self.categories),
-                "inherits": list(self.inherits),
-                "row_scopes": [s.to_json() for s in self.row_scopes],
-                "source": self.source}
+        out = {"description": self.description,
+               "categories": list(self.categories),
+               "inherits": list(self.inherits),
+               "row_scopes": [s.to_json() for s in self.row_scopes],
+               "source": self.source}
+        if self.all_rows:  # omitted when empty: older files stay byte-stable
+            out["all_rows"] = [a.to_json() for a in self.all_rows]
+        return out
+
+    def acknowledged(self, table: str) -> Optional[str]:
+        """The all-rows reason for `table`, or None."""
+        return next((a.reason for a in self.all_rows if a.table == table),
+                    None)
 
     def same_content(self, other: "RoleDef") -> bool:
         a, b = self.to_json(), other.to_json()
@@ -226,11 +255,43 @@ def _scope(raw, where: str, schema: Optional[dict]) -> RowScope:
     return RowScope(table, template.strip(), columns)
 
 
+def check_reason(reason, where: str) -> str:
+    """An all-rows reason: non-empty printable ASCII (it is written into a
+    policy.csv comment line), at most DESCRIPTION_MAX characters."""
+    if not isinstance(reason, str) or not _printable(reason) \
+            or not reason.strip() or len(reason) > DESCRIPTION_MAX:
+        raise RolesError(f"{where}: reason must be non-empty printable ASCII, "
+                         f"at most {DESCRIPTION_MAX} characters")
+    return reason.strip()
+
+
+def _all_rows(raw, where: str, schema: Optional[dict]) -> list:
+    if not isinstance(raw, list):
+        raise RolesError(f"{where} must be a list")
+    out = []
+    for i, entry in enumerate(raw):
+        w = f"{where}[{i}]"
+        if not isinstance(entry, dict) or set(entry) != {"table", "reason"}:
+            raise RolesError(f"{w} must be an object with exactly table and "
+                             "reason")
+        table = entry["table"]
+        if not isinstance(table, str) or not NAME_RE.fullmatch(table):
+            raise RolesError(f"{w}: invalid table {table!r}")
+        if schema is not None and table not in schema:
+            raise RolesError(f"{w}: unknown table {table!r} (not in "
+                             "db_schema.json)")
+        if any(a.table == table for a in out):
+            raise RolesError(f"{where}: table {table} is listed twice")
+        out.append(AllRows(table, check_reason(entry["reason"], w)))
+    return out
+
+
 def _role(name: str, raw, schema: Optional[dict]) -> RoleDef:
     where = f"roles[{name!r}]"
     if not isinstance(raw, dict):
         raise RolesError(f"{where} must be an object")
-    allowed = {"description", "categories", "inherits", "row_scopes", "source"}
+    allowed = {"description", "categories", "inherits", "row_scopes", "source",
+               "all_rows"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise RolesError(f"{where}: unknown field(s) {', '.join(unknown)}")
@@ -251,7 +312,9 @@ def _role(name: str, raw, schema: Optional[dict]) -> RoleDef:
     return RoleDef(description,
                    _names(raw.get("categories", []), f"{where}.categories"),
                    _names(raw.get("inherits", []), f"{where}.inherits", ROLE_RE),
-                   scopes, source)
+                   scopes, source,
+                   _all_rows(raw.get("all_rows", []), f"{where}.all_rows",
+                             schema))
 
 
 def validate_roles(roles: Roles, catalog: Optional[Catalog] = None,
@@ -279,6 +342,8 @@ def validate_roles(roles: Roles, catalog: Optional[Catalog] = None,
         if schema is not None:
             for i, s in enumerate(role.row_scopes):
                 _scope(s.to_json(), f"roles[{name!r}].row_scopes[{i}]", schema)
+            _all_rows([a.to_json() for a in role.all_rows],
+                      f"roles[{name!r}].all_rows", schema)
     # acyclic (depth-first, colours)
     state: dict = {}
 
@@ -418,6 +483,45 @@ def remove_scope(roles: Roles, name: str, scope: RowScope) -> tuple:
         lines.append(f"WARNING: unless another scope of {name}'s role level "
                      f"limits {scope.table}, {name} reads ALL rows of it")
     return out, lines
+
+
+def set_all_rows(roles: Roles, name: str, table: str, reason: str) -> tuple:
+    """Acknowledge that role `name` reads `table` on ALL rows (needed for
+    high-sensitivity columns without a row scope). Replaces an existing
+    reason for that table; the role becomes human-owned."""
+    out = roles.copy()
+    role = out.roles.get(name)
+    if role is None:
+        raise RolesError(f"unknown role {name!r} (create it with roles set)")
+    reason = check_reason(reason, f"role {name} all_rows {table}")
+    old = role.acknowledged(table)
+    if old == reason:
+        raise RolesError(f"role {name} already acknowledges {table} with "
+                         "this reason")
+    role.all_rows = sorted([a for a in role.all_rows if a.table != table]
+                           + [AllRows(table, reason)], key=lambda a: a.table)
+    role.source = HUMAN
+    verb = "replace" if old is not None else "add"
+    return out, [f"role {name}: {verb} the acknowledgement that it reads "
+                 f"{table} on ALL rows (reason: {reason})",
+                 "WARNING: rbic-init compile then no longer refuses "
+                 f"high-sensitivity columns of {table} without a row scope "
+                 f"for {name}"]
+
+
+def remove_all_rows(roles: Roles, name: str, table: str) -> tuple:
+    out = roles.copy()
+    role = out.roles.get(name)
+    if role is None:
+        raise RolesError(f"unknown role {name!r}")
+    if role.acknowledged(table) is None:
+        raise RolesError(f"role {name} has no all-rows acknowledgement for "
+                         f"{table}")
+    role.all_rows = [a for a in role.all_rows if a.table != table]
+    role.source = HUMAN
+    return out, [f"role {name}: remove the all-rows acknowledgement for "
+                 f"{table} (compile refuses its high-sensitivity columns "
+                 "without a row scope again)"]
 
 
 def remove_role(roles: Roles, name: str) -> tuple:

@@ -44,9 +44,16 @@ def test_only_approved_columns_and_never_table_star():
                                      "template": "dept = '{dept}'"}]},
         "payroll_clerk": {"categories": ["pay"], "inherits": ["hr_staff"],
                           "row_scopes": [{"table": "payroll",
-                                          "template": "id = 1"}]}})
+                                          "template": "id = 1"}],
+                          "all_rows": [{"table": "bonuses",
+                                        "reason": "clerks pay every bonus"}]}})
     gen = compile_policy(CAT, roles, SCHEMA)
     rules = rules_of(gen)
+    assert "# all_rows payroll_clerk bonuses: clerks pay every bonus" in gen.body
+    assert gen.acknowledged == [
+        "role payroll_clerk reads high-sensitivity column(s) bonuses.(id, "
+        "staff_no) on ALL rows - acknowledged in roles.json: clerks pay every "
+        "bonus"]
     assert not any(".*" in r for r in rules)
     assert "p, hr_staff, employees.name, read" in rules
     assert "p, hr_staff, trainings.id, read" in rules
@@ -76,22 +83,83 @@ def test_scoped_grants_keep_approved_columns_only():
         in text
 
 
-def test_warnings():
+ACK = "finance reconciles every row"
+
+
+def _acks(*tables):
+    return [{"table": t, "reason": ACK} for t in tables]
+
+
+def test_high_sensitivity_on_all_rows_is_refused():
     roles = parse({
         "a_reader": {"categories": ["pay", "finance"]},
         "b_scoped": {"categories": ["pay"],
                      "row_scopes": [{"table": "payroll",
                                      "template": "employee_id = '{eid}'"}]}})
-    text = "\n".join(compile_policy(CAT, roles, SCHEMA).warnings)
+    with pytest.raises(CompileError) as err:
+        compile_policy(CAT, roles, SCHEMA)
+    text = str(err.value)
+    assert text.startswith("refused - high-sensitivity data on ALL rows")
+    assert ("role a_reader would read high-sensitivity column(s) "
+            "payroll.(id, employee_id, salary) on ALL rows") in text
+    assert "rbic-init roles all-rows a_reader payroll --reason" in text
+    # b_scoped's payroll is scoped; its employees.salary and bonuses are not
+    assert "role b_scoped would read high-sensitivity column(s) " \
+        "employees.(salary)" in text
+    assert "b_scoped would read high-sensitivity column(s) payroll" not in text
+
+
+def test_acknowledged_all_rows_compiles_with_warnings():
+    roles = parse({
+        "a_reader": {"categories": ["pay", "finance"],
+                     "all_rows": _acks("employees", "payroll", "bonuses")},
+        "b_scoped": {"categories": ["pay", "contact"],
+                     "row_scopes": [{"table": "payroll",
+                                     "template": "employee_id = '{eid}'"}],
+                     "all_rows": _acks("bonuses", "employees", "trainings")}})
+    gen = compile_policy(CAT, roles, SCHEMA)
+    text = "\n".join(gen.warnings)
     assert "role a_reader: category finance has no approved column" in text
     assert ("role a_reader reads payroll on ALL rows (no row scope in its "
             "role level), while b_scoped has a row scope on payroll") in text
-    assert ("role a_reader reads high-sensitivity column(s) "
-            "payroll.(id, employee_id, salary) on ALL rows") in text
-    # b_scoped's payroll is scoped; its employees.salary is not
-    assert "role b_scoped reads high-sensitivity column(s) employees.(salary)" \
-        in text
-    assert "role b_scoped reads high-sensitivity column(s) payroll" not in text
+    assert ("role b_scoped: the all-rows acknowledgement for trainings is not "
+            "needed") in text
+    assert len(gen.acknowledged) == 5
+    assert f"# all_rows a_reader payroll: {ACK}" in gen.body
+    assert "# all_rows b_scoped payroll" not in "\n".join(gen.body)
+    # comments in the block are not rules
+    assert all(not r[0].startswith("#") for r in gen.rules)
+
+
+def test_medium_sensitivity_on_all_rows_is_a_warning():
+    cat = CAT.copy()
+    cat.columns["trainings.id"] = replace(cat.columns["trainings.id"],
+                                          category="contact")
+    gen = compile_policy(cat, parse({"r1": {"categories": ["contact"]}}), SCHEMA)
+    assert ("role r1 reads medium-sensitivity column(s) trainings.(id) on ALL "
+            "rows (no row scope)") in gen.warnings
+
+
+@pytest.mark.parametrize("entry, message", [
+    ({"table": "payroll", "reason": ""}, "non-empty printable ASCII"),
+    ({"table": "payroll", "reason": "   "}, "non-empty printable ASCII"),
+    ({"table": "payroll", "reason": "line\nbreak"}, "printable ASCII"),
+    ({"table": "payroll", "reason": "caf\u00e9"}, "printable ASCII"),
+    ({"table": "payroll", "reason": "x" * 201}, "at most 200"),
+    ({"table": "nope", "reason": "why"}, "unknown table"),
+    ({"table": "payroll"}, "exactly table and reason"),
+])
+def test_all_rows_entries_are_validated(entry, message):
+    from rbic.onboarding.roles import RolesError
+    with pytest.raises(RolesError, match=message):
+        parse({"r1": {"categories": ["pay"], "all_rows": [entry]}})
+
+
+def test_all_rows_listed_twice_is_refused():
+    from rbic.onboarding.roles import RolesError
+    with pytest.raises(RolesError, match="listed twice"):
+        parse({"r1": {"categories": ["pay"],
+                      "all_rows": _acks("payroll", "payroll")}})
 
 
 def test_inherited_scope_counts_for_the_role_level():
@@ -100,9 +168,21 @@ def test_inherited_scope_counts_for_the_role_level():
                  "row_scopes": [{"table": "employees",
                                  "template": "dept = '{dept}'"}]},
         "mgr": {"categories": ["pay"], "inherits": ["base"]}})
-    text = "\n".join(compile_policy(CAT, roles, SCHEMA).warnings)
-    assert "mgr reads high-sensitivity column(s) employees" not in text
-    assert "mgr reads high-sensitivity column(s) payroll" in text
+    with pytest.raises(CompileError) as err:
+        compile_policy(CAT, roles, SCHEMA)
+    assert "mgr would read high-sensitivity column(s) employees" \
+        not in str(err.value)
+    assert "mgr would read high-sensitivity column(s) payroll" in str(err.value)
+
+
+def test_inheriting_acknowledged_columns_needs_no_second_acknowledgement():
+    roles = parse({
+        "base": {"categories": ["pay"],
+                 "all_rows": _acks("employees", "payroll", "bonuses")},
+        "child": {"categories": ["directory"], "inherits": ["base"]}})
+    gen = compile_policy(CAT, roles, SCHEMA)
+    assert len(gen.acknowledged) == 3
+    assert all("role base" in a for a in gen.acknowledged)
 
 
 def test_role_named_like_a_user_is_refused():
@@ -313,8 +393,18 @@ def test_master_bot_additions_go_to_the_master_section(onboarded):
     schema, catalog, users, roles, sha = load_state(onboarded)
     roles, _ = set_role(roles, "hr_staff", description="changed")
     save(onboarded, roles, sha)
-    with pytest.raises(ValueError, match="already holds exactly"):
-        compile_change(onboarded)  # a description is not a rule
+    # a description is not a rule: only the sources header changes
+    gen, change = compile_change(onboarded)
+    removed = [l for l in change.diff().splitlines()
+               if l.startswith("-") and not l.startswith("---")]
+    added = [l for l in change.diff().splitlines()
+             if l.startswith("+") and not l.startswith("+++")]
+    assert len(removed) == len(added) == 1
+    assert added[0].startswith("+# sources: catalog.json, roles.json, "
+                               "db_schema.json sha256=")
+    assert "gains" not in change.description and "loses" not in change.description
+    assert "p3, hr_staff, employees.dept, read" not in change.after_text
+    assert CHANGES_HEADER in change.after_text
 
 
 def test_master_bot_refuses_with_malformed_markers(onboarded):
