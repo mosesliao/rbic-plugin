@@ -959,16 +959,35 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv=None, *, input_fn=input, output=print) -> int:
+def console(stream=None):
+    """A print() that never fails on the console's encoding: characters it
+    cannot encode (a Cyrillic table name on a cp1252 console) are written
+    as backslash escapes instead of raising UnicodeEncodeError."""
+    def write(text="", file=None):
+        target = file or stream or sys.stdout
+        encoding = getattr(target, "encoding", None) or "ascii"
+        text = str(text)
+        try:
+            text.encode(encoding)
+        except UnicodeEncodeError:
+            text = text.encode(encoding, "backslashreplace").decode(encoding)
+        except LookupError:
+            text = text.encode("ascii", "backslashreplace").decode("ascii")
+        print(text, file=target)
+    return write
+
+
+def main(argv=None, *, input_fn=input, output=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     setup_logging(args.audit_log)
+    output = output or console()
     try:
         status = args.func(args, input_fn, output)
     except ConfigError as err:
         parser.error(str(err))
     except CommandError as err:
-        print(f"Error: {err}", file=sys.stderr)
+        console(sys.stderr)(f"Error: {err}")
         sys.exit(1)
     return status
 

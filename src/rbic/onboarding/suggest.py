@@ -319,7 +319,7 @@ def suggest_categories(schema: dict, *, db_path=None, sample_rows: int = 200,
         for table, cols in schema.items():
             names = [c for c in cols if IDENTIFIER_RE.match(c)]
             if not IDENTIFIER_RE.match(table) or len(names) != len(cols):
-                notes.append(f"{table}: names that are not lowercase "
+                notes.append(f"{ascii(table)}: names that are not lowercase "
                              "identifiers were skipped (the gate cannot "
                              "address them)")
             if IDENTIFIER_RE.match(table):

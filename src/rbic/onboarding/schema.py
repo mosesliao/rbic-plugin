@@ -21,6 +21,18 @@ from ..engine import readonly_uri
 # mixed-case table is unreachable through the gate: fail closed, noisily).
 IDENTIFIER_RE = re.compile(r"[a-z_][a-z0-9_]{0,62}\Z", re.ASCII)
 
+# Names the gate's loader refuses as a table (and that are reserved as a
+# column too): `master` is the policy owner's role, never data. A table
+# named so would break every compile/report later; it is skipped here.
+RESERVED_NAMES = ("master",)
+
+# Internal storage tables of virtual tables (FTS3/4/5, R*Tree): created by
+# SQLite next to `CREATE VIRTUAL TABLE v ...` as v_<suffix>. They hold the
+# index / a copy of the indexed text, not data to grant: skipped.
+SHADOW_SUFFIXES = ("_content", "_data", "_idx", "_docsize", "_config",
+                   "_segments", "_segdir", "_stat", "_node", "_rowid",
+                   "_parent")
+
 # Normalized types, as the shipped db_schema.json files use them. The gate
 # never looks at types (they document the column for humans and the LLM).
 SCHEMA_TYPES = ("int", "text", "numeric", "date", "timestamp")
@@ -49,7 +61,7 @@ def normalize_type(declared: str) -> tuple:
     if any(k in upper for k in ("REAL", "FLOA", "DOUB", "NUMERIC", "DECIMAL",
                                 "BOOL")):
         return "numeric", None
-    return "text", f"unknown declared type {raw[:40]!r}; reported as text"
+    return "text", f"unknown declared type {ascii(raw[:40])}; reported as text"
 
 
 def introspect_sqlite(db_path, notes: Optional[list] = None) -> dict:
@@ -57,10 +69,15 @@ def introspect_sqlite(db_path, notes: Optional[list] = None) -> dict:
     database, in db_schema.json's shape.
 
     Tables (and views) are sorted by name, columns keep their declared
-    order. sqlite_* internal tables are skipped; so are tables and columns
-    whose names are not lowercase identifiers (IDENTIFIER_RE), with a note.
-    Notes (unknown types, skipped names) are appended to `notes` if given.
-    Opens the database read-only and reads no rows.
+    order. sqlite_* internal tables are skipped; so are, with a note,
+    tables and columns whose names are not lowercase identifiers
+    (IDENTIFIER_RE), names the gate refuses (RESERVED_NAMES: `master`),
+    and the shadow tables of virtual tables (FTS3/4/5 and R*Tree
+    `<name>_content`, `_data`, `_idx`, `_docsize`, `_config`,
+    `_segments`, `_segdir`, `_stat`, ...). Notes (unknown types, skipped
+    names) are appended to `notes` if given; names in them are ascii()-
+    escaped, so printing them never fails on a non-UTF-8 console. Opens
+    the database read-only and reads no rows.
     """
     notes = [] if notes is None else notes
     path = Path(db_path)
@@ -70,31 +87,54 @@ def introspect_sqlite(db_path, notes: Optional[list] = None) -> dict:
     try:
         conn.execute("PRAGMA query_only = ON")
         objects = conn.execute(
-            "SELECT name, type FROM sqlite_master "
+            "SELECT name, type, sql FROM sqlite_master "
             "WHERE type IN ('table', 'view') "
             "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name"
         ).fetchall()
+        virtual = sorted(name for name, kind, sql in objects
+                         if kind == "table" and isinstance(sql, str)
+                         and sql.lstrip().upper().startswith(
+                             "CREATE VIRTUAL TABLE"))
         schema = {}
-        for table, kind in objects:
+        for table, kind, _ in objects:
             if not IDENTIFIER_RE.match(table):
-                notes.append(f"{kind} {table!r} skipped: not a lowercase "
+                notes.append(f"{kind} {ascii(table)} skipped: not a lowercase "
                              "identifier the gate can address (expose it "
                              "through a lowercase view)")
+                continue
+            if table in RESERVED_NAMES:
+                notes.append(f"{kind} {ascii(table)} skipped: '{table}' is "
+                             "reserved for the policy owner's role and the "
+                             "SQL gate refuses it as a table name (expose it "
+                             "through a view with another name)")
+                continue
+            owner = next((v for v in virtual for s in SHADOW_SUFFIXES
+                          if kind == "table" and table == v + s), None)
+            if owner is not None:
+                notes.append(f"table {ascii(table)} skipped: internal shadow "
+                             f"table of virtual table {ascii(owner)} (FTS / "
+                             "R*Tree storage, not data to grant)")
                 continue
             columns = {}
             for column, declared in conn.execute(
                     "SELECT name, type FROM pragma_table_info(?) ORDER BY cid",
                     (table,)):
                 if not IDENTIFIER_RE.match(column):
-                    notes.append(f"{table}.{column!r} skipped: not a "
+                    notes.append(f"{table}.{ascii(column)} skipped: not a "
                                  "lowercase identifier the gate can address")
+                    continue
+                if column in RESERVED_NAMES:
+                    notes.append(f"{table}.{column} skipped: '{column}' is "
+                                 "reserved for the policy owner's role "
+                                 "(expose it through a view with another "
+                                 "name)")
                     continue
                 typ, note = normalize_type(declared)
                 if note:
                     notes.append(f"{table}.{column}: {note}")
                 columns[column] = typ
             if not columns:
-                notes.append(f"{kind} {table!r} skipped: no addressable "
+                notes.append(f"{kind} {ascii(table)} skipped: no addressable "
                              "columns")
                 continue
             schema[table] = columns

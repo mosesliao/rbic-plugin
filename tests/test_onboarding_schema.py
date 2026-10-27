@@ -87,6 +87,83 @@ def test_introspection_skips_internal_and_unaddressable_names(tmp_path):
     assert db.read_bytes() == before  # read-only
 
 
+def test_introspection_skips_virtual_table_internals(tmp_path):
+    db = tmp_path / "v.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE VIRTUAL TABLE docs USING fts5(body)")
+    conn.execute("CREATE VIRTUAL TABLE notes USING fts4(text)")
+    conn.execute("CREATE VIRTUAL TABLE boxes USING rtree(id, x0, x1)")
+    conn.execute("CREATE TABLE docs_archive (id INTEGER)")   # not a shadow
+    conn.execute("CREATE TABLE plain_data (id INTEGER)")     # not a shadow
+    conn.commit()
+    conn.close()
+    notes = []
+    found = introspect_sqlite(db, notes)
+    assert set(found) == {"boxes", "docs", "docs_archive", "notes", "plain_data"}
+    text = "\n".join(notes)
+    for shadow, owner in (("docs_data", "docs"), ("docs_idx", "docs"),
+                          ("docs_content", "docs"), ("docs_docsize", "docs"),
+                          ("docs_config", "docs"), ("notes_segments", "notes"),
+                          ("notes_segdir", "notes"), ("notes_stat", "notes"),
+                          ("notes_content", "notes"), ("boxes_node", "boxes")):
+        assert (f"table '{shadow}' skipped: internal shadow table of virtual "
+                f"table '{owner}'") in text
+
+
+def test_introspection_skips_reserved_master_names(tmp_path):
+    # Review finding: a table named master broke every later compile (the
+    # gate's loader refuses `master` as a table).
+    db = tmp_path / "m.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE master (x TEXT)")
+    conn.execute("CREATE TABLE staff (id INTEGER, master TEXT)")
+    conn.commit()
+    conn.close()
+    notes = []
+    assert introspect_sqlite(db, notes) == {"staff": {"id": "int"}}
+    text = "\n".join(notes)
+    assert "table 'master' skipped: 'master' is reserved" in text
+    assert "staff.master skipped: 'master' is reserved" in text
+
+
+def test_introspection_notes_are_ascii_and_print_on_cp1252(tmp_path,
+                                                           monkeypatch):
+    import io
+    import sys
+    from rbic.cli import init as init_cli
+    db = tmp_path / "c.db"
+    conn = sqlite3.connect(db)
+    conn.execute('CREATE TABLE "\u0440\u0430yroll" (id INTEGER)')
+    conn.execute('CREATE TABLE ok (id INTEGER, "\u0441alary" REAL, '
+                 'odd "\u0442\u0438\u043f")')
+    conn.commit()
+    conn.close()
+    notes = []
+    introspect_sqlite(db, notes)
+    assert notes and all(n.isascii() for n in notes)
+    assert "table '\\u0440\\u0430yroll' skipped" in "\n".join(notes)
+    # the CLI on a cp1252 console: no UnicodeEncodeError, names escaped
+    (tmp_path / "casbin").mkdir()
+    for name in ("casbin/model.conf", "casbin/policy.csv",
+                 "worker_attributes.json"):
+        (tmp_path / name).write_bytes((DEMO_SOURCE / name).read_bytes())
+    (tmp_path / "db_schema.json").write_text("{}", encoding="utf-8")
+    raw = io.BytesIO()
+    out = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+    monkeypatch.setattr(sys, "stdout", out)
+    (tmp_path / "casbin" / "policy.csv").write_text("", encoding="utf-8")
+    assert init_cli.main(["schema", "--config-dir", str(tmp_path),
+                          "--db", str(db)]) == 0
+    out.flush()
+    printed = raw.getvalue().decode("cp1252")
+    assert "u0440" in printed and "ok.id" not in printed
+    write = init_cli.console(out)
+    write("table \u0440\u0430yroll")             # an unencodable name
+    out.flush()
+    assert raw.getvalue().decode("cp1252").endswith("table \\u0440\\u0430yroll\n") \
+        or raw.getvalue().decode("cp1252").endswith("table \\u0440\\u0430yroll\r\n")
+
+
 def test_introspection_missing_db_is_refused(tmp_path):
     with pytest.raises(FileNotFoundError):
         introspect_sqlite(tmp_path / "nope.db")
