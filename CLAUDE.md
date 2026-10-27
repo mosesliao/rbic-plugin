@@ -68,6 +68,7 @@ project/
 ├── README.md
 ├── pyproject.toml          # rbic-plugin: deps, [test] extra, entry points (hatchling, src layout)
 ├── docs/RELEASING.md       # owner checklist: Trusted Publishing, environments, tagging
+├── docs/onboarding.md      # rbic-init guide for a new organization
 ├── .github/workflows/
 │   ├── tests.yml           # pytest (3.10/3.11/3.12) + wheel smoke; adapters (anthropic 0.86.0, pydantic 2.13.4, Pipe tests)
 │   ├── openwebui-image.yml # non-required: build the Open WebUI image + smoke (path-filtered, no push)
@@ -84,14 +85,15 @@ project/
 │   ├── admin.py            # validated, atomic, audited policy/attribute/schema editor
 │   ├── demo/seed.py        # demo company.db schema + rows (seed())
 │   ├── onboarding/         # rbic-init library: schema, catalog.json, suggest, roles.json + packs,
-│   │                       #   compile (rbic-init block), access report
+│   │                       #   compile (rbic-init block), access report, users (import),
+│   │                       #   drift
 │   │   └── packs/*.json    # starter packs (package data, in the wheel)
 │   └── cli/                # the only terminal I/O: argparse, print/input, .env, logging setup
 │       ├── chat.py         # rbic-chat: run_chatbot on RBICEngine.ask() (LocalProvider)
 │       ├── master.py       # rbic-master: interactive master session
 │       ├── gate_demo.py    # rbic-gate-demo: 15 fixed queries (6 ALLOW, 9 DENY on the demo)
 │       ├── init.py         # rbic-init: schema / suggest / status / approve / reject /
-│       │                   #   roles / compile / report
+│       │                   #   roles / import-users / compile / report / drift
 │       └── seed.py         # rbic-seed
 ├── examples/demo/          # demo config dir (not in the wheel)
 │   ├── casbin/
@@ -100,6 +102,7 @@ project/
 │   ├── db_schema.json      # table → columns; the qualify/deny reference
 │   ├── worker_attributes.json  # username → {role, email, dept/site…}; IdP/HRIS stand-in
 │   ├── company.db          # seeded SQLite demo DB (generated, gitignored)
+│   ├── onboarding-sample/  # fake HR export + group_map.json for rbic-init import-users
 │   └── policy_changes.jsonl  # runtime changelog of applied changes (gitignored)
 ├── tests/
 │   ├── conftest.py         # copies examples/demo + seeded DB into tmp_path
@@ -123,6 +126,8 @@ project/
 │   ├── test_onboarding_acceptance.py  # pytest: rbic-init reproduces the demo policy
 │   ├── onboarding_demo.py         # helpers: onboard the demo with library calls
 │   ├── test_cli_init.py           # pytest: rbic-init end to end (yes/no, audit, no values leak)
+│   ├── test_onboarding_users.py   # pytest: import-users (CSV, group map, refusals, undo, no emails)
+│   ├── test_onboarding_drift.py   # pytest: drift checks/exit codes, block state, all-rows acks
 │   └── test_openwebui_pipe.py     # pytest: the Open WebUI Pipe (importlib-loaded, fake client)
 ├── integrations/openwebui/ # Open WebUI plugin (sdist only, not in the wheel)
 │   ├── rbic_pipe.py        # the Pipe function admins import (needs only pydantic + rbic)
@@ -152,6 +157,7 @@ rbic-chat --config-dir examples/demo alice  # chat as a worker (needs ANTHROPIC_
 rbic-chat --config-dir examples/demo bob    # hr_staff — try asking for salaries
 rbic-master --config-dir examples/demo master  # master user: change policy by chatting
 rbic-init suggest --config-dir examples/demo  # onboarding: suggest column categories (see rbic-init flow)
+rbic-init drift --config-dir examples/demo    # drift check: exit 0 clean / 1 drift / 2 error
 python -m rbic.cli.gate_demo --config-dir examples/demo  # any CLI also runs as a module
 cd integrations/openwebui && docker compose up --build  # Open WebUI + Keycloak test deployment (its README)
 ```
@@ -238,7 +244,8 @@ logging.
   `POLICY_UNAVAILABLE_DENY`, `POLICY_RESET`, `POLICY_CHANGED_DURING_TURN`,
   `SQL_ERROR`, `LLM_ERROR`/`ENGINE_ERROR` (engine), `POLICY_RELOAD[_FAILED]`,
   `POLICY_CONFIRM`, `POLICY_CHANGE[_LOG_FAILED]` (master/admin/rbic-init
-  schema and compile), `CATALOG_SUGGEST`, `CATALOG_CONFIRM`,
+  schema, compile and import-users: `kind=schema_update|generated_policy|
+  user_import|undo`), `CATALOG_SUGGEST`, `CATALOG_CONFIRM`,
   `CATALOG_CHANGE`, `ROLES_CONFIRM`, `ROLES_CHANGE` (rbic-init),
   `PIPE_TASK_STUB`, `PIPE_ATTACHMENT_REFUSED`, `PIPE_AUDIENCE`,
   `PIPE_CONFIG_ERROR`, `PIPE_CONFIG_WARNING`, `PIPE_ERROR` (Open WebUI
@@ -395,9 +402,10 @@ logging.
   first (`propose_revoke` / `propose_remove_*` / `propose_remove_user_role`),
   then the user.
 
-### rbic.onboarding / rbic.cli.init flow (rbic-init, Phase 3 steps 1–2)
+### rbic.onboarding / rbic.cli.init flow (rbic-init, Phase 3)
 The toolkit **proposes**; the organization's policy owner (a master user)
-**approves**. Plan: `docs/plugin-plan.md` §6.6.
+**approves**. Plan: `docs/plugin-plan.md` §6.6; user guide:
+`docs/onboarding.md` (keep the two in sync with this section).
 - `rbic-init schema [--db PATH] [--write --actor MASTER]`:
   `onboarding.schema.introspect_sqlite` reads only the catalog
   (`sqlite_master`, `pragma_table_info`) over `engine.readonly_uri` +
@@ -490,11 +498,28 @@ The toolkit **proposes**; the organization's policy owner (a master user)
   scoped grants keep only approved columns (dropped ones warned, an empty
   one skipped); `g, role, parent`; `p2` per scope; deterministic order
   (roles by name; g, p in schema order, p2); every rule round-trips
-  Casbin's tokenizer (`admin._casbin_tokens`). Warnings: a category with
-  no approved column; a role level reading a table on ALL rows while
-  other roles scope it; high-sensitivity columns on ALL rows; every column
-  not approved (hidden). `compile_from_files` records the sha256 of
-  catalog.json, roles.json, db_schema.json and worker_attributes.json.
+  Casbin's tokenizer (`admin._casbin_tokens`). **Refused** (CompileError,
+  fail closed): a role whose OWN categories grant a column of a
+  HIGH-sensitivity category on a table that no 3-field row scope of its
+  role level limits, unless its roles.json entry acknowledges that table
+  in `all_rows: [{table, reason}]` (non-empty printable ASCII ≤ 200,
+  validated; packs never set it; `rbic-init roles all-rows ROLE TABLE
+  --reason TEXT | --remove`). A role that only INHERITS such columns needs
+  no acknowledgement (its level ⊇ the ancestor's, so the ancestor reads
+  the table on all rows too and had to acknowledge it). The reason is
+  written as `# all_rows <role> <table>: <reason>` in the block, listed in
+  `GeneratedPolicy.acknowledged` / the effect summary (`compile: …`) and
+  shown in the access report ("**ALL rows** (acknowledged: …)"); only
+  comments INSIDE the block count. Warnings: a category with no approved
+  column; a role level reading a table on ALL rows while other roles
+  scope it; medium-sensitivity columns on ALL rows; an unneeded
+  acknowledgement; every column not approved (hidden).
+  `compile_from_files` records the sha256 of catalog.json, roles.json,
+  db_schema.json and worker_attributes.json, and puts a sources header
+  first in the block: `# sources: catalog.json, roles.json,
+  db_schema.json sha256=<fp> rbic=<version>` (`sources_fingerprint`: sha256
+  over the three files' text sha256s; worker_attributes.json is not part
+  of it, so an import never makes the block stale).
 - **Generated block** (`onboarding.block`): `# ---- BEGIN rbic init
   (generated; edit onboarding/*.json and re-run rbic-init compile) ----` …
   `# ---- END rbic init ----`, matched as whole lines. Recompiling
@@ -520,7 +545,16 @@ The toolkit **proposes**; the organization's policy owner (a master user)
   their real values, effect summary per role and user (the shared
   effect-diff code), lock, changelog before replace, undo
   (`propose_undo` restores the pre-compile policy.csv; the sources are
-  not touched).
+  not touched, and the undo's description says so:
+  `admin.SOURCES_NOT_REVERTED`).
+- **Block state** (`onboarding.drift.block_state`, shown by `status` and
+  `drift`): `in_sync`; `not_onboarded` (no catalog/roles); `missing`;
+  `malformed`; `edited` (no sources header, or the block body, header
+  aside, differs from what `build_policy_text` produces from the current
+  sources while their fingerprint matches the header); `out_of_date`
+  (fingerprint differs); `undone` (the last applied generated_policy
+  change has an applied undo); `stale_compile` (the recorded sources no
+  longer compile). A different rbic version alone is in sync (noted).
 - **Access report** (`onboarding.report.access_report(snapshot,
   catalog)`, `report_from_bytes`): Markdown from a PolicySnapshot (the
   gate's own view of generated AND manual rules, via `columns_for`,
@@ -547,8 +581,56 @@ The toolkit **proposes**; the organization's policy owner (a master user)
   differences: named columns instead of `table.*`; no `payroll_manager`
   role (hr_manager holds pay + the team filter); `employee` reads payroll
   through a scoped grant. The packs' defaults are stricter than the demo.
-- Not yet (step 3): `import-users`, `drift`, an optional names-only LLM
-  suggester (off by default; never values).
+- `rbic-init import-users --csv FILE --actor MASTER [--group-map PATH]
+  [--team-depth direct|all] [--remove-missing]` / `--undo`
+  (`onboarding.users`): the HR / IdP channel, the ONLY path that may
+  create workers or set/change emails. CSV: UTF-8 (BOM ok), header row,
+  delimiter `,` or `;` detected from the header (both/neither → refused);
+  header names trimmed + lowercased; required `username`, `email`;
+  optional `groups` (separated by `;` when the delimiter is `,`, by `|`
+  when it is `;`), `employee_id` (digits, unique, stored as int),
+  `manager` (a username in the same file); other columns → attributes
+  (`ATTR_KEY_RE` names, `ATTR_VALUE_RE` values, empty cell = remove;
+  `role` column refused; `self_and_subordinate_ids` refused next to
+  `manager`). Emails through `gate.normalize_email` (no non-ASCII /
+  lookalikes), stored lowercased, unique (also vs masters and kept
+  workers); usernames unique case-insensitively, never a master (refused)
+  nor a role name. ANY invalid row rejects the import; errors give row
+  numbers + usernames, never values. `group_map.json` `{"version": 1,
+  "map": [{group, role}]}` in priority order: role = first mapped group;
+  more mapped groups → warning; no mapped group → imported WITHOUT a
+  `role` key (engine: "worker has no role" → DENY); roles must exist in
+  roles.json or the policy, never `master`/`user:`/a username. With a
+  `manager` column: `self_and_subordinate_ids` = own employee_id + direct
+  (or all) reports' ids, sorted "1, 2, 3"; cycle / unknown manager /
+  > 200 chars refused. Masters never created/changed/removed; workers
+  missing from the file kept (listed) unless `--remove-missing`, which is
+  refused while they hold `user:` rules (listed). Keys the file has no
+  column for are kept. Applied via `PolicyAdmin.propose_user_import`
+  (kind `user_import`): masters intact, keys/values/roles validated
+  (messages never echo values), every user's filters bound, gate loader
+  in both dialects (email shape/uniqueness, user subjects), all input
+  hashes, lock, changelog before replace; summary per user with names
+  only (`<email set>` / `<email changed>` / `<email removed>`); the CLI
+  prints the summary, never the diff; `POLICY_CONFIRM` + `POLICY_CHANGE
+  kind=user_import`. Undo: `propose_undo(identity_channel=True)` (CLI
+  `--undo`) only undoes a user_import and may restore emails; the master
+  bot's undo of an import is refused when any email differs.
+  `PolicyAdmin._check_all_users` skips role-less workers (denied anyway).
+- `rbic-init drift [--db PATH] [--json]` (`onboarding.drift.check_drift`):
+  checks `schema` (introspected DB vs db_schema.json), `catalog`
+  (unlabelled/suggested columns = hidden; entries for vanished columns;
+  rejected = info), `generated_block` (block_state), `roles` (roles.json
+  naming missing categories/tables/columns/parents, templates that no
+  longer compile, all_rows tables), `workers` (no role / role no rule
+  mentions, roles nobody holds, policy that does not load = CRITICAL).
+  Exit 0 clean, 1 drift, 2 error (e.g. DB missing, unexpected failure).
+  Names only - never values or emails.
+- Report/lock files are sensitive: `.gitignore` covers
+  `**/onboarding/access-report.md`, `**/onboarding/.onboarding.lock`,
+  `**/onboarding/*.csv` in any config dir.
+- Not yet: an optional names-only LLM suggester (off by default; never
+  values); IdP API connectors (CSV export only).
 
 ---
 
@@ -717,8 +799,10 @@ worker) is the identity key `JsonAttributeProvider` maps sign-ins by: it
 must be a plain ASCII address and unique after ASCII lowercasing
 (`gate.normalize_email`, the same normalization identity emails get), or
 the load fails closed (everyone denied). The master bot can never change an email
-(`propose_set_attribute` refuses it, and no other path, undo included,
-may alter one) — it is owned by HR / the IdP.
+(`propose_set_attribute` refuses it, and its undo refuses any change that
+would alter one) — it is owned by HR / the IdP, whose only channel is
+`rbic-init import-users` (and its `--undo`). A worker without a `role`
+key (an unmapped import) is valid and denied everything.
 
 **Policy fingerprint**: `gate.fingerprint` / `PolicySnapshot.fingerprint`
 is a sha256 over the exact bytes of model.conf, policy.csv,
@@ -970,4 +1054,5 @@ LLM model for text-to-SQL / summarization: `claude-sonnet-4-6`.
   Phase 2 (Open WebUI Pipe, image, Keycloak test deployment) lives in
   `integrations/openwebui/`; its manual end-to-end run against a live
   deployment is still to do. Phase 3 (onboarding toolkit, `rbic-init`) is
-  in progress (plan §6.6); LibreChat is the second platform (plan §2.1).
+  implemented on `feat/onboarding-toolkit` (plan §6.6, guide
+  `docs/onboarding.md`); LibreChat is the second platform (plan §2.1).

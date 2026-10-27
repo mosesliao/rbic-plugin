@@ -4,7 +4,8 @@
 - **Status:** approved plan. Phase 1 is merged (PR #3). Phase 2 (Open WebUI
   plugin, `integrations/openwebui/`) is done and merged (PR #4); see
   `CLAUDE.md` for where it differs from section 5. Phase 3 (onboarding
-  toolkit) is in progress on `feat/onboarding-toolkit` (section 6.6).
+  toolkit) is implemented on `feat/onboarding-toolkit` (section 6.6;
+  guide: `docs/onboarding.md`).
 
 This document records the agreed plan for turning the RBIC gate and chatbot
 into a reusable plugin. It is written for the project owner and for future
@@ -396,7 +397,7 @@ no access.
 - Larger organizations may need the policy stored in a database (a Casbin
   adapter) instead of a CSV file.
 
-### 6.6 Implementation (in progress)
+### 6.6 Implementation (implemented on `feat/onboarding-toolkit`)
 
 The toolkit proposes; the organization's policy owner (a master user)
 approves. Every security invariant applies to it: unapproved columns grant
@@ -422,7 +423,9 @@ log.
      people_manager), `compile` (approved columns only, named columns,
      never `table.*`), `report`, apply through PolicyAdmin. It reproduces
      the demo policy decision for decision.
-  3. Step 3: `import-users` (IdP/HR), `drift`, documentation.
+  3. Step 3 (done): `import-users` (IdP/HR CSV + group map), `drift`
+     (exit 0/1/2), high-sensitivity all-rows refusal, block/source
+     fingerprint, `docs/onboarding.md`.
 
 ---
 

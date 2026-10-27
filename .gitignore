@@ -12,3 +12,8 @@ build/
 dist/
 *.egg-info/
 examples/demo/onboarding/
+# rbic-init, in any config directory: the access report (usernames and
+# policy structure), the onboarding lock, and HR / IdP exports (emails).
+**/onboarding/access-report.md
+**/onboarding/.onboarding.lock
+**/onboarding/*.csv
