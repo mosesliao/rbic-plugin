@@ -58,10 +58,11 @@ from .config import EngineConfig
 from .gate import (
     PTYPE_ALLOW_COLUMNS, PTYPE_ALLOW_ROWS, PTYPE_DENY_COLUMNS, PTYPE_DENY_ROWS,
     SCOPE_COLUMN_SEP, STATIC_FILTER_WARNING, USER_PREFIX, FilterError,
-    MissingAttribute, PolicySnapshot, bind_row_filter, compile_row_filter,
-    compile_snapshot, is_user_subject, load_enforcer, load_snapshot,
-    parse_scope_columns, subjects_for, user_subject,
+    MissingAttribute, PolicySnapshot, bind_row_filter, check_schema,
+    compile_row_filter, compile_snapshot, is_user_subject, load_enforcer,
+    load_snapshot, parse_scope_columns, subjects_for, user_subject,
 )
+from .onboarding.schema import diff_schema
 
 
 MASTER_ROLE = "master"
@@ -163,6 +164,35 @@ def _lines(text: str) -> list:
     if parts[-1]:
         out.append(parts[-1])
     return out
+
+
+@contextlib.contextmanager
+def exclusive_lock(path, timeout: Optional[float] = None, *,
+                   what: str = "policy change"):
+    """Inter-process lock: an O_CREAT|O_EXCL lock file at `path`, retried
+    until `timeout` (default LOCK_TIMEOUT_S), always removed on exit."""
+    path = os.fspath(path)
+    deadline = time.monotonic() + (LOCK_TIMEOUT_S if timeout is None
+                                   else timeout)
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise ValueError(
+                    f"Another {what} is being applied; nothing was "
+                    f"written. Try again (if no {what} is in progress, "
+                    f"delete the stale lock file {path}).")
+            time.sleep(0.05)
+    try:
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode())
+        finally:
+            os.close(fd)
+        yield
+    finally:
+        os.remove(path)
 
 
 def _proposal(method):
@@ -270,31 +300,9 @@ class PolicyAdmin:
         return os.path.join(os.path.dirname(os.path.abspath(self.policy_path)),
                             LOCK_NAME)
 
-    @contextlib.contextmanager
     def _apply_lock(self, timeout: Optional[float] = None):
-        """Inter-process lock: O_CREAT|O_EXCL lock file, always removed."""
-        path = self._lock_path()
-        deadline = time.monotonic() + (LOCK_TIMEOUT_S if timeout is None
-                                       else timeout)
-        while True:
-            try:
-                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                break
-            except FileExistsError:
-                if time.monotonic() >= deadline:
-                    raise ValueError(
-                        "Another policy change is being applied; nothing was "
-                        "written. Try again (if no change is in progress, "
-                        f"delete the stale lock file {path}).")
-                time.sleep(0.05)
-        try:
-            try:
-                os.write(fd, f"{os.getpid()}\n".encode())
-            finally:
-                os.close(fd)
-            yield
-        finally:
-            os.remove(path)
+        """Inter-process lock (exclusive_lock on casbin/.policy.lock)."""
+        return exclusive_lock(self._lock_path(), timeout)
 
     def _enforcer(self, policy_text: Optional[str] = None) -> casbin.Enforcer:
         """Casbin enforcer over policy.csv (or `policy_text`), loaded from
@@ -304,22 +312,21 @@ class PolicyAdmin:
         return load_enforcer(_read_bytes(self.model_path), policy)
 
     def _after_state(self, change: "Change") -> tuple:
-        """(policy bytes, attributes bytes) once `change` is applied; the
-        file it doesn't touch is read from disk."""
-        after = change.after_text.encode("utf-8")
+        """(policy, attributes, schema) bytes once `change` is applied; the
+        files it doesn't touch are read from disk."""
         target = self._managed_path(change.target)
-        if target == self.policy_path:
-            return after, _read_bytes(self.attributes_path)
-        return _read_bytes(self.policy_path), after
+        return tuple(change.after_text.encode("utf-8") if path == target
+                     else _read_bytes(path)
+                     for path in (self.policy_path, self.attributes_path,
+                                  self.schema_path))
 
     def _check_gate_loads(self, change: "Change") -> None:
         """Refuse a change whose resulting files the SQL gate would refuse
         to load (the gate would then deny everyone): the same
         gate.load_snapshot the gate runs on every reload, in every
         supported dialect."""
-        policy, attributes = self._after_state(change)
+        policy, attributes, schema = self._after_state(change)
         model = _read_bytes(self.model_path)
-        schema = _read_bytes(self.schema_path)
         try:
             for dialect in FILTER_DIALECTS:
                 load_snapshot(model, policy, attributes, schema,
@@ -1626,6 +1633,9 @@ class PolicyAdmin:
         if target == self.policy_path:
             change = self._policy_change("undo", actor, headline, current,
                                          restored)
+        elif target == self.schema_path:
+            change = self._schema_change("undo", actor, headline, current,
+                                         restored)
         else:
             before_attrs, after_attrs = json.loads(current), json.loads(restored)
             self._check_master_intact(before_attrs, after_attrs)
@@ -1636,8 +1646,131 @@ class PolicyAdmin:
         change.undoes = last["id"]
         return change
 
+    # ------------------------------------------------------------------
+    # db_schema.json (rbic-init schema; validated like every other change)
+    # ------------------------------------------------------------------
+
+    @_proposal
+    def propose_schema_update(self, schema, actor=None) -> Change:
+        """Replace db_schema.json with `schema` ({table: {column: type}},
+        written in the given order).
+
+        Refused when the gate would refuse the result (a row filter or
+        column deny naming a removed column, a malformed schema...) and
+        when any p/p3/p2/p4 rule names a table or table.column the new
+        schema removes: a grant left pointing at a vanished column would
+        silently come back to life if a column of that name reappeared.
+        """
+        try:
+            schema = check_schema(schema)
+        except ValueError as err:
+            raise ValueError(f"Invalid schema: {err}") from None
+        before = _read(self.schema_path)
+        nl = _newline(before)
+        after = json.dumps(schema, indent=2).replace("\n", nl) + nl
+        if after == before:
+            raise ValueError("db_schema.json already matches; nothing to "
+                             "change.")
+        headline = (f"db_schema.json will describe {len(schema)} table(s) "
+                    "as shown in the diff.")
+        return self._schema_change("schema_update", actor, headline, before,
+                                   after)
+
+    @staticmethod
+    def _schema_refs(e: casbin.Enforcer) -> list:
+        """[(rule, table, column|None)] for every table.column a p/p3 rule
+        names and every table a p2/p4 rule filters (column None)."""
+        refs = []
+        for ptype in COLUMN_PTYPES:
+            for rule in e.get_named_policy(ptype):
+                table, _, column = rule[1].partition(".")
+                refs.append(([ptype, *rule], table, column))
+        for ptype in ROW_PTYPES:
+            for rule in e.get_named_policy(ptype):
+                refs.append(([ptype, *rule], rule[1], None))
+        return refs
+
+    @classmethod
+    def _check_schema_refs(cls, e: casbin.Enforcer, old: dict, new: dict,
+                           notes: Optional[list] = None) -> None:
+        """Refuse a schema that removes a table/column a rule names (while
+        the old schema had it); note rules that name something only the
+        new schema has (they take effect with this change)."""
+        def has(schema, table, column):
+            if table not in schema:
+                return False
+            return column in (None, "*") or column in schema[table]
+
+        broken = []
+        for rule, table, column in cls._schema_refs(e):
+            if "*" in table:  # a glob over table names: nothing to resolve
+                continue
+            name = table if column in (None, "*") else f"{table}.{column}"
+            line = ", ".join(rule)
+            if has(old, table, column) and not has(new, table, column):
+                broken.append(f"{name} (rule: {line})")
+            elif notes is not None and not has(old, table, column) \
+                    and has(new, table, column):
+                notes.append(f"WARNING: the existing rule '{line}' names "
+                             f"{name}, which did not exist before; it takes "
+                             "effect with this change")
+        if broken:
+            raise ValueError(
+                "The new schema removes table(s)/column(s) that policy rules "
+                "still reference: " + "; ".join(broken) + ". Remove or "
+                "revoke those rules first (rbic-master), then update the "
+                "schema.")
+
+    def _schema_change(self, kind, actor, headline, before, after) -> Change:
+        try:
+            old = check_schema(json.loads(before))
+            new = check_schema(json.loads(after))
+        except ValueError as err:  # json.JSONDecodeError is a ValueError
+            raise ValueError(f"Invalid schema: {err}") from None
+        e = self._enforcer()
+        attrs = self.attributes()
+        notes = diff_schema(old, new).lines(new)
+        self._check_schema_refs(e, old, new, notes)
+        before_s = self._snapshot(e, attrs, old)
+        after_s = self._snapshot(e, attrs, new,
+                                 "The policy with the new db_schema.json")
+        self._check_all_users(e, attrs, new)
+        for role in sorted(self._roles(e)):
+            diff = self._column_diff(self._readable(before_s, role, old),
+                                     self._readable(after_s, role, new))
+            users = sorted(u for u, a in attrs.items() if a.get("role") == role)
+            who = f" [users: {', '.join(users)}]" if users else ""
+            for table, gained, lost in diff:
+                if gained:
+                    notes.append(
+                        f"WARNING: {role}{who} can read {table}."
+                        f"({', '.join(gained)}) immediately through an "
+                        "existing grant (e.g. a table.* wildcard)")
+                if lost:
+                    notes.append(f"{role}{who}: loses read on {table}."
+                                 f"({', '.join(lost)}) (removed)")
+        for user in sorted(attrs):
+            if attrs[user].get("role") == MASTER_ROLE or not any(
+                    self._personal(after_s, user).values()):
+                continue
+            diff = self._column_diff(before_s.effective_columns(user, old),
+                                     after_s.effective_columns(user, new))
+            for table, gained, lost in diff:
+                if gained:
+                    notes.append(f"WARNING: {user} (has personal rules) can "
+                                 f"read {table}.({', '.join(gained)}) "
+                                 "immediately")
+                if lost:
+                    notes.append(f"{user}: loses read on {table}."
+                                 f"({', '.join(lost)}) (removed)")
+        if not notes:
+            notes.append("no table, column or access change (formatting "
+                         "only)")
+        return self._make(kind, actor, headline, notes, self.schema_path,
+                          before, after)
+
     def _managed_path(self, path) -> str:
-        for p in (self.policy_path, self.attributes_path):
+        for p in (self.policy_path, self.attributes_path, self.schema_path):
             if path and os.path.abspath(path) == os.path.abspath(p):
                 return p
         raise ValueError(f"Changelog refers to unmanaged file {path!r}.")
@@ -1697,6 +1830,10 @@ class PolicyAdmin:
                 self._check_no_master_in_policy(
                     load_enforcer(_read_bytes(self.model_path),
                                   change.after_text.encode("utf-8")))
+            elif target == self.schema_path:
+                self._check_schema_refs(self._enforcer(),
+                                        json.loads(change.before_text),
+                                        json.loads(change.after_text))
             else:
                 self._check_master_intact(attrs, json.loads(change.after_text))
             # The audit record goes down BEFORE the file changes, so a live

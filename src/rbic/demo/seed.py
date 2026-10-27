@@ -4,6 +4,10 @@ Data spans two warehouses (SG-01, SG-02) and two departments
 (engineering, logistics) so the ABAC row filters are visible:
 alice (site SG-01) must never see SG-02 rows, bob/carol (engineering)
 must never see logistics HR rows, dave (logistics) only logistics expenses.
+
+Date columns are declared DATE / TIMESTAMP (SQLite stores the ISO-8601
+strings as text either way), so `rbic-init schema` introspects exactly the
+types examples/demo/db_schema.json lists.
 """
 
 import os
@@ -15,26 +19,26 @@ CREATE TABLE inventory (
 );
 CREATE TABLE shipments (
     id INTEGER PRIMARY KEY, warehouse_id TEXT, destination TEXT,
-    eta TEXT, status TEXT
+    eta DATE, status TEXT
 );
 CREATE TABLE safety_incidents (
     id INTEGER PRIMARY KEY, warehouse_id TEXT, severity TEXT,
-    reported_at TEXT, description TEXT
+    reported_at TIMESTAMP, description TEXT
 );
 CREATE TABLE payroll (
     id INTEGER PRIMARY KEY, employee_id INTEGER, salary NUMERIC,
-    effective_date TEXT
+    effective_date DATE
 );
 CREATE TABLE employees (
-    id INTEGER PRIMARY KEY, name TEXT, dept TEXT, start_date TEXT,
+    id INTEGER PRIMARY KEY, name TEXT, dept TEXT, start_date DATE,
     salary NUMERIC
 );
 CREATE TABLE leave_requests (
     id INTEGER PRIMARY KEY, employee_id INTEGER, dept TEXT,
-    start_date TEXT, end_date TEXT, status TEXT
+    start_date DATE, end_date DATE, status TEXT
 );
 CREATE TABLE trainings (
-    id INTEGER PRIMARY KEY, title TEXT, dept TEXT, date TEXT
+    id INTEGER PRIMARY KEY, title TEXT, dept TEXT, date DATE
 );
 CREATE TABLE budgets (
     id INTEGER PRIMARY KEY, dept TEXT, fiscal_year INTEGER, amount NUMERIC
@@ -45,7 +49,7 @@ CREATE TABLE expenses (
 );
 CREATE TABLE invoices (
     id INTEGER PRIMARY KEY, vendor TEXT, amount NUMERIC,
-    due_date TEXT, status TEXT
+    due_date DATE, status TEXT
 );
 """
 
