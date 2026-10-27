@@ -17,7 +17,7 @@
     rbic-init roles remove ROLE --config-dir DIR --actor NAME
     rbic-init import-users --config-dir DIR --csv FILE --actor NAME
                            [--group-map PATH] [--team-depth direct|all]
-                           [--remove-missing]
+                           [--remove-missing] [--clear-team-ids]
     rbic-init import-users --config-dir DIR --undo --actor NAME
     rbic-init compile --config-dir DIR --actor NAME [--report PATH]
     rbic-init report  --config-dir DIR [--out PATH]
@@ -602,8 +602,9 @@ def cmd_import_users(args, input_fn, output):
     done = ("The engine uses the new worker records on its next request "
             "(every open conversation resets once).")
     if args.undo:
-        if args.csv or args.remove_missing:
-            raise CommandError("--undo takes no --csv / --remove-missing.")
+        if args.csv or args.remove_missing or args.clear_team_ids:
+            raise CommandError("--undo takes no --csv / --remove-missing / "
+                               "--clear-team-ids.")
         try:
             change = admin.propose_undo(actor=args.actor, identity_channel=True)
         except ValueError as err:
@@ -633,7 +634,8 @@ def cmd_import_users(args, input_fn, output):
         plan = plan_import(current, parsed, group_map, known_roles=known,
                            team_depth=args.team_depth,
                            remove_missing=args.remove_missing,
-                           rules_by_user=user_rules(admin._enforcer()))
+                           rules_by_user=user_rules(admin._enforcer()),
+                           clear_team_ids=args.clear_team_ids)
     except UserImportError as err:
         raise CommandError(str(err)) from None
     output(f"Export: {plan.rows} row(s), delimiter {parsed.delimiter!r}, "
@@ -928,6 +930,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--remove-missing", action="store_true",
                    help="remove existing workers that are not in the export "
                         "(refused while they hold personal user: rules)")
+    p.add_argument("--clear-team-ids", action="store_true",
+                   help="export without a manager column: remove "
+                        "self_and_subordinate_ids from the workers in it "
+                        "(by default it is kept unchanged, with a warning)")
     p.add_argument("--undo", action="store_true",
                    help="undo the last import instead (it must be the most "
                         "recent change)")

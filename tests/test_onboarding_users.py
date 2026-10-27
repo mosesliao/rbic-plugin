@@ -398,6 +398,52 @@ def test_set_attribute_cannot_duplicate_an_employee_id(demo_dir):
                                           actor="master")
 
 
+NO_MANAGER_CSV = ("username,email,groups,employee_id,dept\n"
+                  "carol,carol@example.test,HR Managers,2,engineering\n"
+                  "bob,bob@example.test,HR Staff,1,engineering\n")
+
+
+def test_no_manager_column_warns_that_team_ids_may_be_stale(demo_dir):
+    p = plan(demo_dir, NO_MANAGER_CSV)
+    assert p.attributes["carol"]["self_and_subordinate_ids"] == "1, 2, 3"
+    note = next(n for n in p.notes if n.startswith("WARNING: the export has "
+                                                   "no manager column"))
+    assert "kept UNCHANGED for carol and may be stale" in note
+    assert "--clear-team-ids" in note
+    p = plan(demo_dir, NO_MANAGER_CSV + "erin,erin@example.test,HR Staff,3,"
+                                        "engineering" + chr(10))
+    change = admin(demo_dir).propose_user_import(
+        p.attributes, actor="master", headline=p.headline(),
+        extra_notes=p.notes)
+    assert "kept UNCHANGED for carol" in change.description
+    assert "1, 2, 3" not in change.description
+
+
+def test_clear_team_ids_removes_them(demo_dir):
+    p = plan(demo_dir, NO_MANAGER_CSV, clear_team_ids=True)
+    assert "self_and_subordinate_ids" not in p.attributes["carol"]
+    assert not any(n.startswith("WARNING: the export has no manager")
+                   for n in p.notes)
+    assert "self_and_subordinate_ids removed (--clear-team-ids): carol" in p.notes
+    # kept workers (not in the export) are never touched
+    assert p.attributes["alice"] == attrs(demo_dir)["alice"]
+    with pytest.raises(UserImportError, match="only for an export without a "
+                                              "manager"):
+        plan(demo_dir, DEMO_CSV, clear_team_ids=True)
+
+
+def test_cli_clear_team_ids(demo_dir):
+    path = group_map_path(demo_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(GROUP_MAP), encoding="utf-8")
+    code, out = cli(demo_dir, NO_MANAGER_CSV, ("--clear-team-ids",))
+    assert code == 0
+    assert "self_and_subordinate_ids" not in attrs(demo_dir)["carol"]
+    with pytest.raises(SystemExit):
+        run(["import-users", "--config-dir", str(demo_dir), "--undo",
+             "--clear-team-ids", "--actor", "master"])
+
+
 def test_remove_missing_refuses_workers_with_personal_rules(demo_dir):
     a = admin(demo_dir)
     a.apply(a.propose_grant(username="dave", table="employees", column="name",

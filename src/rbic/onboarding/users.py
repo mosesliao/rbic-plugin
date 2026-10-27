@@ -395,12 +395,22 @@ def _cycle(manager_of: dict) -> Optional[list]:
 def plan_import(current: dict, parsed: ParsedCsv, group_map: list, *,
                 known_roles: Iterable = (), team_depth: str = "direct",
                 remove_missing: bool = False,
-                rules_by_user: Optional[dict] = None) -> ImportPlan:
+                rules_by_user: Optional[dict] = None,
+                clear_team_ids: bool = False) -> ImportPlan:
     """The new worker_attributes.json for `parsed` applied to `current`
     (see the module doc). Raises UserImportError (row numbers and
-    usernames only)."""
+    usernames only).
+
+    Without a `manager` (or `self_and_subordinate_ids`) column, a worker's
+    existing self_and_subordinate_ids is kept unchanged - and may be
+    stale: the plan warns, and `clear_team_ids` removes it from every
+    worker in the export instead."""
     if team_depth not in TEAM_DEPTHS:
         raise UserImportError(f"team depth must be one of {', '.join(TEAM_DEPTHS)}")
+    if clear_team_ids and (parsed.has_manager or DERIVED in parsed.columns):
+        raise UserImportError(
+            f"--clear-team-ids is only for an export without a manager / "
+            f"{DERIVED} column (with one, {DERIVED} is set from the file)")
     rules_by_user = rules_by_user or {}
     known_roles = set(known_roles)
     masters = {u for u, r in current.items()
@@ -502,8 +512,12 @@ def plan_import(current: dict, parsed: ParsedCsv, group_map: list, *,
         _raise(errors)
 
     covered = {"role", "email", "employee_id", *parsed.attribute_columns}
-    if parsed.has_manager:
+    if parsed.has_manager or clear_team_ids:
         covered.add(DERIVED)
+    stale = [] if DERIVED in covered else sorted(
+        r.username for r in parsed.rows
+        if isinstance(current.get(r.username), dict)
+        and DERIVED in current[r.username])
     multi = []
     new_records = {}
     for row in parsed.rows:
@@ -556,4 +570,17 @@ def plan_import(current: dict, parsed: ParsedCsv, group_map: list, *,
     if kept:
         plan.notes.append("kept, not in the export (pass --remove-missing to "
                           f"remove them): {', '.join(kept)}")
+    if stale:
+        plan.notes.append(
+            f"WARNING: the export has no manager column, so {DERIVED} is "
+            f"kept UNCHANGED for {', '.join(stale)} and may be stale (team "
+            "row filters bind it): include the manager column, or pass "
+            "--clear-team-ids to remove it")
+    if clear_team_ids:
+        cleared = sorted(r.username for r in parsed.rows
+                         if isinstance(current.get(r.username), dict)
+                         and DERIVED in current[r.username])
+        if cleared:
+            plan.notes.append(f"{DERIVED} removed (--clear-team-ids): "
+                              f"{', '.join(cleared)}")
     return plan
