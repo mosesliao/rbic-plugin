@@ -159,8 +159,7 @@ def block_state(cfg, admin: Optional[PolicyAdmin] = None) -> tuple:
     if _without_header(block_body(expected)) != _without_header(body):
         return "edited", ["generated block was edited: it differs from what "
                           "its recorded sources compile to (a hand edit "
-                          "inside the block, or a rule added outside it that "
-                          "duplicates a generated one): run rbic-init compile"]
+                          "inside the block): run rbic-init compile"]
     notes = ["generated block matches its sources"]
     if header[1] != __version__:
         notes.append(f"compiled by rbic {header[1]} (this is {__version__}); "

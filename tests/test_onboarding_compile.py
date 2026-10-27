@@ -12,11 +12,13 @@ from datetime import datetime, timezone
 import pytest
 
 from onboarding_demo import (MANUAL_POLICY, admin, approve_catalog, build_roles,
-                             compile_change, config, load_state, onboard_demo,
-                             save)
+                             compile_and_apply, compile_change, config,
+                             load_state, onboard_demo, save)
 from rbic.admin import CHANGES_HEADER, STALE_MESSAGE
 from rbic.onboarding import catalog_path, roles_path
+from rbic.gate import SQLGate
 from rbic.onboarding.block import (BEGIN_MARKER, END_MARKER,
+                                   GENERATED_DUPLICATE_MESSAGE,
                                    GENERATED_RULE_MESSAGE, BlockError,
                                    find_block, outside_lines,
                                    replace_block)
@@ -239,18 +241,23 @@ def test_malformed_markers_are_refused(text, message):
         build_policy_text(text, GeneratedPolicy(["p, a1, t.c, read"], []))
 
 
-def test_duplicate_of_an_outside_rule_stays_outside():
+def test_duplicate_of_an_outside_rule_is_also_generated_inside():
+    # Review finding: a generated rule left out of the block because a copy
+    # existed outside could be removed by the master bot. Every generated
+    # rule now lives in the block; the outside copy is noted.
     gen = GeneratedPolicy(["# role hr_staff (human)",
                            "p, hr_staff, employees.id, read",
                            "p, hr_staff, employees.name, read"], [])
     text, notes = build_policy_text(OUTSIDE, gen)
     begin, end = find_block(text)
-    block = text.split("\n")[begin:end + 1]
+    lines = text.split("\n")
+    block = lines[begin:end + 1]
     assert "p, hr_staff, employees.name, read\r" in block
-    assert "p, hr_staff, employees.id, read\r" not in block
-    assert notes == ["rule 'p, hr_staff, employees.id, read' already exists in "
-                     "policy.csv outside the rbic-init block; kept there and "
-                     "left out of the block"]
+    assert "p, hr_staff, employees.id, read\r" in block
+    assert "p, hr_staff, employees.id, read\r" in lines[:begin] + lines[end + 1:]
+    assert notes == ["rule 'p, hr_staff, employees.id, read' is also present "
+                     "in policy.csv outside the rbic-init block; the generated "
+                     "copy (inside the block) is authoritative"]
 
 
 # ---- PolicyAdmin: proposals, staleness, apply, undo -----------------------------
@@ -271,9 +278,11 @@ def test_generated_change_records_every_source(demo_dir):
     assert set(gen.sources) == {"catalog", "roles", "schema", "attributes"}
     assert "Effects:" in change.description
     assert "warehouse_worker [users: alice]:" in change.description
-    # the shipped hand-written rules are duplicates: kept outside the block
-    assert "already exists in policy.csv outside the rbic-init block" \
-        in change.description
+    # the shipped hand-written rules are duplicates: generated in the block
+    # too (the block's copy is authoritative)
+    assert ("is also present in policy.csv outside the rbic-init block; the "
+            "generated copy (inside the block) is authoritative"
+            in change.description)
 
 
 @pytest.mark.parametrize("touch", ["catalog", "roles"])
@@ -373,6 +382,98 @@ def test_master_bot_refuses_to_edit_generated_rules(onboarded, call):
         call(admin(onboarded))
     assert GENERATED_RULE_MESSAGE in str(err.value)
     assert (onboarded / "casbin" / "policy.csv").read_bytes() == before
+
+
+def test_reviewer_scenario_compile_over_hand_written_policy(demo_dir):
+    # Review finding: compile on the hand-written demo policy left
+    # `p2, hr_staff, employees, dept = '{dept}'` outside the block (it
+    # already existed there); propose_remove_row_scope then removed the only
+    # copy and carol (hr_manager, inherits hr_staff) read every salary.
+    approve_catalog(demo_dir)
+    build_roles(demo_dir)
+    compile_and_apply(demo_dir)
+    text = (demo_dir / "casbin" / "policy.csv").read_text(encoding="utf-8")
+    begin, end = find_block(text)
+    rule = "p2, hr_staff, employees, dept = '{dept}'"
+    lines = text.split("\n")
+    assert rule in lines[begin:end + 1] and rule in lines[:begin]
+    before = (demo_dir / "casbin" / "policy.csv").read_bytes()
+    with pytest.raises(ValueError) as err:
+        admin(demo_dir).propose_remove_row_scope(
+            role="hr_staff", table="employees",
+            filter_template="dept = '{dept}'", actor="master")
+    assert GENERATED_DUPLICATE_MESSAGE in str(err.value)
+    assert "rbic-init compile" in str(err.value)
+    assert (demo_dir / "casbin" / "policy.csv").read_bytes() == before
+    gate = SQLGate.from_config(config(demo_dir))
+    sql = gate.authorize("carol", "SELECT name, salary FROM employees")
+    assert "dept = 'engineering'" in sql
+    # and the outside copy alone, removed by hand, changes nothing either
+    kept = [l for i, l in enumerate(lines) if not (i < begin and l == rule)]
+    (demo_dir / "casbin" / "policy.csv").write_text("\n".join(kept),
+                                                    encoding="utf-8")
+    assert "dept = 'engineering'" in SQLGate.from_config(config(demo_dir)) \
+        .authorize("carol", "SELECT name, salary FROM employees")
+
+
+@pytest.mark.parametrize("call", [
+    lambda a: a.propose_revoke(role="hr_staff", table="employees",
+                               column="name", actor="master"),
+    lambda a: a.propose_remove_row_scope(role="hr_staff", table="employees",
+                                         filter_template="dept = '{dept}'",
+                                         actor="master"),
+    lambda a: a.propose_remove_inherit("hr_manager", "hr_staff", actor="master"),
+    lambda a: a.propose_remove_row_scope(
+        role="warehouse_worker", table="inventory",
+        filter_template="warehouse_id = '{site}'", actor="master"),
+])
+def test_master_bot_refuses_to_remove_outside_copies_of_generated_rules(
+        onboarded, call):
+    # onboarded: only the manual section outside the block; add hand-written
+    # copies of generated rules outside it, then try to remove them
+    path = onboarded / "casbin" / "policy.csv"
+    text = path.read_text(encoding="utf-8")
+    copies = ("p, hr_staff, employees.name, read\n"
+              "p2, hr_staff, employees, dept = '{dept}'\n"
+              "g, hr_manager, hr_staff\n"
+              "p2, warehouse_worker, inventory, warehouse_id = '{site}'\n")
+    path.write_text(copies + text, encoding="utf-8")
+    before = path.read_bytes()
+    with pytest.raises(ValueError) as err:
+        call(admin(onboarded))
+    assert GENERATED_DUPLICATE_MESSAGE in str(err.value)
+    assert path.read_bytes() == before
+
+
+def test_duplicate_rules_are_harmless_to_the_gate(onboarded):
+    path = onboarded / "casbin" / "policy.csv"
+    text = path.read_text(encoding="utf-8")
+    queries = [("bob", "SELECT name FROM employees"),
+               ("carol", "SELECT employee_id, salary FROM payroll"),
+               ("alice", "SELECT sku FROM inventory"),
+               ("alice", "SELECT name, salary FROM employees")]
+    gate = SQLGate.from_config(config(onboarded))
+    want = [gate.authorize(u, q) for u, q in queries]
+    begin, end = find_block(text)
+    body = [l for l in text.split("\n")[begin + 1:end] if l and l[0] != "#"]
+    path.write_text(text + "\n".join(body) + "\n", encoding="utf-8")
+    gate = SQLGate.from_config(config(onboarded))
+    assert [gate.authorize(u, q) for u, q in queries] == want
+
+
+def test_undo_may_not_remove_an_outside_copy_of_a_generated_rule(onboarded):
+    # A master-bot change whose undo would drop a hand-written copy of a
+    # generated rule (the copy was added in the same change's after-state
+    # by an earlier hand edit is impossible - undo checks the sha - so the
+    # check is exercised on the helper directly).
+    from rbic.admin import PolicyAdmin
+    text = (onboarded / "casbin" / "policy.csv").read_text(encoding="utf-8")
+    rule = "p2, hr_staff, employees, dept = '{dept}'"
+    current = rule + "\n" + text
+    with pytest.raises(ValueError, match="the undo would remove"):
+        PolicyAdmin._check_undo_keeps_generated(current, text)
+    PolicyAdmin._check_undo_keeps_generated(text, text)
+    PolicyAdmin._check_undo_keeps_generated(current, current)
 
 
 def test_master_bot_additions_go_to_the_master_section(onboarded):

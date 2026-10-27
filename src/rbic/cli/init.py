@@ -487,7 +487,9 @@ def cmd_compile(args, input_fn, output):
     rules = sum(1 for line in generated.body if not line.startswith("#"))
     output(f"Compiled {rules} rule(s) for {len(generated.roles)} role(s) from "
            "approved catalog columns and roles.json.")
-    for w in (*notes, *generated.warnings):
+    for n in notes:
+        output(f"info: {n}")
+    for w in generated.warnings:
         output(f"warning: {w}")
     if after == before:
         output("policy.csv already holds exactly this compiled policy; "

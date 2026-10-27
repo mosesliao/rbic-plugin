@@ -69,7 +69,8 @@ from .gate import (
     load_snapshot, parse_scope_columns, subjects_for, user_subject,
 )
 from .onboarding import CATALOG_FILE, ONBOARDING_DIR, ROLES_FILE
-from .onboarding.block import (GENERATED_RULE_MESSAGE, BlockError,
+from .onboarding.block import (GENERATED_DUPLICATE_MESSAGE,
+                               GENERATED_RULE_MESSAGE, BlockError,
                                block_line_indexes)
 from .onboarding.schema import diff_schema
 
@@ -838,11 +839,42 @@ class PolicyAdmin:
         hits = {i for i, l in enumerate(lines) if _casbin_tokens(l) == fields}
         if not hits:
             raise ValueError("No such rule in policy.csv.")
-        if hits & cls._block(text):
+        inside = hits & cls._block(text)
+        if inside == hits:
             # The onboarding sources own the block: an edit here would be
             # silently reverted by the next compile.
             raise ValueError(f"Refused: {GENERATED_RULE_MESSAGE}.")
+        if inside:
+            # A hand-written copy outside the block of a generated rule:
+            # removing it would change nothing (the block's copy stays in
+            # force), so refuse rather than suggest access changed.
+            raise ValueError(f"Refused: {GENERATED_DUPLICATE_MESSAGE}.")
         return "".join(l for i, l in enumerate(lines) if i not in hits)
+
+    @classmethod
+    def _check_undo_keeps_generated(cls, current: str, restored: str) -> None:
+        """An undo of a non-compile change may not remove a line outside
+        the block that duplicates a generated rule (_remove_line's rule)."""
+        def split(text):
+            block = cls._block(text)
+            inside, outside = set(), []
+            for i, line in enumerate(_lines(text)):
+                tokens = _casbin_tokens(line)
+                if tokens:
+                    if i in block:
+                        inside.add(tuple(tokens))
+                    else:
+                        outside.append(tuple(tokens))
+            return inside, outside
+
+        generated, now_outside = split(current)
+        _, then_outside = split(restored)
+        for rule in now_outside:
+            if rule in generated and now_outside.count(rule) > \
+                    then_outside.count(rule):
+                raise ValueError(f"Refused: the undo would remove "
+                                 f"'{', '.join(rule)}': "
+                                 f"{GENERATED_DUPLICATE_MESSAGE}.")
 
     def _rules(self, text: str) -> list:
         return [t for t in map(_casbin_tokens, _lines(text)) if t]
@@ -1684,6 +1716,8 @@ class PolicyAdmin:
             raise ValueError(f"The last change ({last['id']}, {last['kind']}) "
                              "is not a user import; undo it with rbic-master.")
         if target == self.policy_path:
+            if last.get("kind") != "generated_policy":
+                self._check_undo_keeps_generated(current, restored)
             notes = ([SOURCES_NOT_REVERTED]
                      if last.get("kind") == "generated_policy" else [])
             change = self._policy_change("undo", actor, headline, current,

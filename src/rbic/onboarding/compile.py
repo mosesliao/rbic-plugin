@@ -311,22 +311,25 @@ def build_policy_text(policy_text: str, generated: GeneratedPolicy) -> tuple:
     """(new policy.csv text, notes): `policy_text` with its rbic-init block
     replaced by `generated` (or a new block inserted before the master
     chatbot's section, else at the end). Lines outside the block are kept
-    byte for byte; a generated rule that already exists outside the block
-    stays there and is left out of the block (noted). Raises BlockError
-    on malformed markers."""
+    byte for byte. EVERY generated rule is written inside the block, even
+    when an identical line exists outside it (a rule listed twice means
+    the same as once to Casbin and the gate): the block's copy is the
+    authoritative one, which the master bot can never remove, so removing
+    the outside copy can never take away what the onboarding sources
+    grant or limit. Such duplicates are noted. Raises BlockError on
+    malformed markers."""
     find_block(policy_text)  # malformed markers: refuse before anything
     outside = {tuple(t) for t in map(_casbin_tokens, outside_lines(policy_text))
                if t}
-    notes, body = [], []
+    notes = []
     for line in generated.body:
         tokens = _casbin_tokens(line)
         if tokens and tuple(tokens) in outside:
-            notes.append(f"rule '{line}' already exists in policy.csv outside "
-                         "the rbic-init block; kept there and left out of the "
-                         "block")
-            continue
-        body.append(line)
-    return replace_block(policy_text, body, before_header=CHANGES_HEADER), notes
+            notes.append(f"rule '{line}' is also present in policy.csv outside "
+                         "the rbic-init block; the generated copy (inside the "
+                         "block) is authoritative")
+    return (replace_block(policy_text, list(generated.body),
+                          before_header=CHANGES_HEADER), notes)
 
 
 def source_paths(config_dir, schema_path, attributes_path) -> dict:

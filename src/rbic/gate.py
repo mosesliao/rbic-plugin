@@ -1073,6 +1073,17 @@ class _BytesPolicyAdapter(Adapter):
     def load_policy(self, model):
         for raw in self._data.split(b"\n"):
             load_policy_line(raw.decode().strip(), model)
+        # A rule listed twice (e.g. a hand-written copy of a rule the
+        # rbic-init block also generates) means the same as once: keep the
+        # first, so decisions and rewritten SQL never depend on duplicates.
+        for sec in ("p", "g"):
+            for ast in model.model.get(sec, {}).values():
+                seen, unique = set(), []
+                for rule in ast.policy:
+                    if tuple(rule) not in seen:
+                        seen.add(tuple(rule))
+                        unique.append(rule)
+                ast.policy[:] = unique
 
     def save_policy(self, model):
         raise NotImplementedError("the gate never writes policy")
@@ -1128,7 +1139,7 @@ def load_snapshot(model_bytes: bytes, policy_bytes: bytes,
     a policy Casbin can't load, attributes or a schema that aren't JSON,
     and everything compile_snapshot refuses (schema shape, arity, user
     subjects, master, unsafe filters, invalid or duplicate emails,
-    duplicate employee_ids).
+    duplicate employee_ids). A rule listed twice counts once.
     """
     if not isinstance(schema_bytes, (bytes, bytearray)):
         raise TypeError("load_snapshot takes db_schema.json's bytes")
