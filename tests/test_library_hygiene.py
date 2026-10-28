@@ -61,7 +61,11 @@ def test_scan_covers_the_library():
     names = {p.relative_to(SRC).as_posix() for p in LIBRARY_FILES}
     assert {"__init__.py", "audit.py", "admin.py", "engine.py", "gate.py",
             "master.py", "identity.py", "history.py", "config.py",
-            "demo/seed.py"} <= names
+            "demo/seed.py", "onboarding/__init__.py", "onboarding/catalog.py",
+            "onboarding/schema.py", "onboarding/suggest.py",
+            "onboarding/block.py", "onboarding/compile.py",
+            "onboarding/report.py", "onboarding/roles.py",
+            "onboarding/store.py"} <= names
     assert not any(n.startswith("cli/") for n in names)
 
 

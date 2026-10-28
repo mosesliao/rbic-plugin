@@ -16,6 +16,7 @@ import pytest
 from rbic import DENY_MESSAGE
 from rbic.cli import chat as chat_cli
 from rbic.cli import gate_demo, seed as seed_cli
+from rbic.cli import init as init_cli
 from rbic.cli import master as master_cli
 from rbic.gate import SQLGate
 from test_engine import SALARY_Q, A, FakeClient, U, end_turn, tool_use
@@ -27,7 +28,8 @@ from test_master_policy import tool_use as master_tool_use
 logging.disable(logging.CRITICAL)
 
 CLI_MODULES = [("rbic-chat", chat_cli), ("rbic-master", master_cli),
-               ("rbic-gate-demo", gate_demo), ("rbic-seed", seed_cli)]
+               ("rbic-gate-demo", gate_demo), ("rbic-seed", seed_cli),
+               ("rbic-init", init_cli)]
 
 
 # ---- rbic-chat ---------------------------------------------------------------

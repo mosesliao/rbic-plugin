@@ -1,8 +1,11 @@
 # RBIC plugin plan: core package, Open WebUI plugin, onboarding toolkit
 
 - **Date:** 2026-10-21
-- **Status:** approved plan. Phase 1 is merged. Phase 2 (Open WebUI plugin) is implemented on branch
-  `feat/openwebui-pipe` (`integrations/openwebui/`); see `CLAUDE.md` for where it differs from section 5.
+- **Status:** approved plan. Phase 1 is merged (PR #3). Phase 2 (Open WebUI
+  plugin, `integrations/openwebui/`) is done and merged (PR #4); see
+  `CLAUDE.md` for where it differs from section 5. Phase 3 (onboarding
+  toolkit) is implemented on `feat/onboarding-toolkit` (section 6.6;
+  guide: `docs/onboarding.md`).
 
 This document records the agreed plan for turning the RBIC gate and chatbot
 into a reusable plugin. It is written for the project owner and for future
@@ -35,6 +38,23 @@ in `CLAUDE.md` must not weaken.
 | Open WebUI admins | Accepted as fully trusted. They can edit in-process function code and can read the configuration, the database and the API key. |
 | Distribution | Publish to PyPI. |
 | Database | Stay on the SQLite demo. A least-privilege Postgres executor is out of scope (about 2–3 days if added later). |
+| Chat platforms (2026-10-27) | Open WebUI first (Phase 2, merged). LibreChat second (section 2.1). Zulip and HuggingChat chat-ui are later options. Chainlit and Flowise are archived (as of 2026-08) and not pursued. |
+
+### 2.1 LibreChat (second platform, not yet scheduled)
+
+- **Adapter:** a small, reusable OpenAI-compatible server around
+  `RBICEngine.ask()` (one model, non-streaming is acceptable), registered
+  in LibreChat as a custom endpoint. About 4–6 engineer-days. The same
+  server can serve later OpenAI-compatible hosts.
+- **Identity:** preferably an IdP-issued token that the server verifies
+  against the IdP's JWKS (issuer, audience, expiry); otherwise LibreChat's
+  server-side header placeholders (user id and email), which are only
+  trustworthy together with the transport rules below.
+- **Transport:** a shared secret between LibreChat and the server, and a
+  private network only; the server is never reachable by users directly.
+- **Hardening:** disable shared links, conversation titles and memory for
+  this endpoint (each would resend or persist answers outside `ask()`; see
+  Host requirements in `CLAUDE.md`). Require LibreChat ≥ 0.8.3.
 
 ---
 
@@ -376,6 +396,36 @@ no access.
 - Each organization needs a data owner (the "master").
 - Larger organizations may need the policy stored in a database (a Casbin
   adapter) instead of a CSV file.
+
+### 6.6 Implementation (implemented on `feat/onboarding-toolkit`)
+
+The toolkit proposes; the organization's policy owner (a master user)
+approves. Every security invariant applies to it: unapproved columns grant
+nothing, it never writes a policy the gate would refuse, policy writes go
+through `PolicyAdmin` (lock, input hashes, changelog before replace) after
+an explicit yes, and no data value is ever sent to an LLM or written to a
+log.
+
+- **Sources:** `<config_dir>/onboarding/` holds human-editable JSON:
+  `catalog.json` (column → category, with status and evidence) and
+  `roles.json` (roles × categories grid, inheritance, row ownership, starter
+  packs used). The compiled rules live in a marked block of `policy.csv`
+  (`# ---- BEGIN rbic init (generated; edit onboarding/*.json and re-run
+  rbic-init compile) ----` … `# ---- END rbic init ----`); master-bot
+  changes stay in their own section, so recompiling only replaces the
+  generated block, and the master bot refuses to edit generated lines.
+- **CLI:** `rbic-init` with subcommands.
+  1. Step 1: `schema` (introspect, diff, validated write), `suggest`
+     (local name/value rules into `catalog.json`), `status`, `approve` /
+     `reject`.
+  2. Step 2 (done): `roles` (show, packs, add-pack, set, scope, remove),
+     starter packs (hr, finance, warehouse, staff_self_service,
+     people_manager), `compile` (approved columns only, named columns,
+     never `table.*`), `report`, apply through PolicyAdmin. It reproduces
+     the demo policy decision for decision.
+  3. Step 3 (done): `import-users` (IdP/HR CSV + group map), `drift`
+     (exit 0/1/2), high-sensitivity all-rows refusal, block/source
+     fingerprint, `docs/onboarding.md`.
 
 ---
 

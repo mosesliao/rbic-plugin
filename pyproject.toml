@@ -27,6 +27,7 @@ rbic-chat = "rbic.cli.chat:main"
 rbic-master = "rbic.cli.master:main"
 rbic-gate-demo = "rbic.cli.gate_demo:main"
 rbic-seed = "rbic.cli.seed:main"
+rbic-init = "rbic.cli.init:main"
 
 [tool.hatch.version]
 path = "src/rbic/__init__.py"
@@ -36,7 +37,7 @@ packages = ["src/rbic"]
 
 [tool.hatch.build.targets.sdist]
 include = ["/src/rbic", "/tests", "/examples", "/integrations", "/README.md", "/pyproject.toml"]
-exclude = ["company.db", "policy_changes.jsonl", ".policy.lock", ".env"]
+exclude = ["company.db", "policy_changes.jsonl", ".policy.lock", ".onboarding.lock", "access-report.md", ".env"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

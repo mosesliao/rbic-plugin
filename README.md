@@ -111,7 +111,7 @@ rbic-chat --config-dir examples/demo dave    # finance_analyst, dept logistics
 ```
 
 Type `exit` to quit. Every command takes `--help`; `rbic-chat`,
-`rbic-master` and `rbic-gate-demo` also take `--audit-log PATH` to append
+`rbic-master`, `rbic-gate-demo` and `rbic-init` also take `--audit-log PATH` to append
 the audit records as JSON lines. Each command also runs as a module, e.g.
 `python -m rbic.cli.chat --config-dir examples/demo alice`.
 
@@ -121,6 +121,7 @@ the audit records as JSON lines. Each command also runs as a module, e.g.
 | `rbic-master USER` | `rbic.cli.master` | change access policy by chatting (master users only) |
 | `rbic-gate-demo` | `rbic.cli.gate_demo` | gate decisions for fixed queries, no API key |
 | `rbic-seed` | `rbic.cli.seed` | (re)create the demo SQLite database |
+| `rbic-init COMMAND` | `rbic.cli.init` | onboarding: introspect the schema, suggest column categories, record approvals, define roles, import workers, compile policy.csv, access report, drift check (`schema`, `suggest`, `status`, `approve`, `reject`, `roles`, `import-users`, `compile`, `report`, `drift`) |
 
 ### Demo users
 
@@ -245,6 +246,61 @@ covers:
 - SSO recipes for Microsoft Entra ID, Google Workspace and generic OIDC
 - the admin hardening checklist
 - a manual end-to-end test script
+
+---
+
+## Onboarding an organization (rbic-init)
+
+`rbic-init` builds `policy.csv` from your database instead of by hand. The
+toolkit proposes; a master user approves every write (`Apply? [yes/no]`).
+Columns nobody approved stay hidden from everyone. **The full guide for a
+new organization is [docs/onboarding.md](docs/onboarding.md)**: CSV and
+group-map formats, the fail-closed rules, what to review before signing
+the access report, and running `drift` nightly.
+
+```bash
+D=examples/demo   # or your own config directory
+rbic-init schema   --config-dir $D                         # db_schema.json vs the database
+rbic-init suggest  --config-dir $D                         # a category per column (local rules, no LLM)
+rbic-init approve  --config-dir $D --actor master --all-suggested   # or COLUMN [CATEGORY]
+rbic-init roles packs    --config-dir $D                   # list the starter packs
+rbic-init roles add-pack staff_self_service --config-dir $D --actor master
+rbic-init roles add-pack hr --config-dir $D --actor master # also: finance, warehouse, people_manager
+rbic-init roles set hr_staff --inherits employee --config-dir $D --actor master
+rbic-init roles scope hr_staff trainings "dept = '{dept}'" --config-dir $D --actor master
+rbic-init import-users --config-dir $D --csv hr_export.csv --actor master   # workers from the IdP / HR export
+rbic-init compile  --config-dir $D --actor master          # warnings, access report, diff, yes/no
+rbic-init report   --config-dir $D                         # access report for the live policy
+rbic-init drift    --config-dir $D [--json]                # exit 0 clean / 1 drift / 2 error
+```
+
+- `onboarding/catalog.json` (column → category, approval) and
+  `onboarding/roles.json` (roles × categories, inheritance, row scopes) are
+  the sources; edit them with the commands above.
+- Starter packs scope rows by column name (e.g. `dept = '{dept}'` on every
+  table with a `dept` column) and report the tables they had to skip.
+- `compile` writes one `p` line per approved column (never `table.*`) into
+  the block between `# ---- BEGIN rbic init …` and `# ---- END rbic init ----`
+  in `policy.csv`. Recompiling replaces only that block; hand-written rules
+  and the master chatbot's section are kept. The master chatbot cannot
+  edit generated lines.
+- The access report (`onboarding/access-report.md`) lists, per role, the
+  readable tables and columns, which rows ("rows where dept = the user's
+  dept", **ALL rows** flagged), denies, hidden columns and warnings, as
+  the gate enforces them. It contains usernames and the policy structure
+  (never emails or data): keep it out of version control (`.gitignore`
+  covers `**/onboarding/access-report.md`).
+- `compile` refuses a role that would read a **high-sensitivity** category
+  (e.g. `pay`) on ALL rows of a table unless you add a row scope or record
+  why with `rbic-init roles all-rows ROLE TABLE --reason "..."`.
+- `import-users` is the HR / IdP channel, the only one that may set
+  emails. Roles come from IdP groups through `onboarding/group_map.json`.
+  A worker in no mapped group gets no role and is denied. Its summary masks
+  emails (`<email set>`). Try it with the fake export in
+  `examples/demo/onboarding-sample/`.
+- `status` and `drift` report a generated block that is out of date, was
+  edited by hand, or was undone (the block records a fingerprint of the
+  sources it was compiled from).
 
 ---
 
@@ -431,7 +487,9 @@ src/rbic/config.py            configuration resolution (args > RBIC_* env > defa
 src/rbic/master.py            master chatbot: tools, propose, human confirms (no terminal I/O)
 src/rbic/admin.py             validated, atomic, audited policy/attribute editor
 src/rbic/demo/seed.py         demo database schema and rows
-src/rbic/cli/                 rbic-chat, rbic-master, rbic-gate-demo, rbic-seed (all terminal I/O)
+src/rbic/onboarding/          rbic-init library: schema, catalog.json, suggestions, roles.json, compiler, access report
+src/rbic/onboarding/packs/    starter packs (hr, finance, warehouse, staff_self_service, people_manager)
+src/rbic/cli/                 rbic-chat, rbic-master, rbic-gate-demo, rbic-seed, rbic-init (all terminal I/O)
 examples/demo/casbin/model.conf   Casbin model (RBAC matcher + p2 ABAC definition)
 examples/demo/casbin/policy.csv   grants, role hierarchy, row-filter templates
 examples/demo/db_schema.json      table → columns; unknown tables/columns are denied

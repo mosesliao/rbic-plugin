@@ -831,7 +831,8 @@ def compile_snapshot(version: int, enforcer: casbin.Enforcer, attributes,
     malformed rule arity, a model.conf without p3/p4, a user subject that
     is not a known non-master worker, a g row whose parent is a user
     subject, or a row filter compile_row_filter rejects, an invalid
-    worker email, or two workers sharing an email. Called by
+    worker email, two workers sharing an email, or two workers sharing an
+    employee_id. Called by
     load_snapshot, the loader the gate and PolicyAdmin share.
 
     `fingerprint` identifies the exact file bytes the snapshot was built
@@ -845,6 +846,7 @@ def compile_snapshot(version: int, enforcer: casbin.Enforcer, attributes,
         raise ValueError("worker attributes must map username -> object")
     schema = check_schema(schema)
     check_worker_emails(attributes)
+    check_worker_employee_ids(attributes)
     for ptype in (PTYPE_DENY_COLUMNS, PTYPE_DENY_ROWS):
         if ptype not in enforcer.model.model["p"]:
             raise ValueError(f"model.conf does not define {ptype} (deny rules)")
@@ -1009,6 +1011,43 @@ def check_worker_emails(attributes: dict) -> None:
         seen[key] = username
 
 
+EMPLOYEE_ID = "employee_id"
+
+
+def _employee_id_key(value):
+    """What a row filter compares an employee_id as: a number for an int
+    or an all-digits string (a bare {employee_id} binds a number, and
+    SQLite's affinity makes '2' = 2 on an integer column), else the value
+    itself."""
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, str) and _INT_RE.fullmatch(value.strip(" \t")):
+        return int(value.strip(" \t"))
+    return ("other", repr(value))
+
+
+def check_worker_employee_ids(attributes) -> None:
+    """`employee_id` is optional per worker; when present it must be unique
+    (compared as a row filter compares it: 2, "2" and "02" are the same).
+    Row filters such as `employee_id = '{employee_id}'` are bound from it,
+    so two workers sharing one would read each other's rows (payslips):
+    the whole load fails instead (deny everyone), like a shared email.
+    The message names the workers, never the value."""
+    seen: dict = {}
+    for username, record in attributes.items():
+        if EMPLOYEE_ID not in record:
+            continue
+        key = _employee_id_key(record[EMPLOYEE_ID])
+        if key in seen:
+            raise ValueError(f"workers {seen[key]!r} and {username!r} share "
+                             f"the same {EMPLOYEE_ID} ({EMPLOYEE_ID}s must be "
+                             "unique: row filters bound from it would let "
+                             "each read the other's rows)")
+        seen[key] = username
+
+
 def policy_fingerprint(model_bytes: bytes, policy_bytes: bytes,
                        attributes_bytes: bytes, schema_bytes: bytes) -> str:
     """sha256 over the exact bytes of model.conf, policy.csv,
@@ -1034,6 +1073,17 @@ class _BytesPolicyAdapter(Adapter):
     def load_policy(self, model):
         for raw in self._data.split(b"\n"):
             load_policy_line(raw.decode().strip(), model)
+        # A rule listed twice (e.g. a hand-written copy of a rule the
+        # rbic-init block also generates) means the same as once: keep the
+        # first, so decisions and rewritten SQL never depend on duplicates.
+        for sec in ("p", "g"):
+            for ast in model.model.get(sec, {}).values():
+                seen, unique = set(), []
+                for rule in ast.policy:
+                    if tuple(rule) not in seen:
+                        seen.add(tuple(rule))
+                        unique.append(rule)
+                ast.policy[:] = unique
 
     def save_policy(self, model):
         raise NotImplementedError("the gate never writes policy")
@@ -1088,7 +1138,8 @@ def load_snapshot(model_bytes: bytes, policy_bytes: bytes,
     gate refuses to serve: a lone CR or unknown ptype (check_policy_bytes),
     a policy Casbin can't load, attributes or a schema that aren't JSON,
     and everything compile_snapshot refuses (schema shape, arity, user
-    subjects, master, unsafe filters, invalid or duplicate emails).
+    subjects, master, unsafe filters, invalid or duplicate emails,
+    duplicate employee_ids). A rule listed twice counts once.
     """
     if not isinstance(schema_bytes, (bytes, bytearray)):
         raise TypeError("load_snapshot takes db_schema.json's bytes")

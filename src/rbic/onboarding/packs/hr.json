@@ -1,0 +1,32 @@
+{
+  "format": 1,
+  "name": "hr",
+  "version": "1",
+  "description": "HR staff (directory, leave, training for their department) and HR managers (plus pay for their team).",
+  "roles": {
+    "hr_staff": {
+      "description": "HR staff: the people directory, leave and training records of their own department.",
+      "categories": ["directory", "leave", "training"],
+      "inherits": [],
+      "row_scopes": [
+        {
+          "ownership_columns": ["dept", "department"],
+          "template": "$column = '{dept}'",
+          "explain": "rows of the user's own department (attribute dept)"
+        }
+      ]
+    },
+    "hr_manager": {
+      "description": "HR managers: everything HR staff see, plus pay for themselves and their team.",
+      "categories": ["pay"],
+      "inherits": ["hr_staff"],
+      "row_scopes": [
+        {
+          "ownership_columns": ["employee_id"],
+          "template": "$column IN ({self_and_subordinate_ids})",
+          "explain": "pay rows of the user and their team (attribute self_and_subordinate_ids: a comma-separated list of employee ids)"
+        }
+      ]
+    }
+  }
+}

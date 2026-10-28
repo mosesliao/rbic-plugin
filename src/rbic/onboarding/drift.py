@@ -1,0 +1,392 @@
+"""`rbic-init drift`: has the deployment drifted from what was approved?
+
+Checks (each "ok", "drift" or "skipped"; findings name tables, columns,
+roles and usernames only - never a data value or an email):
+- schema: the live database (introspected read-only, catalog only) vs
+  db_schema.json (diff_schema).
+- catalog: columns with no approved category and catalog entries for
+  columns that no longer exist. A column that is not approved (unlabelled,
+  suggested or rejected) but that some role or user CAN read - through a
+  rule outside the generated block, e.g. a hand-written `inventory.*`
+  grant, computed from the gate's snapshot as the access report does -
+  is drift naming who reads it; otherwise it is hidden from everyone
+  (rejected and hidden: info).
+- generated_block: the rbic-init block vs its sources (block_state):
+  out of date, edited by hand, undone, missing, malformed.
+- roles: roles.json entries naming categories, tables, columns or parent
+  roles that no longer exist (or templates that no longer compile).
+- workers: workers with no role (denied everything) or a role no policy
+  rule mentions, roles no worker holds, and a policy that does not load.
+
+Exit codes (rbic-init drift): 0 clean, 1 drift found, 2 error (the check
+itself could not run, e.g. the database is missing) - for cron / CI.
+
+Library code: no terminal I/O.
+"""
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+from ..admin import MASTER_ROLE, PolicyAdmin
+from ..gate import FilterError, check_schema, compile_row_filter, load_snapshot
+from . import catalog_path, roles_path
+from .block import BlockError
+from .catalog import CatalogError, parse_catalog
+from .compile import (CompileError, block_body, block_header,
+                      build_policy_text, compile_from_files,
+                      current_fingerprint, HEADER_RE)
+from .report import readable_from_files
+from .roles import Roles, RolesError, _role
+from .schema import diff_schema, introspect_sqlite
+
+CHECKS = ("schema", "catalog", "generated_block", "roles", "workers")
+READABLE_VIA = '(through a rule that does not come from approved catalog columns: a hand-written rule such as a table.* grant, or an out-of-date generated block)'
+OK, DRIFT, SKIPPED, ERROR = "ok", "drift", "skipped", "error"
+# block_state() states that are not drift
+IN_SYNC, NOT_ONBOARDED = "in_sync", "not_onboarded"
+
+
+@dataclass
+class Check:
+    name: str
+    status: str = OK
+    findings: list = field(default_factory=list)   # drift
+    info: list = field(default_factory=list)       # not drift
+
+    def drift(self, message: str) -> None:
+        self.findings.append(message)
+        if self.status == OK:
+            self.status = DRIFT
+
+    def to_json(self) -> dict:
+        return {"name": self.name, "status": self.status,
+                "findings": list(self.findings), "info": list(self.info)}
+
+
+@dataclass
+class DriftReport:
+    checks: list = field(default_factory=list)
+
+    @property
+    def status(self) -> str:
+        states = {c.status for c in self.checks}
+        if ERROR in states:
+            return "error"
+        return "drift" if DRIFT in states else "clean"
+
+    @property
+    def exit_code(self) -> int:
+        return {"clean": 0, "drift": 1, "error": 2}[self.status]
+
+    def to_json(self) -> dict:
+        return {"status": self.status, "exit_code": self.exit_code,
+                "checks": [c.to_json() for c in self.checks]}
+
+    def lines(self) -> list:
+        out = []
+        for c in self.checks:
+            out.append(f"[{c.status.upper()}] {c.name}")
+            out += [f"  - {f}" for f in c.findings]
+            out += [f"  . {i}" for i in c.info]
+        out.append(f"Result: {self.status} (exit {self.exit_code})")
+        return out
+
+
+# ----------------------------------------------------------------------
+# the generated block vs its sources
+# ----------------------------------------------------------------------
+
+def _last_compile(admin: PolicyAdmin) -> tuple:
+    """(id of the last applied generated_policy change, whether an applied
+    undo reverted it)."""
+    try:
+        entries = admin._applied()
+    except (OSError, ValueError):
+        return None, False
+    compiles = [e for e in entries if e.get("kind") == "generated_policy"]
+    if not compiles:
+        return None, False
+    last = compiles[-1]["id"]
+    return last, any(e.get("kind") == "undo" and e.get("undoes") == last
+                     for e in entries)
+
+
+def _without_header(body: Optional[list]) -> list:
+    return [l for l in body or [] if not HEADER_RE.fullmatch(l.strip())]
+
+
+def block_state(cfg, admin: Optional[PolicyAdmin] = None) -> tuple:
+    """(state, [messages]) of policy.csv's rbic-init block vs the
+    onboarding sources: in_sync, not_onboarded, missing, malformed,
+    edited, out_of_date, undone or stale_compile."""
+    from .. import __version__
+    admin = admin or PolicyAdmin.from_config(cfg)
+    if not (catalog_path(cfg.config_dir).exists()
+            and roles_path(cfg.config_dir).exists()):
+        return NOT_ONBOARDED, ["no onboarding/catalog.json and roles.json: "
+                               "nothing is generated by rbic-init here"]
+    with open(cfg.policy_path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    try:
+        body = block_body(text)
+        header = block_header(text)
+    except BlockError as err:
+        return "malformed", [f"policy.csv: {err}"]
+    last, undone = _last_compile(admin)
+    undo_note = (f"the last compile (change {last}) was undone; the "
+                 "onboarding sources were not reverted" if undone else None)
+    if body is None:
+        return ("undone" if undone else "missing"), [
+            "policy.csv has no rbic-init block"
+            + (f" - {undo_note}" if undo_note else "")
+            + ": run rbic-init compile"]
+    if header is None:
+        return "edited", ["the generated block has no sources header (edited "
+                          "by hand, or compiled by an older rbic-init): run "
+                          "rbic-init compile"]
+    fingerprint = current_fingerprint(cfg.config_dir, cfg.schema_path)
+    if header[0] != fingerprint:
+        if undone:
+            return "undone", [f"generated block is out of date - {undo_note}: "
+                              "change them or run rbic-init compile"]
+        return "out_of_date", ["generated block is out of date: "
+                               "onboarding/catalog.json, roles.json or "
+                               "db_schema.json changed since it was compiled: "
+                               "review and run rbic-init compile"]
+    try:
+        generated = compile_from_files(cfg.config_dir, cfg.schema_path,
+                                       cfg.attributes_path)
+        expected, _ = build_policy_text(text, generated)
+    except (CompileError, CatalogError, RolesError, ValueError) as err:
+        return "stale_compile", [f"the recorded sources no longer compile: "
+                                 f"{err}"]
+    if _without_header(block_body(expected)) != _without_header(body):
+        return "edited", ["generated block was edited: it differs from what "
+                          "its recorded sources compile to (a hand edit "
+                          "inside the block): run rbic-init compile"]
+    notes = ["generated block matches its sources"]
+    if header[1] != __version__:
+        notes.append(f"compiled by rbic {header[1]} (this is {__version__}); "
+                     "a compile would only refresh the header")
+    return IN_SYNC, notes
+
+
+# ----------------------------------------------------------------------
+# the checks
+# ----------------------------------------------------------------------
+
+def _schema_check(cfg, schema: dict, db_path) -> Check:
+    c = Check("schema")
+    try:
+        found = introspect_sqlite(db_path or cfg.db_path, [])
+    except FileNotFoundError as err:
+        c.status = ERROR
+        c.findings.append(f"cannot introspect the database: {err}")
+        return c
+    diff = diff_schema(schema, found)
+    if diff.empty:
+        c.info.append("db_schema.json matches the database")
+    for line in diff.lines(found):
+        c.drift(f"db_schema.json vs database: {line}")
+    return c
+
+
+def _read_catalog(cfg):
+    path = catalog_path(cfg.config_dir)
+    if not path.exists():
+        return None
+    return parse_catalog(path.read_text(encoding="utf-8"))
+
+
+def _readers(cfg) -> Optional[dict]:
+    """readable_columns of the live policy, or None when it does not load
+    (then the gate denies everyone; the workers check says so)."""
+    try:
+        return readable_from_files(
+            Path(cfg.model_path).read_bytes(), Path(cfg.policy_path).read_bytes(),
+            Path(cfg.attributes_path).read_bytes(),
+            Path(cfg.schema_path).read_bytes(), dialect=cfg.dialect)
+    except Exception:  # noqa: BLE001 - whatever the gate refuses
+        return None
+
+
+def _catalog_check(cfg, schema: dict, catalog) -> Check:
+    c = Check("catalog")
+    if catalog is None:
+        c.status = SKIPPED
+        c.info.append("no onboarding/catalog.json")
+        return c
+    for key in sorted(catalog.columns):
+        table, _, column = key.partition(".")
+        if column not in schema.get(table, {}):
+            c.drift(f"{key}: catalog entry for a column that no longer exists "
+                    "in db_schema.json")
+    readers = _readers(cfg) or {}
+    rejected = []
+    for table, cols in schema.items():
+        for col in cols:
+            e = catalog.columns.get(f"{table}.{col}")
+            who = readers.get((table, col))
+            if e is None or e.status == "suggested":
+                state = ("unlabelled" if e is None else
+                         f"suggested ({e.category or 'no category'}), not "
+                         "approved")
+                if who:
+                    c.drift(f"{table}.{col}: {state} - but READABLE by "
+                            f"{', '.join(who)} {READABLE_VIA}: approve or "
+                            "reject it, and remove that rule if it should be "
+                            "hidden")
+                elif e is None:
+                    c.drift(f"{table}.{col}: unlabelled - hidden from everyone "
+                            "until approved")
+                else:
+                    c.drift(f"{table}.{col}: {state} - hidden from everyone")
+            elif e.status == "rejected":
+                if who:
+                    c.drift(f"{table}.{col}: rejected in catalog.json - but "
+                            f"READABLE by {', '.join(who)} {READABLE_VIA}: "
+                            "remove that rule")
+                else:
+                    rejected.append(f"{table}.{col}")
+    if rejected:
+        c.info.append("rejected (hidden from everyone by decision): "
+                      + ", ".join(rejected))
+    return c
+
+
+def _block_check(cfg, admin) -> Check:
+    c = Check("generated_block")
+    state, messages = block_state(cfg, admin)
+    if state == NOT_ONBOARDED:
+        c.status = SKIPPED
+        c.info += messages
+    elif state == IN_SYNC:
+        c.info += messages
+    else:
+        for m in messages:
+            c.drift(f"{state}: {m}")
+    return c
+
+
+def _roles_check(cfg, schema: dict, catalog, usernames) -> Check:
+    c = Check("roles")
+    path = roles_path(cfg.config_dir)
+    if not path.exists():
+        c.status = SKIPPED
+        c.info.append("no onboarding/roles.json")
+        return c
+    try:
+        # Each entry's own shape only (no cross-references): the checks
+        # below report every dangling reference instead of the first.
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        roles = Roles({n: _role(n, e, None) for n, e in raw["roles"].items()})
+    except (RolesError, ValueError, KeyError, TypeError, AttributeError) as err:
+        c.drift(f"roles.json does not load: {type(err).__name__}: {err}")
+        return c
+    for name in sorted(roles.roles):
+        role = roles.roles[name]
+        if name in usernames:
+            c.drift(f"role {name}: is now also a username")
+        for parent in role.inherits:
+            if parent not in roles.roles:
+                c.drift(f"role {name}: inherits {parent}, which roles.json "
+                        "does not define")
+        if catalog is not None:
+            for cat in role.categories:
+                if cat not in catalog.categories:
+                    c.drift(f"role {name}: category {cat} is not in "
+                            "catalog.json")
+        for scope in role.row_scopes:
+            if scope.table not in schema:
+                c.drift(f"role {name}: row scope on missing table "
+                        f"{scope.table}")
+                continue
+            for col in scope.columns or ():
+                if col not in schema[scope.table]:
+                    c.drift(f"role {name}: scoped grant names missing column "
+                            f"{scope.table}.{col}")
+            try:
+                compile_row_filter(scope.table, scope.template, schema,
+                                   dialect=cfg.dialect)
+            except FilterError as err:
+                c.drift(f"role {name}: row scope on {scope.table} no longer "
+                        f"compiles: {err}")
+        for ack in role.all_rows:
+            if ack.table not in schema:
+                c.drift(f"role {name}: all-rows acknowledgement for missing "
+                        f"table {ack.table}")
+    return c
+
+
+def _workers_check(cfg) -> Check:
+    c = Check("workers")
+    try:
+        snap = load_snapshot(Path(cfg.model_path).read_bytes(),
+                             Path(cfg.policy_path).read_bytes(),
+                             Path(cfg.attributes_path).read_bytes(),
+                             Path(cfg.schema_path).read_bytes(),
+                             dialect=cfg.dialect)
+    except Exception as err:  # noqa: BLE001 - whatever the gate refuses
+        c.drift(f"CRITICAL: the policy does not load in the SQL gate, so "
+                f"everyone is denied: {type(err).__name__}: {err}")
+        return c
+    e = snap.enforcer
+    defined = set()
+    for sub, _ in (*snap.allow_grants, *snap.deny_grants):
+        defined.add(sub)
+    for sub, _ in (*snap.row_filters, *snap.deny_filters):
+        defined.add(sub)
+    for child, parent, *_ in e.get_grouping_policy():
+        defined |= {child, parent}
+    defined = {r for r in defined if not r.startswith("user:")}
+    used = set()
+    for user, record in sorted(snap.attributes.items()):
+        role = record.get("role")
+        if role == MASTER_ROLE:
+            continue
+        if role is None:
+            c.drift(f"worker {user} has no role (denied everything)")
+            continue
+        if role not in defined:
+            c.drift(f"worker {user} has role {role}, which no policy rule "
+                    "mentions (no data access)")
+        subj = snap.subjects_for(user)
+        if subj is not None:
+            used |= set(subj.roles)
+    for role in sorted(defined - used):
+        c.drift(f"role {role} has no workers (directly, by inheritance or as "
+                "an extra role)")
+    return c
+
+
+def check_drift(cfg, *, db_path=None) -> DriftReport:
+    """Run every check (see the module doc)."""
+    admin = PolicyAdmin.from_config(cfg)
+    report = DriftReport()
+    try:
+        schema = check_schema(json.loads(Path(cfg.schema_path)
+                                         .read_text(encoding="utf-8")))
+        attributes = json.loads(Path(cfg.attributes_path)
+                                .read_text(encoding="utf-8"))
+    except (OSError, ValueError) as err:
+        failed = Check("schema", ERROR, [f"cannot read db_schema.json / "
+                                         f"worker_attributes.json: {err}"])
+        report.checks.append(failed)
+        return report
+    report.checks.append(_schema_check(cfg, schema, db_path))
+    try:
+        catalog = _read_catalog(cfg)
+    except CatalogError as err:
+        bad = Check("catalog")
+        bad.drift(f"catalog.json does not load: {err}")
+        catalog = None
+        report.checks.append(bad)
+    else:
+        report.checks.append(_catalog_check(cfg, schema, catalog))
+    report.checks.append(_block_check(cfg, admin))
+    usernames = set(attributes) if isinstance(attributes, dict) else set()
+    report.checks.append(_roles_check(cfg, schema, catalog, usernames))
+    report.checks.append(_workers_check(cfg))
+    return report

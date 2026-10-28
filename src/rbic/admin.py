@@ -29,6 +29,12 @@ Fail-closed rules:
   compile_snapshot, email and user-subject checks), checked for
   every proposal and again under the lock in apply()          -> reject
 
+worker_attributes.json changes come from the master bot (roles and
+non-identity attributes only) or from the HR / IdP channel
+(propose_user_import, `rbic-init import-users`), the one path that may set
+emails. Imported workers whose IdP groups map to no role have no `role`
+key: the engine denies them everything (fail closed).
+
 apply() is serialized across processes with a lock file next to
 policy.csv, and the changelog record ("applying") is written BEFORE the
 file is replaced, followed by an "applied"/"failed: ..." record — a live
@@ -58,10 +64,15 @@ from .config import EngineConfig
 from .gate import (
     PTYPE_ALLOW_COLUMNS, PTYPE_ALLOW_ROWS, PTYPE_DENY_COLUMNS, PTYPE_DENY_ROWS,
     SCOPE_COLUMN_SEP, STATIC_FILTER_WARNING, USER_PREFIX, FilterError,
-    MissingAttribute, PolicySnapshot, bind_row_filter, compile_row_filter,
-    compile_snapshot, is_user_subject, load_enforcer, load_snapshot,
-    parse_scope_columns, subjects_for, user_subject,
+    MissingAttribute, PolicySnapshot, bind_row_filter, check_schema,
+    compile_row_filter, compile_snapshot, is_user_subject, load_enforcer,
+    load_snapshot, parse_scope_columns, subjects_for, user_subject,
 )
+from .onboarding import CATALOG_FILE, ONBOARDING_DIR, ROLES_FILE
+from .onboarding.block import (GENERATED_DUPLICATE_MESSAGE,
+                               GENERATED_RULE_MESSAGE, BlockError,
+                               block_line_indexes)
+from .onboarding.schema import diff_schema
 
 
 MASTER_ROLE = "master"
@@ -82,6 +93,11 @@ INT_RE = re.compile(r"[0-9]{1,18}\Z", re.ASCII)
 INT_LIST_RE = re.compile(r"[0-9]{1,18}(\s*,\s*[0-9]{1,18})*\Z", re.ASCII)
 
 STALE_MESSAGE = "Policy changed since this was proposed — please ask again"
+SOURCES_NOT_REVERTED = (
+    "NOTE: the onboarding sources (onboarding/catalog.json, roles.json) were "
+    "NOT reverted: rbic-init status / drift report the generated block as "
+    "out of date, and the next rbic-init compile applies them again unless "
+    "you change them first.")
 # Attributes that identify WHO a worker is (hosts map a signed-in user to a
 # worker by them). Owned by HR / the identity provider: no admin path may
 # change them, or a master could take over another worker's identity.
@@ -116,6 +132,9 @@ class Change:
     undoes: Optional[str] = None
     # sha256 of every input file at proposal time; apply() re-verifies all.
     input_hashes: dict = field(default_factory=dict)
+    # Inputs beyond the four policy files ({name: path}; e.g. the
+    # onboarding sources of a generated_policy change), hashed alongside.
+    extra_inputs: dict = field(default_factory=dict)
 
     def diff(self) -> str:
         text = "".join(difflib.unified_diff(
@@ -165,6 +184,35 @@ def _lines(text: str) -> list:
     return out
 
 
+@contextlib.contextmanager
+def exclusive_lock(path, timeout: Optional[float] = None, *,
+                   what: str = "policy change"):
+    """Inter-process lock: an O_CREAT|O_EXCL lock file at `path`, retried
+    until `timeout` (default LOCK_TIMEOUT_S), always removed on exit."""
+    path = os.fspath(path)
+    deadline = time.monotonic() + (LOCK_TIMEOUT_S if timeout is None
+                                   else timeout)
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise ValueError(
+                    f"Another {what} is being applied; nothing was "
+                    f"written. Try again (if no {what} is in progress, "
+                    f"delete the stale lock file {path}).")
+            time.sleep(0.05)
+    try:
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode())
+        finally:
+            os.close(fd)
+        yield
+    finally:
+        os.remove(path)
+
+
 def _proposal(method):
     """Record input-file hashes around a propose_* call.
 
@@ -178,9 +226,11 @@ def _proposal(method):
         # Whatever the method checked, the files it would produce must
         # load in the gate exactly as the gate loads them.
         self._check_gate_loads(change)
-        if self._input_hashes() != before:
+        # A method with extra inputs records their hashes as it read them.
+        final = self._input_hashes(change.extra_inputs)
+        if final != {**before, **change.input_hashes}:
             raise ValueError(STALE_MESSAGE + ".")
-        change.input_hashes = before
+        change.input_hashes = final
         return change
     return wrapper
 
@@ -226,6 +276,7 @@ class PolicyAdmin:
         schema_path,
         model_path,
         changelog_path,
+        onboarding_dir=None,
     ):
         # No default paths: nothing depends on the current directory.
         self.policy_path = os.fspath(policy_path)
@@ -233,6 +284,10 @@ class PolicyAdmin:
         self.schema_path = os.fspath(schema_path)
         self.model_path = os.fspath(model_path)
         self.changelog_path = os.fspath(changelog_path)
+        # <config_dir>/onboarding (the rbic-init sources); None: no
+        # generated-policy proposals.
+        self.onboarding_dir = (None if onboarding_dir is None
+                               else os.fspath(onboarding_dir))
 
     @classmethod
     def from_config(cls, cfg: EngineConfig,
@@ -242,7 +297,8 @@ class PolicyAdmin:
         if changelog_path is None:
             changelog_path = cfg.config_dir / CHANGELOG_FILE
         return cls(cfg.policy_path, cfg.attributes_path, cfg.schema_path,
-                   cfg.model_path, changelog_path)
+                   cfg.model_path, changelog_path,
+                   onboarding_dir=cfg.config_dir / ONBOARDING_DIR)
 
     # ------------------------------------------------------------------
     # state loading
@@ -255,8 +311,9 @@ class PolicyAdmin:
     def attributes(self) -> dict:
         return json.loads(_read(self.attributes_path))
 
-    def _input_hashes(self) -> dict:
-        """sha256 of every file a proposal's analysis depends on."""
+    def _input_hashes(self, extra: Optional[dict] = None) -> dict:
+        """sha256 of every file a proposal's analysis depends on (plus
+        `extra` {name: path}; a missing extra file hashes as None)."""
         out = {}
         for name, path in (("policy", self.policy_path),
                            ("attributes", self.attributes_path),
@@ -264,37 +321,18 @@ class PolicyAdmin:
                            ("model", self.model_path)):
             with open(path, "rb") as f:
                 out[name] = hashlib.sha256(f.read()).hexdigest()
+        for name, path in (extra or {}).items():
+            out[f"extra:{name}"] = (hashlib.sha256(_read_bytes(path)).hexdigest()
+                                    if os.path.exists(path) else None)
         return out
 
     def _lock_path(self) -> str:
         return os.path.join(os.path.dirname(os.path.abspath(self.policy_path)),
                             LOCK_NAME)
 
-    @contextlib.contextmanager
     def _apply_lock(self, timeout: Optional[float] = None):
-        """Inter-process lock: O_CREAT|O_EXCL lock file, always removed."""
-        path = self._lock_path()
-        deadline = time.monotonic() + (LOCK_TIMEOUT_S if timeout is None
-                                       else timeout)
-        while True:
-            try:
-                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                break
-            except FileExistsError:
-                if time.monotonic() >= deadline:
-                    raise ValueError(
-                        "Another policy change is being applied; nothing was "
-                        "written. Try again (if no change is in progress, "
-                        f"delete the stale lock file {path}).")
-                time.sleep(0.05)
-        try:
-            try:
-                os.write(fd, f"{os.getpid()}\n".encode())
-            finally:
-                os.close(fd)
-            yield
-        finally:
-            os.remove(path)
+        """Inter-process lock (exclusive_lock on casbin/.policy.lock)."""
+        return exclusive_lock(self._lock_path(), timeout)
 
     def _enforcer(self, policy_text: Optional[str] = None) -> casbin.Enforcer:
         """Casbin enforcer over policy.csv (or `policy_text`), loaded from
@@ -304,22 +342,21 @@ class PolicyAdmin:
         return load_enforcer(_read_bytes(self.model_path), policy)
 
     def _after_state(self, change: "Change") -> tuple:
-        """(policy bytes, attributes bytes) once `change` is applied; the
-        file it doesn't touch is read from disk."""
-        after = change.after_text.encode("utf-8")
+        """(policy, attributes, schema) bytes once `change` is applied; the
+        files it doesn't touch are read from disk."""
         target = self._managed_path(change.target)
-        if target == self.policy_path:
-            return after, _read_bytes(self.attributes_path)
-        return _read_bytes(self.policy_path), after
+        return tuple(change.after_text.encode("utf-8") if path == target
+                     else _read_bytes(path)
+                     for path in (self.policy_path, self.attributes_path,
+                                  self.schema_path))
 
     def _check_gate_loads(self, change: "Change") -> None:
         """Refuse a change whose resulting files the SQL gate would refuse
         to load (the gate would then deny everyone): the same
         gate.load_snapshot the gate runs on every reload, in every
         supported dialect."""
-        policy, attributes = self._after_state(change)
+        policy, attributes, schema = self._after_state(change)
         model = _read_bytes(self.model_path)
-        schema = _read_bytes(self.schema_path)
         try:
             for dialect in FILTER_DIALECTS:
                 load_snapshot(model, policy, attributes, schema,
@@ -745,10 +782,10 @@ class PolicyAdmin:
             if not isinstance(record, dict):
                 raise ValueError(f"Record for {user!r} must be an object.")
             role = record.get("role")
-            if role == MASTER_ROLE:
-                continue
+            if role == MASTER_ROLE or role is None:
+                continue  # master: no data access; no role: denied outright
             if not isinstance(role, str):
-                raise ValueError(f"User {user!r} has no role.")
+                raise ValueError(f"User {user!r} has an invalid role.")
             self._check_rendered_scopes(e, role, record, schema, user)
 
     def _check_master_intact(self, before: dict, after: dict):
@@ -770,6 +807,7 @@ class PolicyAdmin:
     # ------------------------------------------------------------------
 
     def _add_line(self, text: str, fields: list) -> str:
+        self._block(text)  # malformed rbic-init markers: refuse
         line = ", ".join(fields)
         if _casbin_tokens(line) != fields:
             # Casbin's CSV has no quoting; a comma outside ()/[] or an
@@ -786,12 +824,57 @@ class PolicyAdmin:
         return text + line + nl
 
     @staticmethod
-    def _remove_line(text: str, fields: list) -> str:
+    def _block(text: str) -> set:
+        """Line indexes of policy.csv's rbic-init block (empty if none);
+        malformed markers refuse every edit (fail closed)."""
+        try:
+            return block_line_indexes(text)
+        except BlockError as err:
+            raise ValueError(f"policy.csv: {err}. Fix the rbic-init markers "
+                             "by hand before changing rules.") from None
+
+    @classmethod
+    def _remove_line(cls, text: str, fields: list) -> str:
         lines = _lines(text)
-        kept = [l for l in lines if _casbin_tokens(l) != fields]
-        if len(kept) == len(lines):
+        hits = {i for i, l in enumerate(lines) if _casbin_tokens(l) == fields}
+        if not hits:
             raise ValueError("No such rule in policy.csv.")
-        return "".join(kept)
+        inside = hits & cls._block(text)
+        if inside == hits:
+            # The onboarding sources own the block: an edit here would be
+            # silently reverted by the next compile.
+            raise ValueError(f"Refused: {GENERATED_RULE_MESSAGE}.")
+        if inside:
+            # A hand-written copy outside the block of a generated rule:
+            # removing it would change nothing (the block's copy stays in
+            # force), so refuse rather than suggest access changed.
+            raise ValueError(f"Refused: {GENERATED_DUPLICATE_MESSAGE}.")
+        return "".join(l for i, l in enumerate(lines) if i not in hits)
+
+    @classmethod
+    def _check_undo_keeps_generated(cls, current: str, restored: str) -> None:
+        """An undo of a non-compile change may not remove a line outside
+        the block that duplicates a generated rule (_remove_line's rule)."""
+        def split(text):
+            block = cls._block(text)
+            inside, outside = set(), []
+            for i, line in enumerate(_lines(text)):
+                tokens = _casbin_tokens(line)
+                if tokens:
+                    if i in block:
+                        inside.add(tuple(tokens))
+                    else:
+                        outside.append(tuple(tokens))
+            return inside, outside
+
+        generated, now_outside = split(current)
+        _, then_outside = split(restored)
+        for rule in now_outside:
+            if rule in generated and now_outside.count(rule) > \
+                    then_outside.count(rule):
+                raise ValueError(f"Refused: the undo would remove "
+                                 f"'{', '.join(rule)}': "
+                                 f"{GENERATED_DUPLICATE_MESSAGE}.")
 
     def _rules(self, text: str) -> list:
         return [t for t in map(_casbin_tokens, _lines(text)) if t]
@@ -1603,7 +1686,13 @@ class PolicyAdmin:
                                  before, attrs, record)
 
     @_proposal
-    def propose_undo(self, actor=None) -> Change:
+    def propose_undo(self, actor=None, *, identity_channel=False) -> Change:
+        """Revert the most recently applied change that is not undone yet.
+
+        `identity_channel=True` is the HR / IdP channel (rbic-init
+        import-users --undo): it only undoes a user_import, and may restore
+        emails. The master bot never passes it, so it can undo an import
+        only when no email differs."""
         entries = self._applied()
         undone = {e.get("undoes") for e in entries}
         candidates = [e for e in entries
@@ -1623,9 +1712,31 @@ class PolicyAdmin:
         headline = (f"Undo change {last['id']} ({last['kind']}), restoring "
                     f"{target} to its previous content. Undone change was: "
                     + last["description"].splitlines()[0])
+        if identity_channel and last.get("kind") != "user_import":
+            raise ValueError(f"The last change ({last['id']}, {last['kind']}) "
+                             "is not a user import; undo it with rbic-master.")
         if target == self.policy_path:
+            if last.get("kind") != "generated_policy":
+                self._check_undo_keeps_generated(current, restored)
+            notes = ([SOURCES_NOT_REVERTED]
+                     if last.get("kind") == "generated_policy" else [])
             change = self._policy_change("undo", actor, headline, current,
+                                         restored, notes)
+        elif target == self.schema_path:
+            change = self._schema_change("undo", actor, headline, current,
                                          restored)
+        elif last.get("kind") == "user_import":
+            before_attrs, after_attrs = json.loads(current), json.loads(restored)
+            if not identity_channel and self._identity_differs(before_attrs,
+                                                               after_attrs):
+                raise ValueError(
+                    f"Change {last['id']} imported workers from the HR / IdP "
+                    "export; undoing it would change emails, which only that "
+                    "channel may do: run rbic-init import-users --undo (or "
+                    "import a corrected export).")
+            change = self._make("undo", actor, headline,
+                                self._import_notes(before_attrs, after_attrs),
+                                target, current, restored)
         else:
             before_attrs, after_attrs = json.loads(current), json.loads(restored)
             self._check_master_intact(before_attrs, after_attrs)
@@ -1636,8 +1747,332 @@ class PolicyAdmin:
         change.undoes = last["id"]
         return change
 
+    # ------------------------------------------------------------------
+    # worker_attributes.json from the HR / IdP export (rbic-init import-users)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _identity_differs(before: dict, after: dict) -> bool:
+        for user in set(before) | set(after):
+            for key in IDENTITY_ATTRIBUTES:
+                b, a = before.get(user), after.get(user)
+                if (b.get(key, _ABSENT) if isinstance(b, dict) else _ABSENT) != \
+                        (a.get(key, _ABSENT) if isinstance(a, dict) else _ABSENT):
+                    return True
+        return False
+
+    def _import_notes(self, before: dict, after: dict) -> list:
+        """Validate a whole new worker_attributes.json from the HR / IdP
+        channel and describe it per user - usernames, role names, column
+        names and attribute NAMES only: never an email or attribute value
+        (emails show as <email set> / <email changed> / <email removed>).
+
+        Masters must be untouched; every non-master record must have valid
+        keys and values; every user's row filters must bind with their
+        real values; the result must load in the gate (email shape and
+        uniqueness, user subjects naming existing workers)."""
+        if not isinstance(after, dict) or not all(
+                isinstance(r, dict) for r in after.values()):
+            raise ValueError("Worker attributes must map username -> object.")
+        self._check_master_intact(before, after)
+        schema = self.schema()
+        e = self._enforcer()
+        for user, record in after.items():
+            if record.get("role") == MASTER_ROLE:
+                continue
+            if not isinstance(user, str) or not USER_RE.fullmatch(user):
+                raise ValueError("Invalid username in the import (letters, "
+                                 "digits and _ . @ - only, at most 64).")
+            for key, value in record.items():
+                if key in IDENTITY_ATTRIBUTES:
+                    continue  # shape + uniqueness: the gate's loader below
+                if key == "role":
+                    if not isinstance(value, str) or not ROLE_RE.fullmatch(value) \
+                            or value == MASTER_ROLE:
+                        raise ValueError(f"{user}: invalid role (never "
+                                         "master; lowercase letters, digits, "
+                                         "underscores).")
+                    if value in after:
+                        raise ValueError(f"{user}: role {value} is also a "
+                                         "username; roles are groups.")
+                    continue
+                if not isinstance(key, str) or not ATTR_KEY_RE.fullmatch(key):
+                    raise ValueError(f"{user}: invalid attribute name.")
+                try:
+                    self._check_attr_value(user, key, value)
+                except ValueError:
+                    raise ValueError(f"{user}.{key}: invalid attribute value "
+                                     "(letters, digits, spaces and . , @ : / "
+                                     "_ - only, at most 200; value not "
+                                     "shown).") from None
+        for user in sorted(after):
+            try:
+                self._check_all_users(e, after, schema, users={user})
+            except ValueError:
+                raise ValueError(
+                    f"{user}: an attribute value cannot be used in a row "
+                    "filter that applies to them (an unquoted placeholder "
+                    "such as IN ({...}) needs a number or a comma-separated "
+                    "list of numbers; values not shown).") from None
+        after_s = self._snapshot(e, after, schema,
+                                 "The policy with the imported workers")
+        before_s = self._snapshot(e, before, schema)
+        notes = []
+        for user in sorted(set(before) | set(after)):
+            old, new = before.get(user), after.get(user)
+            if old == new:
+                continue
+            if new is None:
+                notes.append(f"{user}: removed (loses all access)")
+                continue
+            bits = []
+            role = new.get("role")
+            if old is None:
+                bits.append(f"new worker, role {role}" if role else
+                            "new worker with NO role (unmapped: every "
+                            "request is denied)")
+            elif old.get("role") != role:
+                bits.append(f"role {old.get('role') or 'none'} -> "
+                            f"{role or 'NONE (unmapped: every request is denied)'}")
+            had = old is not None and "email" in old
+            if "email" in new and not had:
+                bits.append("<email set>")
+            elif "email" in new and old.get("email") != new["email"]:
+                bits.append("<email changed>")
+            elif had and "email" not in new:
+                bits.append("<email removed>")
+            keys_old = {k for k in (old or {}) if k not in ("role", "email")}
+            keys_new = {k for k in new if k not in ("role", "email")}
+            added = sorted(keys_new - keys_old)
+            changed = sorted(k for k in keys_new & keys_old if old[k] != new[k])
+            removed = sorted(keys_old - keys_new)
+            for label, keys in (("attributes set", added),
+                                ("attributes changed", changed),
+                                ("attributes removed", removed)):
+                if keys:
+                    bits.append(f"{label}: {', '.join(keys)}")
+            if old is not None:
+                diff = self._column_diff(
+                    before_s.effective_columns(user, schema),
+                    after_s.effective_columns(user, schema))
+                for table, gained, lost in diff:
+                    if gained:
+                        bits.append(f"gains read on {table}.({', '.join(gained)})")
+                    if lost:
+                        bits.append(f"loses read on {table}.({', '.join(lost)})")
+            for table, keys in self._missing_for_user(after_s, user).items():
+                bits.append(f"WARNING: lacks attribute(s) {', '.join(keys)}, so "
+                            f"their queries on {table} that the rule needing "
+                            "it covers will be denied")
+            notes.append(f"{user}: " + "; ".join(bits))
+        return notes
+
+    @_proposal
+    def propose_user_import(self, attributes: dict, actor=None, *,
+                            headline: Optional[str] = None,
+                            extra_notes=()) -> Change:
+        """Replace worker_attributes.json with `attributes` (the result of
+        rbic.onboarding.users.plan_import: the HR / IdP export applied to
+        the current file). The only proposal that may set or change emails;
+        masters must be untouched. Validated like every change (gate loader
+        in both dialects, every user's filters bound, input hashes, lock,
+        changelog before replace, undo). The description never holds an
+        email or attribute value."""
+        before = _read(self.attributes_path)
+        current = json.loads(before)
+        notes = self._import_notes(current, attributes)
+        nl = _newline(before)
+        after = json.dumps(attributes, indent=2).replace("\n", nl) + nl
+        if after == before:
+            raise ValueError("worker_attributes.json already matches this "
+                             "import; nothing to change.")
+        if headline is None:
+            headline = (f"Import {len(attributes)} worker record(s) from the "
+                        "HR / IdP export into worker_attributes.json.")
+        return self._make("user_import", actor, headline,
+                          [*extra_notes, *notes], self.attributes_path,
+                          before, after)
+
+    # ------------------------------------------------------------------
+    # the rbic-init block (rbic-init compile)
+    # ------------------------------------------------------------------
+
+    @_proposal
+    def propose_generated_policy(self, generated, actor=None) -> Change:
+        """Replace policy.csv's rbic-init block with `generated` (an
+        rbic.onboarding.compile.GeneratedPolicy from compile_from_files).
+
+        Lines outside the block are kept byte for byte. Refused when any
+        source the compile read (catalog.json, roles.json, db_schema.json,
+        worker_attributes.json) changed since - and, through the Change's
+        input hashes, again at apply time - when the block markers are
+        malformed, and (like every proposal) when the result would not
+        load in the gate or a user's row filters would not bind.
+        """
+        # Imported here: rbic.onboarding.compile imports this module.
+        from .onboarding.compile import build_policy_text, sources_current
+        if self.onboarding_dir is None:
+            raise ValueError("This PolicyAdmin has no onboarding directory.")
+        extra = {"catalog": os.path.join(self.onboarding_dir,
+                                         CATALOG_FILE.name),
+                 "roles": os.path.join(self.onboarding_dir, ROLES_FILE.name)}
+        hashes = self._input_hashes(extra)
+        if not sources_current(generated, {**extra,
+                                           "schema": self.schema_path,
+                                           "attributes": self.attributes_path}):
+            raise ValueError("The onboarding sources (catalog.json, roles.json, "
+                             "db_schema.json or worker_attributes.json) "
+                             "changed since this policy was compiled; run "
+                             "rbic-init compile again.")
+        before = _read(self.policy_path)
+        try:
+            after, notes = build_policy_text(before, generated)
+        except BlockError as err:
+            raise ValueError(f"policy.csv: {err}. Fix the rbic-init markers by "
+                             "hand, then compile again.") from None
+        if after == before:
+            raise ValueError("policy.csv already holds exactly this compiled "
+                             "policy; nothing to change.")
+        n = sum(1 for line in generated.body if not line.startswith("#"))
+        headline = (f"Replace the rbic-init block of policy.csv with {n} "
+                    f"rule(s) for {len(generated.roles)} role(s) compiled from "
+                    "onboarding/catalog.json and roles.json; lines outside "
+                    "the block are unchanged.")
+        change = self._policy_change(
+            "generated_policy", actor, headline, before, after,
+            [*(f"compile: {a}" for a in generated.acknowledged),
+             *(f"compile: {w}" for w in (*notes, *generated.warnings))])
+        change.extra_inputs = extra
+        change.input_hashes = {k: v for k, v in hashes.items()
+                               if k.startswith("extra:")}
+        return change
+
+    # ------------------------------------------------------------------
+    # db_schema.json (rbic-init schema; validated like every other change)
+    # ------------------------------------------------------------------
+
+    @_proposal
+    def propose_schema_update(self, schema, actor=None) -> Change:
+        """Replace db_schema.json with `schema` ({table: {column: type}},
+        written in the given order).
+
+        Refused when the gate would refuse the result (a row filter or
+        column deny naming a removed column, a malformed schema...) and
+        when any p/p3/p2/p4 rule names a table or table.column the new
+        schema removes: a grant left pointing at a vanished column would
+        silently come back to life if a column of that name reappeared.
+        """
+        try:
+            schema = check_schema(schema)
+        except ValueError as err:
+            raise ValueError(f"Invalid schema: {err}") from None
+        before = _read(self.schema_path)
+        nl = _newline(before)
+        after = json.dumps(schema, indent=2).replace("\n", nl) + nl
+        if after == before:
+            raise ValueError("db_schema.json already matches; nothing to "
+                             "change.")
+        headline = (f"db_schema.json will describe {len(schema)} table(s) "
+                    "as shown in the diff.")
+        return self._schema_change("schema_update", actor, headline, before,
+                                   after)
+
+    @staticmethod
+    def _schema_refs(e: casbin.Enforcer) -> list:
+        """[(rule, table, column|None)] for every table.column a p/p3 rule
+        names and every table a p2/p4 rule filters (column None)."""
+        refs = []
+        for ptype in COLUMN_PTYPES:
+            for rule in e.get_named_policy(ptype):
+                table, _, column = rule[1].partition(".")
+                refs.append(([ptype, *rule], table, column))
+        for ptype in ROW_PTYPES:
+            for rule in e.get_named_policy(ptype):
+                refs.append(([ptype, *rule], rule[1], None))
+        return refs
+
+    @classmethod
+    def _check_schema_refs(cls, e: casbin.Enforcer, old: dict, new: dict,
+                           notes: Optional[list] = None) -> None:
+        """Refuse a schema that removes a table/column a rule names (while
+        the old schema had it); note rules that name something only the
+        new schema has (they take effect with this change)."""
+        def has(schema, table, column):
+            if table not in schema:
+                return False
+            return column in (None, "*") or column in schema[table]
+
+        broken = []
+        for rule, table, column in cls._schema_refs(e):
+            if "*" in table:  # a glob over table names: nothing to resolve
+                continue
+            name = table if column in (None, "*") else f"{table}.{column}"
+            line = ", ".join(rule)
+            if has(old, table, column) and not has(new, table, column):
+                broken.append(f"{name} (rule: {line})")
+            elif notes is not None and not has(old, table, column) \
+                    and has(new, table, column):
+                notes.append(f"WARNING: the existing rule '{line}' names "
+                             f"{name}, which did not exist before; it takes "
+                             "effect with this change")
+        if broken:
+            raise ValueError(
+                "The new schema removes table(s)/column(s) that policy rules "
+                "still reference: " + "; ".join(broken) + ". Remove or "
+                "revoke those rules first (rbic-master; for rules in the "
+                "rbic-init block: update onboarding/*.json and run rbic-init "
+                "compile), then update the schema.")
+
+    def _schema_change(self, kind, actor, headline, before, after) -> Change:
+        try:
+            old = check_schema(json.loads(before))
+            new = check_schema(json.loads(after))
+        except ValueError as err:  # json.JSONDecodeError is a ValueError
+            raise ValueError(f"Invalid schema: {err}") from None
+        e = self._enforcer()
+        attrs = self.attributes()
+        notes = diff_schema(old, new).lines(new)
+        self._check_schema_refs(e, old, new, notes)
+        before_s = self._snapshot(e, attrs, old)
+        after_s = self._snapshot(e, attrs, new,
+                                 "The policy with the new db_schema.json")
+        self._check_all_users(e, attrs, new)
+        for role in sorted(self._roles(e)):
+            diff = self._column_diff(self._readable(before_s, role, old),
+                                     self._readable(after_s, role, new))
+            users = sorted(u for u, a in attrs.items() if a.get("role") == role)
+            who = f" [users: {', '.join(users)}]" if users else ""
+            for table, gained, lost in diff:
+                if gained:
+                    notes.append(
+                        f"WARNING: {role}{who} can read {table}."
+                        f"({', '.join(gained)}) immediately through an "
+                        "existing grant (e.g. a table.* wildcard)")
+                if lost:
+                    notes.append(f"{role}{who}: loses read on {table}."
+                                 f"({', '.join(lost)}) (removed)")
+        for user in sorted(attrs):
+            if attrs[user].get("role") == MASTER_ROLE or not any(
+                    self._personal(after_s, user).values()):
+                continue
+            diff = self._column_diff(before_s.effective_columns(user, old),
+                                     after_s.effective_columns(user, new))
+            for table, gained, lost in diff:
+                if gained:
+                    notes.append(f"WARNING: {user} (has personal rules) can "
+                                 f"read {table}.({', '.join(gained)}) "
+                                 "immediately")
+                if lost:
+                    notes.append(f"{user}: loses read on {table}."
+                                 f"({', '.join(lost)}) (removed)")
+        if not notes:
+            notes.append("no table, column or access change (formatting "
+                         "only)")
+        return self._make(kind, actor, headline, notes, self.schema_path,
+                          before, after)
+
     def _managed_path(self, path) -> str:
-        for p in (self.policy_path, self.attributes_path):
+        for p in (self.policy_path, self.attributes_path, self.schema_path):
             if path and os.path.abspath(path) == os.path.abspath(p):
                 return p
         raise ValueError(f"Changelog refers to unmanaged file {path!r}.")
@@ -1662,7 +2097,8 @@ class PolicyAdmin:
         target = self._managed_path(change.target)
         # The proposal's analysis (effects, scope checks, description) was
         # computed from ALL of these files; any change invalidates it.
-        if not change.input_hashes or self._input_hashes() != change.input_hashes:
+        if not change.input_hashes or \
+                self._input_hashes(change.extra_inputs) != change.input_hashes:
             raise ValueError(STALE_MESSAGE + "; nothing was written.")
         current = _read(target)
         if _sha(current) != _sha(change.before_text):
@@ -1697,6 +2133,10 @@ class PolicyAdmin:
                 self._check_no_master_in_policy(
                     load_enforcer(_read_bytes(self.model_path),
                                   change.after_text.encode("utf-8")))
+            elif target == self.schema_path:
+                self._check_schema_refs(self._enforcer(),
+                                        json.loads(change.before_text),
+                                        json.loads(change.after_text))
             else:
                 self._check_master_intact(attrs, json.loads(change.after_text))
             # The audit record goes down BEFORE the file changes, so a live

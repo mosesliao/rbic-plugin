@@ -1,0 +1,20 @@
+{
+  "format": 1,
+  "name": "warehouse",
+  "version": "1",
+  "description": "Warehouse workers: inventory, logistics and safety records of their own site.",
+  "roles": {
+    "warehouse_worker": {
+      "description": "Warehouse workers: stock, shipments and safety incidents of their own site.",
+      "categories": ["inventory", "logistics", "safety"],
+      "inherits": [],
+      "row_scopes": [
+        {
+          "ownership_columns": ["warehouse_id", "site_id", "site", "warehouse"],
+          "template": "$column = '{site}'",
+          "explain": "rows of the user's own site (attribute site)"
+        }
+      ]
+    }
+  }
+}

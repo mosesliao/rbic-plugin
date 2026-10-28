@@ -1,0 +1,528 @@
+"""rbic.onboarding.compile + the rbic-init block + PolicyAdmin's
+generated_policy proposals: only approved columns, never table.*, block
+replacement that keeps every outside line, malformed markers refused,
+the master bot never edits generated lines, stale sources refused at
+proposal and apply time, gate-load and filter-binding refusals, undo."""
+
+import json
+import logging
+from dataclasses import replace
+from datetime import datetime, timezone
+
+import pytest
+
+from onboarding_demo import (MANUAL_POLICY, admin, approve_catalog, build_roles,
+                             compile_and_apply, compile_change, config,
+                             load_state, onboard_demo, save)
+from rbic.admin import CHANGES_HEADER, STALE_MESSAGE
+from rbic.onboarding import catalog_path, roles_path
+from rbic.gate import SQLGate
+from rbic.onboarding.block import (BEGIN_MARKER, END_MARKER,
+                                   GENERATED_DUPLICATE_MESSAGE,
+                                   GENERATED_RULE_MESSAGE, BlockError,
+                                   find_block, outside_lines,
+                                   replace_block)
+from rbic.onboarding.catalog import (apply_decisions, load_catalog,
+                                     plan_rejections, save_catalog)
+from rbic.onboarding.compile import (CompileError, GeneratedPolicy, _line,
+                                     build_policy_text, compile_from_files,
+                                     compile_policy)
+from rbic.onboarding.roles import RowScope, add_scope, set_role
+from test_onboarding_roles import CAT, SCHEMA, parse
+
+logging.disable(logging.CRITICAL)
+
+
+def rules_of(gen):
+    return [", ".join(r) for r in gen.rules]
+
+
+# ---- compile_policy ------------------------------------------------------------
+
+def test_only_approved_columns_and_never_table_star():
+    roles = parse({
+        "hr_staff": {"categories": ["directory", "training"],
+                     "row_scopes": [{"table": "employees",
+                                     "template": "dept = '{dept}'"}]},
+        "payroll_clerk": {"categories": ["pay"], "inherits": ["hr_staff"],
+                          "row_scopes": [{"table": "payroll",
+                                          "template": "employee_id IN "
+                                                      "({team_ids})"}],
+                          "all_rows": [{"table": "bonuses",
+                                        "reason": "clerks pay every bonus"}]}})
+    gen = compile_policy(CAT, roles, SCHEMA)
+    rules = rules_of(gen)
+    assert "# all_rows payroll_clerk bonuses: clerks pay every bonus" in gen.body
+    assert gen.acknowledged == [
+        "role payroll_clerk reads high-sensitivity column(s) bonuses.(id, "
+        "staff_no) on ALL rows - acknowledged in roles.json: clerks pay every "
+        "bonus"]
+    assert not any(".*" in r for r in rules)
+    assert "p, hr_staff, employees.name, read" in rules
+    assert "p, hr_staff, trainings.id, read" in rules
+    assert "p, hr_staff, trainings.title, read" not in rules     # rejected
+    assert "p, payroll_clerk, bonuses.staff_no, read" in rules
+    assert "p, payroll_clerk, bonuses.amount, read" not in rules  # suggested
+    assert "g, payroll_clerk, hr_staff" in rules
+    assert "p2, hr_staff, employees, dept = '{dept}'" in rules
+    assert {"trainings.title (rejected)", "bonuses.amount (suggested)"} <= \
+        set(gen.hidden)
+    # deterministic, role by role: comment, g, p (schema order), p2
+    assert gen.body[0] == "# role hr_staff (human)"
+    assert compile_policy(CAT, roles, SCHEMA).body == gen.body
+
+
+def test_scoped_grants_keep_approved_columns_only():
+    roles = parse({"employee": {"row_scopes": [
+        {"table": "bonuses", "template": "staff_no = '{employee_id}'",
+         "columns": ["staff_no", "amount"]},
+        {"table": "trainings", "template": "id = 1", "columns": ["title"]}]}})
+    gen = compile_policy(CAT, roles, SCHEMA)
+    assert rules_of(gen) == [
+        "p2, employee, bonuses, staff_no = '{employee_id}', staff_no"]
+    text = "\n".join(gen.warnings)
+    assert "leaves out not-approved column(s) amount" in text
+    assert "scoped grant on trainings has no approved column and is skipped" \
+        in text
+
+
+ACK = "finance reconciles every row"
+
+
+def _acks(*tables):
+    return [{"table": t, "reason": ACK} for t in tables]
+
+
+def test_high_sensitivity_on_all_rows_is_refused():
+    roles = parse({
+        "a_reader": {"categories": ["pay", "finance"]},
+        "b_scoped": {"categories": ["pay"],
+                     "row_scopes": [{"table": "payroll",
+                                     "template": "employee_id = '{eid}'"}]}})
+    with pytest.raises(CompileError) as err:
+        compile_policy(CAT, roles, SCHEMA)
+    text = str(err.value)
+    assert text.startswith("refused - high-sensitivity data on ALL rows")
+    assert ("role a_reader would read high-sensitivity column(s) "
+            "payroll.(id, employee_id, salary) on ALL rows") in text
+    assert "rbic-init roles all-rows a_reader payroll --reason" in text
+    # b_scoped's payroll is scoped; its employees.salary and bonuses are not
+    assert "role b_scoped would read high-sensitivity column(s) " \
+        "employees.(salary)" in text
+    assert "b_scoped would read high-sensitivity column(s) payroll" not in text
+
+
+def test_acknowledged_all_rows_compiles_with_warnings():
+    roles = parse({
+        "a_reader": {"categories": ["pay", "finance"],
+                     "all_rows": _acks("employees", "payroll", "bonuses")},
+        "b_scoped": {"categories": ["pay", "contact"],
+                     "row_scopes": [{"table": "payroll",
+                                     "template": "employee_id = '{eid}'"}],
+                     "all_rows": _acks("bonuses", "employees", "trainings")}})
+    gen = compile_policy(CAT, roles, SCHEMA)
+    text = "\n".join(gen.warnings)
+    assert "role a_reader: category finance has no approved column" in text
+    assert ("role a_reader reads payroll on ALL rows (no row scope in its "
+            "role level), while b_scoped has a row scope on payroll") in text
+    assert ("role b_scoped: the all-rows acknowledgement for trainings is not "
+            "needed") in text
+    assert len(gen.acknowledged) == 5
+    assert f"# all_rows a_reader payroll: {ACK}" in gen.body
+    assert "# all_rows b_scoped payroll" not in "\n".join(gen.body)
+    # comments in the block are not rules
+    assert all(not r[0].startswith("#") for r in gen.rules)
+
+
+def test_medium_sensitivity_on_all_rows_is_a_warning():
+    cat = CAT.copy()
+    cat.columns["trainings.id"] = replace(cat.columns["trainings.id"],
+                                          category="contact")
+    gen = compile_policy(cat, parse({"r1": {"categories": ["contact"]}}), SCHEMA)
+    assert ("role r1 reads medium-sensitivity column(s) trainings.(id) on ALL "
+            "rows (no row scope)") in gen.warnings
+
+
+@pytest.mark.parametrize("entry, message", [
+    ({"table": "payroll", "reason": ""}, "non-empty printable ASCII"),
+    ({"table": "payroll", "reason": "   "}, "non-empty printable ASCII"),
+    ({"table": "payroll", "reason": "line\nbreak"}, "printable ASCII"),
+    ({"table": "payroll", "reason": "caf\u00e9"}, "printable ASCII"),
+    ({"table": "payroll", "reason": "x" * 201}, "at most 200"),
+    ({"table": "nope", "reason": "why"}, "unknown table"),
+    ({"table": "payroll"}, "exactly table and reason"),
+])
+def test_all_rows_entries_are_validated(entry, message):
+    from rbic.onboarding.roles import RolesError
+    with pytest.raises(RolesError, match=message):
+        parse({"r1": {"categories": ["pay"], "all_rows": [entry]}})
+
+
+def test_all_rows_listed_twice_is_refused():
+    from rbic.onboarding.roles import RolesError
+    with pytest.raises(RolesError, match="listed twice"):
+        parse({"r1": {"categories": ["pay"],
+                      "all_rows": _acks("payroll", "payroll")}})
+
+
+def test_inherited_scope_counts_for_the_role_level():
+    roles = parse({
+        "base": {"categories": ["directory"],
+                 "row_scopes": [{"table": "employees",
+                                 "template": "dept = '{dept}'"}]},
+        "mgr": {"categories": ["pay"], "inherits": ["base"]}})
+    with pytest.raises(CompileError) as err:
+        compile_policy(CAT, roles, SCHEMA)
+    assert "mgr would read high-sensitivity column(s) employees" \
+        not in str(err.value)
+    assert "mgr would read high-sensitivity column(s) payroll" in str(err.value)
+
+
+def test_inheriting_acknowledged_columns_needs_no_second_acknowledgement():
+    roles = parse({
+        "base": {"categories": ["pay"],
+                 "all_rows": _acks("employees", "payroll", "bonuses")},
+        "child": {"categories": ["directory"], "inherits": ["base"]}})
+    gen = compile_policy(CAT, roles, SCHEMA)
+    assert len(gen.acknowledged) == 3
+    assert all("role base" in a for a in gen.acknowledged)
+
+
+def test_role_named_like_a_user_is_refused():
+    with pytest.raises(CompileError, match="username"):
+        compile_policy(CAT, parse({"hr": {}}), SCHEMA, usernames=["hr"])
+
+
+def test_rules_must_round_trip_casbins_tokenizer():
+    assert _line(["p2", "r1", "t", "id IN (1, 2)"]) == "p2, r1, t, id IN (1, 2)"
+    with pytest.raises(CompileError, match="round-trip"):
+        _line(["p2", "r1", "t", "a = 1, b = 2"])
+
+
+# ---- the block -----------------------------------------------------------------
+
+OUTSIDE = ("# head comment\r\n"
+           "p, hr_staff, employees.id, read\r\n"
+           "\r\n"
+           f"{CHANGES_HEADER}\r\n"
+           "p3, hr_staff, employees.dept, read\r\n")
+
+
+def test_insert_before_master_section_then_replace_keeps_outside_bytes():
+    first = replace_block(OUTSIDE, ["p, a1, t.c, read"],
+                          before_header=CHANGES_HEADER)
+    assert first == ("# head comment\r\np, hr_staff, employees.id, read\r\n\r\n"
+                     f"{BEGIN_MARKER}\r\np, a1, t.c, read\r\n{END_MARKER}\r\n"
+                     f"{CHANGES_HEADER}\r\np3, hr_staff, employees.dept, read\r\n")
+    second = replace_block(first, ["p, b2, t.d, read", "p, b2, t.e, read"])
+    assert "".join(outside_lines(second)) == OUTSIDE
+    begin, end = find_block(second)
+    assert second.split("\n")[begin + 1:end] == ["p, b2, t.d, read\r",
+                                                 "p, b2, t.e, read\r"]
+
+
+def test_insert_at_end_without_master_section():
+    assert replace_block("p, x1, t.c, read", ["p, a1, t.c, read"]) == (
+        f"p, x1, t.c, read\n{BEGIN_MARKER}\np, a1, t.c, read\n{END_MARKER}\n")
+    assert replace_block("", []) == f"{BEGIN_MARKER}\n{END_MARKER}\n"
+
+
+@pytest.mark.parametrize("text, message", [
+    (f"{BEGIN_MARKER}\n{BEGIN_MARKER}\n{END_MARKER}\n", "at most one"),
+    (f"{BEGIN_MARKER}\n", "at most one"),
+    (f"{END_MARKER}\n", "at most one"),
+    (f"{END_MARKER}\n{BEGIN_MARKER}\n", "before its BEGIN"),
+    ("# ---- BEGIN rbic init (generated) ----\n", "malformed"),
+    ("#  ----  END  rbic init ----\n", "malformed"),
+])
+def test_malformed_markers_are_refused(text, message):
+    with pytest.raises(BlockError, match=message):
+        find_block(text)
+    with pytest.raises(BlockError):
+        build_policy_text(text, GeneratedPolicy(["p, a1, t.c, read"], []))
+
+
+def test_duplicate_of_an_outside_rule_is_also_generated_inside():
+    # Review finding: a generated rule left out of the block because a copy
+    # existed outside could be removed by the master bot. Every generated
+    # rule now lives in the block; the outside copy is noted.
+    gen = GeneratedPolicy(["# role hr_staff (human)",
+                           "p, hr_staff, employees.id, read",
+                           "p, hr_staff, employees.name, read"], [])
+    text, notes = build_policy_text(OUTSIDE, gen)
+    begin, end = find_block(text)
+    lines = text.split("\n")
+    block = lines[begin:end + 1]
+    assert "p, hr_staff, employees.name, read\r" in block
+    assert "p, hr_staff, employees.id, read\r" in block
+    assert "p, hr_staff, employees.id, read\r" in lines[:begin] + lines[end + 1:]
+    assert notes == ["rule 'p, hr_staff, employees.id, read' is also present "
+                     "in policy.csv outside the rbic-init block; the generated "
+                     "copy (inside the block) is authoritative"]
+
+
+# ---- PolicyAdmin: proposals, staleness, apply, undo -----------------------------
+
+@pytest.fixture
+def onboarded(demo_dir):
+    onboard_demo(demo_dir)
+    return demo_dir
+
+
+def test_generated_change_records_every_source(demo_dir):
+    approve_catalog(demo_dir)
+    build_roles(demo_dir)
+    gen, change = compile_change(demo_dir)
+    assert change.kind == "generated_policy"
+    assert set(change.input_hashes) == {"policy", "attributes", "schema", "model",
+                                        "extra:catalog", "extra:roles"}
+    assert set(gen.sources) == {"catalog", "roles", "schema", "attributes"}
+    assert "Effects:" in change.description
+    assert "warehouse_worker [users: alice]:" in change.description
+    # the shipped hand-written rules are duplicates: generated in the block
+    # too (the block's copy is authoritative)
+    assert ("is also present in policy.csv outside the rbic-init block; the "
+            "generated copy (inside the block) is authoritative"
+            in change.description)
+
+
+@pytest.mark.parametrize("touch", ["catalog", "roles"])
+def test_source_changed_after_proposal_is_refused_at_apply(demo_dir, touch):
+    approve_catalog(demo_dir)
+    build_roles(demo_dir)
+    _, change = compile_change(demo_dir)
+    path = catalog_path(demo_dir) if touch == "catalog" else roles_path(demo_dir)
+    path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    before = (demo_dir / "casbin" / "policy.csv").read_bytes()
+    with pytest.raises(ValueError, match=STALE_MESSAGE):
+        admin(demo_dir).apply(change, actor="master")
+    assert (demo_dir / "casbin" / "policy.csv").read_bytes() == before
+
+
+@pytest.mark.parametrize("touch", ["catalog", "roles", "db_schema.json",
+                                   "worker_attributes.json"])
+def test_source_changed_after_compile_is_refused_at_proposal(demo_dir, touch):
+    approve_catalog(demo_dir)
+    build_roles(demo_dir)
+    cfg = config(demo_dir)
+    gen = compile_from_files(demo_dir, cfg.schema_path, cfg.attributes_path)
+    path = {"catalog": catalog_path(demo_dir),
+            "roles": roles_path(demo_dir)}.get(touch, demo_dir / touch)
+    path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="changed since this policy was compiled"):
+        admin(demo_dir).propose_generated_policy(gen, actor="master")
+
+
+def test_result_that_the_gate_refuses_is_refused(demo_dir):
+    approve_catalog(demo_dir)
+    build_roles(demo_dir)
+    cfg = config(demo_dir)
+    gen = compile_from_files(demo_dir, cfg.schema_path, cfg.attributes_path)
+    bad = replace(gen, body=[*gen.body,
+                             "p2, hr_staff, employees, id IN (SELECT 1)"])
+    with pytest.raises(ValueError, match="would not load in the SQL gate"):
+        admin(demo_dir).propose_generated_policy(bad, actor="master")
+
+
+def test_every_users_filters_are_bound_against_the_result(demo_dir):
+    approve_catalog(demo_dir)
+    build_roles(demo_dir)
+    schema, catalog, users, roles, sha = load_state(demo_dir)
+    # bob's dept ("engineering") can't bind into an unquoted placeholder
+    roles, _ = add_scope(roles, "hr_staff",
+                         RowScope("leave_requests", "employee_id IN ({dept})"))
+    save(demo_dir, roles, sha)
+    with pytest.raises(ValueError, match="unquoted placeholder needs a number"):
+        compile_change(demo_dir)
+
+
+def test_nothing_to_change_and_undo(onboarded):
+    policy = onboarded / "casbin" / "policy.csv"
+    with pytest.raises(ValueError, match="already holds exactly"):
+        compile_change(onboarded)
+    a = admin(onboarded)
+    undo = a.propose_undo(actor="master")
+    a.apply(undo, actor="master")
+    assert policy.read_text(encoding="utf-8") == MANUAL_POLICY
+    kinds = [json.loads(l)["kind"] for l in
+             (onboarded / "policy_changes.jsonl").read_text(
+                 encoding="utf-8").splitlines()]
+    assert kinds == ["generated_policy", "generated_policy", "undo", "undo"]
+
+
+def test_recompile_after_catalog_change_hides_rejected_column(onboarded):
+    schema, *_ = load_state(onboarded)
+    catalog, sha = load_catalog(catalog_path(onboarded), schema)
+    plan = plan_rejections(catalog, schema, ["employees.start_date"])
+    save_catalog(catalog_path(onboarded),
+                 apply_decisions(catalog, plan, "master",
+                                 datetime.now(timezone.utc)), sha)
+    gen, change = compile_change(onboarded)
+    assert "p, hr_staff, employees.start_date, read" not in rules_of(gen)
+    assert "loses read on employees.(start_date)" in change.description
+    assert "employees.start_date (rejected)" in gen.hidden
+
+
+# ---- the master bot and the block -----------------------------------------------
+
+@pytest.mark.parametrize("call", [
+    lambda a: a.propose_revoke(role="hr_staff", table="employees",
+                               column="name", actor="master"),
+    lambda a: a.propose_remove_row_scope(role="hr_staff", table="employees",
+                                         filter_template="dept = '{dept}'",
+                                         actor="master"),
+    lambda a: a.propose_remove_inherit("hr_manager", "hr_staff", actor="master"),
+    lambda a: a.propose_remove_row_scope(
+        role="employee", table="payroll",
+        filter_template="employee_id = '{employee_id}'",
+        columns="id|employee_id|salary|effective_date", actor="master"),
+])
+def test_master_bot_refuses_to_edit_generated_rules(onboarded, call):
+    before = (onboarded / "casbin" / "policy.csv").read_bytes()
+    with pytest.raises(ValueError) as err:
+        call(admin(onboarded))
+    assert GENERATED_RULE_MESSAGE in str(err.value)
+    assert (onboarded / "casbin" / "policy.csv").read_bytes() == before
+
+
+def test_reviewer_scenario_compile_over_hand_written_policy(demo_dir):
+    # Review finding: compile on the hand-written demo policy left
+    # `p2, hr_staff, employees, dept = '{dept}'` outside the block (it
+    # already existed there); propose_remove_row_scope then removed the only
+    # copy and carol (hr_manager, inherits hr_staff) read every salary.
+    approve_catalog(demo_dir)
+    build_roles(demo_dir)
+    compile_and_apply(demo_dir)
+    text = (demo_dir / "casbin" / "policy.csv").read_text(encoding="utf-8")
+    begin, end = find_block(text)
+    rule = "p2, hr_staff, employees, dept = '{dept}'"
+    lines = text.split("\n")
+    assert rule in lines[begin:end + 1] and rule in lines[:begin]
+    before = (demo_dir / "casbin" / "policy.csv").read_bytes()
+    with pytest.raises(ValueError) as err:
+        admin(demo_dir).propose_remove_row_scope(
+            role="hr_staff", table="employees",
+            filter_template="dept = '{dept}'", actor="master")
+    assert GENERATED_DUPLICATE_MESSAGE in str(err.value)
+    assert "rbic-init compile" in str(err.value)
+    assert (demo_dir / "casbin" / "policy.csv").read_bytes() == before
+    gate = SQLGate.from_config(config(demo_dir))
+    sql = gate.authorize("carol", "SELECT name, salary FROM employees")
+    assert "dept = 'engineering'" in sql
+    # and the outside copy alone, removed by hand, changes nothing either
+    kept = [l for i, l in enumerate(lines) if not (i < begin and l == rule)]
+    (demo_dir / "casbin" / "policy.csv").write_text("\n".join(kept),
+                                                    encoding="utf-8")
+    assert "dept = 'engineering'" in SQLGate.from_config(config(demo_dir)) \
+        .authorize("carol", "SELECT name, salary FROM employees")
+
+
+@pytest.mark.parametrize("call", [
+    lambda a: a.propose_revoke(role="hr_staff", table="employees",
+                               column="name", actor="master"),
+    lambda a: a.propose_remove_row_scope(role="hr_staff", table="employees",
+                                         filter_template="dept = '{dept}'",
+                                         actor="master"),
+    lambda a: a.propose_remove_inherit("hr_manager", "hr_staff", actor="master"),
+    lambda a: a.propose_remove_row_scope(
+        role="warehouse_worker", table="inventory",
+        filter_template="warehouse_id = '{site}'", actor="master"),
+])
+def test_master_bot_refuses_to_remove_outside_copies_of_generated_rules(
+        onboarded, call):
+    # onboarded: only the manual section outside the block; add hand-written
+    # copies of generated rules outside it, then try to remove them
+    path = onboarded / "casbin" / "policy.csv"
+    text = path.read_text(encoding="utf-8")
+    copies = ("p, hr_staff, employees.name, read\n"
+              "p2, hr_staff, employees, dept = '{dept}'\n"
+              "g, hr_manager, hr_staff\n"
+              "p2, warehouse_worker, inventory, warehouse_id = '{site}'\n")
+    path.write_text(copies + text, encoding="utf-8")
+    before = path.read_bytes()
+    with pytest.raises(ValueError) as err:
+        call(admin(onboarded))
+    assert GENERATED_DUPLICATE_MESSAGE in str(err.value)
+    assert path.read_bytes() == before
+
+
+def test_duplicate_rules_are_harmless_to_the_gate(onboarded):
+    path = onboarded / "casbin" / "policy.csv"
+    text = path.read_text(encoding="utf-8")
+    queries = [("bob", "SELECT name FROM employees"),
+               ("carol", "SELECT employee_id, salary FROM payroll"),
+               ("alice", "SELECT sku FROM inventory"),
+               ("alice", "SELECT name, salary FROM employees")]
+    gate = SQLGate.from_config(config(onboarded))
+    want = [gate.authorize(u, q) for u, q in queries]
+    begin, end = find_block(text)
+    body = [l for l in text.split("\n")[begin + 1:end] if l and l[0] != "#"]
+    path.write_text(text + "\n".join(body) + "\n", encoding="utf-8")
+    gate = SQLGate.from_config(config(onboarded))
+    assert [gate.authorize(u, q) for u, q in queries] == want
+
+
+def test_undo_may_not_remove_an_outside_copy_of_a_generated_rule(onboarded):
+    # A master-bot change whose undo would drop a hand-written copy of a
+    # generated rule (the copy was added in the same change's after-state
+    # by an earlier hand edit is impossible - undo checks the sha - so the
+    # check is exercised on the helper directly).
+    from rbic.admin import PolicyAdmin
+    text = (onboarded / "casbin" / "policy.csv").read_text(encoding="utf-8")
+    rule = "p2, hr_staff, employees, dept = '{dept}'"
+    current = rule + "\n" + text
+    with pytest.raises(ValueError, match="the undo would remove"):
+        PolicyAdmin._check_undo_keeps_generated(current, text)
+    PolicyAdmin._check_undo_keeps_generated(text, text)
+    PolicyAdmin._check_undo_keeps_generated(current, current)
+
+
+def test_master_bot_additions_go_to_the_master_section(onboarded):
+    a = admin(onboarded)
+    change = a.propose_deny(role="hr_staff", table="employees", column="dept",
+                            actor="master")
+    a.apply(change, actor="master")
+    text = (onboarded / "casbin" / "policy.csv").read_text(encoding="utf-8")
+    begin, end = find_block(text)
+    lines = text.split("\n")
+    assert "p3, hr_staff, employees.dept, read" in lines[end + 1:]
+    assert lines.index(CHANGES_HEADER) > end
+    # and a master-bot rule outside the block can still be removed
+    a = admin(onboarded)
+    a.apply(a.propose_remove_deny(role="hr_staff", table="employees",
+                                  column="dept", actor="master"), actor="master")
+    # a recompile keeps the master section
+    schema, catalog, users, roles, sha = load_state(onboarded)
+    roles, _ = set_role(roles, "hr_staff", description="changed")
+    save(onboarded, roles, sha)
+    # a description is not a rule: only the sources header changes
+    gen, change = compile_change(onboarded)
+    removed = [l for l in change.diff().splitlines()
+               if l.startswith("-") and not l.startswith("---")]
+    added = [l for l in change.diff().splitlines()
+             if l.startswith("+") and not l.startswith("+++")]
+    assert len(removed) == len(added) == 1
+    assert added[0].startswith("+# sources: catalog.json, roles.json, "
+                               "db_schema.json sha256=")
+    assert "gains" not in change.description and "loses" not in change.description
+    assert "p3, hr_staff, employees.dept, read" not in change.after_text
+    assert CHANGES_HEADER in change.after_text
+
+
+def test_master_bot_refuses_with_malformed_markers(onboarded):
+    policy = onboarded / "casbin" / "policy.csv"
+    policy.write_text(policy.read_text(encoding="utf-8").replace(END_MARKER, ""),
+                      encoding="utf-8")
+    a = admin(onboarded)
+    with pytest.raises(ValueError, match="rbic-init markers"):
+        a.propose_grant(role="hr_staff", table="employees", column="salary",
+                        actor="master")
+    with pytest.raises(ValueError, match="markers"):
+        compile_change(onboarded)
+
+
+def test_master_system_prompt_explains_the_block(onboarded):
+    from rbic.master import build_system_prompt
+    prompt = build_system_prompt(admin(onboarded))
+    assert "rbic-init block are generated" in prompt
+    assert "rbic-init compile" in prompt

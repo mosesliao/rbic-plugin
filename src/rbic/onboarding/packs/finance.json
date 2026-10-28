@@ -1,0 +1,20 @@
+{
+  "format": 1,
+  "name": "finance",
+  "version": "1",
+  "description": "Finance analysts: budgets, expenses and invoices, limited to their department where a department column exists.",
+  "roles": {
+    "finance_analyst": {
+      "description": "Finance analysts: finance records (budgets, expenses, invoices) of their own department.",
+      "categories": ["finance"],
+      "inherits": [],
+      "row_scopes": [
+        {
+          "ownership_columns": ["dept", "department"],
+          "template": "$column = '{dept}'",
+          "explain": "rows of the user's own department (attribute dept)"
+        }
+      ]
+    }
+  }
+}
