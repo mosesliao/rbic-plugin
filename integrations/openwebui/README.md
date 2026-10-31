@@ -80,10 +80,18 @@ docker compose up --build
      build (`0.1.0.dev0` today)
    - Leave `CONFIG_DIR` empty. The container's `RBIC_CONFIG_DIR` is
      `/app/rbic/config`, the read-only mount of `examples/demo`.
-6. Make it the only model workers see. Under Admin Panel → Settings →
-   Models, set **Company Data (RBIC)** as the default model. The compose
-   file already turns off OpenAI/Ollama connections, so no other models
-   exist.
+6. Let workers use it, and make it the only model they see. A freshly
+   imported Pipe model has no access settings, and Open WebUI shows such a
+   model **to admins only**: workers see no model at all, and their chat
+   requests fail with "Model not found". Under Admin Panel → Settings →
+   Models, edit **Company Data (RBIC)**, set its access to **Public** (or
+   give read access to a group that holds all workers) and save; then set
+   it as the default model. Sign in as a worker once to check that the
+   model is listed. The compose file already turns off OpenAI/Ollama
+   connections, so no other models exist. The access setting is stored
+   with the model and survives restarts; the default-model setting does
+   not (`ENABLE_PERSISTENT_CONFIG=false`), so set it again after a
+   restart.
 7. Strip the model's extras. Edit **Company Data (RBIC)** (Admin Panel →
    Settings → Models): under *Capabilities* turn off **File Upload**,
    **File Context**, **Web Search**, **Vision**, **Image Generation**,
@@ -374,7 +382,11 @@ Check the rest in the admin UI.
       no folder that has knowledge files. Keep file and web upload off
       (`USER_PERMISSIONS_CHAT_FILE_UPLOAD=false`,
       `USER_PERMISSIONS_CHAT_WEB_UPLOAD=false`) and web search off
-      (`ENABLE_WEB_SEARCH=false`).
+      (`ENABLE_WEB_SEARCH=false`). The two upload permissions only hide
+      the upload controls in the chat: Open WebUI v0.12.4 still accepts
+      `POST /api/v1/files/` from any signed-in user, and such a file can
+      be attached to a chat request. The Pipe's attachment refusal is what
+      actually keeps it away from rbic.
 - [ ] `RAG_SYSTEM_CONTEXT=true`, so any context Open WebUI still retrieves
       (files, knowledge, chat references, web search) goes into the system
       message, which rbic drops, never into the user's turn. The Pipe
@@ -446,7 +458,7 @@ audit log while you go (`docker compose exec open-webui tail -f
 | 4 | carol | Ask about payslips. Then on the host run `rbic-master --config-dir examples/demo master` and ask it to remove `payroll_manager`'s row scope on `payroll` (the `employee_id IN ({self_and_subordinate_ids})` rule; answer `yes`). Ask again in the **same chat**. | The next answer starts with *"(Access policy was updated — conversation reset.)"* and shows only her own payslip (employee_id 2) | Container: `POLICY_RELOAD`, `POLICY_RESET user=carol …`, then `ALLOW … WHERE payroll.employee_id = '2'`. Host (`rbic-master`'s stderr): `POLICY_CHANGE …` |
 | 5 | any | Temporarily set `ENABLE_TITLE_GENERATION=true` and restart, then chat | The chat title is "Company data chat" | `PIPE_TASK_STUB task='title_generation'`, with no `ALLOW`/`DENY` for it |
 | 6 | carol | Call the API without a `chat_id` (see below) | `AUDIENCE_DENY_MESSAGE` (*"This assistant only answers in private one-to-one chats."*) | `PIPE_AUDIENCE … reason=no chat_id`, `AUDIENCE_DENY …` |
-| 7 | carol | With `ALLOW_API_REQUESTS=true`, repeat step 6 with a chat reference: add `"files": [{"type": "chat", "id": "<id of carol's chat from step 2>"}]` to the JSON (the id is the last part of the chat's URL) | *"Attachments, documents and chat references can't be used with this assistant. Please ask your question directly."* | `PIPE_ATTACHMENT_REFUSED subject='<id>' source=metadata.files`, and no `ALLOW`/`DENY` line |
+| 7 | carol | With `ALLOW_API_REQUESTS=true`, repeat step 6 with a chat reference: add `"files": [{"type": "chat", "id": "<id of carol's chat from step 2>"}]` to the JSON (the id is the last part of the chat's URL) | *"Attachments, documents and chat references can't be used with this assistant. Please ask your question directly."* | `PIPE_ATTACHMENT_REFUSED subject='<id>' source=__files__` (Open WebUI passes the request's `files` both as `__files__` and as `metadata.files`; the Pipe names the first place it checks), and no `ALLOW`/`DENY` line |
 | 8 | owui-admin | Admin Panel → Users | owui-admin and the bootstrap placeholder are `admin`; bob, carol, dave, mallory are `user`, whatever order they signed in | — |
 
 Undo step 4 afterwards with `rbic-master` (`propose_undo`) or by
@@ -494,6 +506,7 @@ Never do this with real credentials or on a shared host.
 | `IDENTITY_DENY … unmapped identity` for a real worker | The SSO email doesn't match the worker's `email` in `worker_attributes.json` (compared ASCII-lowercased). Fix the HR record, not the IdP. |
 | Every answer is *"This assistant only answers in private one-to-one chats."* | A temporary chat, channel or shared chat, or an API call without `chat_id`. `PIPE_AUDIENCE … reason=…` names the case. Start a normal new chat. |
 | Login loops or "OAuth login failed" | The browser and the container must reach Keycloak under the same URL (`http://keycloak.localhost:8080`). If your browser doesn't resolve `*.localhost`, add `127.0.0.1 keycloak.localhost` to your hosts file. Check `WEBUI_URL` and that the redirect URI matches the Keycloak client (`/oauth/oidc/login/callback`). |
+| Workers see no model, or chat requests fail with "Model not found" | The RBIC model has no access settings yet, so Open WebUI shows it to admins only. Admin Panel → Settings → Models → Company Data (RBIC): set access to Public (or a group of all workers) and save (Quickstart step 6). |
 | New users can't chat ("pending") | `DEFAULT_USER_ROLE` is `pending` and their token carries no roles claim; give them the IdP role (`owui-user`) or approve them under Admin Panel → Users. |
 | Sign-in fails with "access prohibited" | OAuth role management: the token's `roles` claim has neither an `OAUTH_ALLOWED_ROLES` nor an `OAUTH_ADMIN_ROLES` value. Assign the user `owui-user` (or `owui-admin`) on the `open-webui` client in Keycloak. |
 | `docker compose up` stops with "Set WEBUI_SECRET_KEY …" | Export `WEBUI_SECRET_KEY` and `WEBUI_BOOTSTRAP_ADMIN_PASSWORD` first (Quickstart step 2). |
@@ -564,6 +577,15 @@ Re-check them when bumping the image.
     `apply_source_context_to_messages`, `utils/middleware.py` 669-680).
   - Model capability names: `src/lib/components/workspace/Models/Capabilities.svelte`
     (`file_upload`, `file_context`, `web_search`, `builtin_tools`, …).
+- **Model visibility:** a model without a database entry (a freshly
+  imported Pipe model) is listed for admins only, and `check_model_access`
+  refuses it for everyone else ("Model not found"); with an entry, a
+  non-owner needs a read grant (`utils/models.py` `get_filtered_models`,
+  `check_model_access`; `routers/models.py` `/model/access/update`).
+- **Upload permissions:** `chat.file_upload` is only read by the UI and
+  the builtin tools (`utils/tools.py`), `chat.web_upload` only by the UI;
+  the files router (`routers/files.py`) accepts uploads from any verified
+  user.
 - **Chat ids:** `backend/open_webui/utils/chat_id.py` (`temporary:`,
   legacy `local:`, `channel:`) and `backend/open_webui/main.py`
   (`chat_completion`).
