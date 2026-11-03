@@ -29,6 +29,8 @@ ROW_RULES = (
     "Every query result is already limited to the rows this user may see",
     "Do NOT add filters on the user's name, id, email, department\n"
     "  or team, and never ask the user who they are or for their id.",
+    "you are not told which row is the user's\n  own.",
+    "never use LIMIT, ORDER BY or\n  a guess to pick one row",
     "Choose the table whose columns answer the question.",
     "a payroll-style table, if one is listed",
     "LOWER(col) = LOWER('value')",

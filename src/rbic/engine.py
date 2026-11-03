@@ -141,6 +141,12 @@ Rules:
   "my ...", "my team ..." or "my department ...", query the relevant table
   directly. Do NOT add filters on the user's name, id, email, department
   or team, and never ask the user who they are or for their id.
+- Results can also hold other people's rows that the user may see (for
+  example their team's), and you are not told which row is the user's
+  own. For a question about the user alone, never use LIMIT, ORDER BY or
+  a guess to pick one row: if the rows cover several people, show them
+  all and say these are all the matching records the user can access and
+  that you cannot tell which one is theirs.
 - Choose the table whose columns answer the question. When several tables
   hold the asked-for column, prefer the one dedicated to that subject (for
   pay, payslips or salaries: a payroll-style table, if one is listed); for

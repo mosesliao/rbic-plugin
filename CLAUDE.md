@@ -287,7 +287,8 @@ logging.
   text not shown) — pure UX so it doesn't write doomed queries; the gate
   enforces regardless. Its rules say results are **already row-limited**
   (never ask who the user is or add name/id/dept/team filters for "my …"
-  questions), pick the table dedicated to the subject, compare text
+  questions; never guess which row is the user's own), pick the table
+  dedicated to the subject, compare text
   case-insensitively, and report empty results without guessing why
   (`tests/test_prompt_rules.py`).
 - Every `run_sql` call goes through `gate.authorize()`; results are returned
