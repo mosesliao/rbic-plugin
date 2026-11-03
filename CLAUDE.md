@@ -109,6 +109,7 @@ project/
 │   ├── test_config.py      # pytest: config precedence, refusals, cwd independence
 │   ├── test_engine.py      # pytest: RBICEngine.ask() decision order, guard, errors
 │   ├── test_history.py     # pytest: host history sanitizing
+│   ├── test_prompt_rules.py  # pytest: worker prompt rules (row-limited), LOWER() via the gate
 │   ├── test_identity.py    # pytest: identity providers, email index, fingerprint, no-email logs/LLM
 │   ├── test_phase1_review_fixes.py  # pytest: Phase 1 review regressions (emails, schema reload, URI, ...)
 │   ├── test_cli.py         # pytest: rbic.cli entry points with injected I/O / fake clients
@@ -284,7 +285,11 @@ logging.
   tables/columns its role may read** (`allowed_schema()`), plus its scoped
   grants' column lists (`scoped_schema()`, flagged "row-limited", filter
   text not shown) — pure UX so it doesn't write doomed queries; the gate
-  enforces regardless.
+  enforces regardless. Its rules say results are **already row-limited**
+  (never ask who the user is or add name/id/dept/team filters for "my …"
+  questions), pick the table dedicated to the subject, compare text
+  case-insensitively, and report empty results without guessing why
+  (`tests/test_prompt_rules.py`).
 - Every `run_sql` call goes through `gate.authorize()`; results are returned
   to the model as JSON (capped at `MAX_ROWS_TO_MODEL`).
 - The SQLite connection is opened **read-only** (`mode=ro`) — invariant #3.
