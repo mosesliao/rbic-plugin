@@ -109,7 +109,7 @@ project/
 │   ├── test_config.py      # pytest: config precedence, refusals, cwd independence
 │   ├── test_engine.py      # pytest: RBICEngine.ask() decision order, guard, errors
 │   ├── test_history.py     # pytest: host history sanitizing
-│   ├── test_prompt_rules.py  # pytest: worker prompt rules (row-limited), LOWER() via the gate
+│   ├── test_prompt_rules.py  # pytest: worker prompt rules (row-limited, own employee_id only), LOWER() via the gate
 │   ├── test_identity.py    # pytest: identity providers, email index, fingerprint, no-email logs/LLM
 │   ├── test_phase1_review_fixes.py  # pytest: Phase 1 review regressions (emails, schema reload, URI, ...)
 │   ├── test_cli.py         # pytest: rbic.cli entry points with injected I/O / fake clients
@@ -286,11 +286,22 @@ logging.
   grants' column lists (`scoped_schema()`, flagged "row-limited", filter
   text not shown) — pure UX so it doesn't write doomed queries; the gate
   enforces regardless. Its rules say results are **already row-limited**
-  (never ask who the user is or add name/id/dept/team filters for "my …"
-  questions; never guess which row is the user's own), pick the table
-  dedicated to the subject, compare text
-  case-insensitively, and report empty results without guessing why
-  (`tests/test_prompt_rules.py`).
+  (never add name/email/dept/team filters for "my …" questions; never ask
+  or invite the user to give their name, id, email or other identity
+  details), pick the table dedicated to the subject, compare text
+  case-insensitively, and report empty or partial results without
+  guessing or speculating why (`tests/test_prompt_rules.py`).
+- **The prompt carries no attribute values except the user's own
+  employee_id** (`engine.SELF_IDENTITY_ATTRIBUTES`; owner decision, PR
+  #7): an "About this user: their own employee_id is N …" line, so "my
+  salary" for a manager who also sees team rows picks the user's own row
+  (`WHERE employee_id = N`, ANDed with the gate's row filter, so it can
+  only narrow). Only an `int` or a `str` of 1-20 ASCII digits is shown;
+  anything else (or no employee_id) omits the line, and the rule then
+  says to list all matching rows and say which one is theirs can't be
+  told. Never LIMIT/ORDER BY to guess. Never emails, dept/site, team id
+  lists (`self_and_subordinate_ids`), usernames, filter text or
+  `{placeholders}`; built from the request's one snapshot.
 - Every `run_sql` call goes through `gate.authorize()`; results are returned
   to the model as JSON (capped at `MAX_ROWS_TO_MODEL`).
 - The SQLite connection is opened **read-only** (`mode=ro`) — invariant #3.
