@@ -15,6 +15,7 @@ rbic.history), and the system prompt is always built here.
 import asyncio
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 from collections import OrderedDict, deque
@@ -114,7 +115,52 @@ def scoped_schema(gate: SQLGate, username: str, snapshot=None) -> dict:
     return out
 
 
-def build_system_prompt(role: str, schema: dict, scoped: dict = None) -> str:
+# The only worker attributes whose values may ever appear in the prompt:
+# the user's OWN employee id, so the model can pick out their own row when a
+# result also holds team rows. Never emails, dept/site, team id lists,
+# usernames or filter text.
+SELF_IDENTITY_ATTRIBUTES = ("employee_id",)
+_PLAIN_ID_RE = re.compile(r"[0-9]{1,20}", re.ASCII)
+
+
+def self_identity(worker) -> dict:
+    """{key: value} of SELF_IDENTITY_ATTRIBUTES in the worker's record whose
+    value is a plain id (an int, or a str of 1-20 ASCII digits); anything
+    else is left out, never interpolated."""
+    if not isinstance(worker, Mapping):
+        return {}
+    out = {}
+    for key in SELF_IDENTITY_ATTRIBUTES:
+        value = worker.get(key)
+        if type(value) not in (int, str):  # bool, lists, subclasses
+            continue
+        text = str(value)
+        if _PLAIN_ID_RE.fullmatch(text):
+            out[key] = text
+    return out
+
+
+def self_identity_line(worker) -> str:
+    """The prompt's "About this user" line, or "" without a usable id.
+    A filter the model builds from it is ANDed with the gate's row filter,
+    so it can only narrow what the user sees."""
+    own_id = self_identity(worker).get("employee_id")
+    if own_id is None:
+        return ""
+    return (f"About this user: their own employee_id is {own_id}. Use it "
+            f"only to pick out the user's own row (e.g. WHERE employee_id = "
+            f"{own_id} in a payroll-style table) when they ask about "
+            "themselves alone; results already include everything else "
+            "they may see.\n")
+
+
+def build_system_prompt(role: str, schema: dict, scoped: dict = None,
+                        worker=None) -> str:
+    """worker: the user's own attribute record; only self_identity() of it
+    reaches the prompt."""
+    about = self_identity_line(worker)
+    if about:
+        about = f"\n{about}"
     tables = "\n".join(f"- {t}({', '.join(cols)})" for t, cols in schema.items())
     scoped_lines = "\n".join(
         f"- {t}({', '.join(cols)})"
@@ -131,10 +177,39 @@ ONLY the columns of one of these lines, nothing else from that table:
 
 Answer the worker's questions using the run_sql tool against these tables:
 {tables}
-{scoped_lines}
+{scoped_lines}{about}
 Rules:
 - Emit a single SQLite SELECT per tool call. No other statement types.
 - Only reference the tables and columns listed above.
+- Every query result is already limited to the rows this user may see
+  (their own records, their team or their department, as the access
+  policy allows); the limit is applied automatically. For questions about
+  "my team ..." or "my department ...", query the relevant table directly.
+  Do NOT add filters on the user's name, email, department or team.
+- Never ask the user, or invite them, to provide their name, id, email or
+  any other identity detail (not even "if you know your employee ID ...").
+- Results can also hold other people's rows that the user may see (for
+  example their team's). For a question about the user alone ("my
+  salary", "my payslip"): if their own employee_id is given under "About
+  this user" above, filter on it (e.g. WHERE employee_id = <that id>) and
+  present the result as theirs. Only when it is NOT given, show all the
+  matching rows and say these are all the records the user can access and
+  that you cannot tell which one is theirs. Never use LIMIT, ORDER BY or
+  a guess to pick one row.
+- Choose the table whose columns answer the question. When several tables
+  hold the asked-for column, prefer the one dedicated to that subject (for
+  pay, payslips or salaries: a payroll-style table, if one is listed); for
+  personal or team questions, prefer a row-limited scope listed above when
+  one holds those columns.
+- Do not filter on a text value you have not seen in a query result. When
+  you must compare text, compare case-insensitively, e.g.
+  LOWER(col) = LOWER('value').
+- If a query returns no rows, say that nothing was found in the data this
+  user can access. Do not guess why, and do not tell the user to contact
+  HR or an administrator.
+- Never speculate about why records are missing or why results look
+  partial (e.g. "hasn't been entered yet"); just state what was found in
+  the data the user can access.
 - After getting rows back, answer concisely in plain language.
 - If a question needs no company data, answer directly without the tool.
 """
@@ -151,7 +226,8 @@ def system_prompt_for(gate: SQLGate, username: str,
         return None, build_system_prompt(None, {}, {})
     return subj.role, build_system_prompt(
         subj.role, allowed_schema(gate, username, snap),
-        scoped_schema(gate, username, snap))
+        scoped_schema(gate, username, snap),
+        snap.attributes.get(username))
 
 
 # ---------------------------------------------------------------------------
