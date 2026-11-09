@@ -2,10 +2,12 @@
 
 - **Date:** 2026-10-21
 - **Status:** approved plan. Phase 1 is merged (PR #3). Phase 2 (Open WebUI
-  plugin, `integrations/openwebui/`) is done and merged (PR #4); see
+  plugin, `integrations/openwebui/`) is merged (PR #4) and passed the live
+  end-to-end run of section 5.6 with real Claude (fixes in PR #6); see
   `CLAUDE.md` for where it differs from section 5. Phase 3 (onboarding
-  toolkit) is implemented on `feat/onboarding-toolkit` (section 6.6;
-  guide: `docs/onboarding.md`).
+  toolkit) is merged (PR #5; section 6.6; guide: `docs/onboarding.md`).
+  Phase 4, LibreChat (section 2.1), is next: issue #8 on the project board
+  "RBAC plugin for chatbot" (https://github.com/users/mosesliao/projects/4).
 
 This document records the agreed plan for turning the RBIC gate and chatbot
 into a reusable plugin. It is written for the project owner and for future
@@ -40,7 +42,7 @@ in `CLAUDE.md` must not weaken.
 | Database | Stay on the SQLite demo. A least-privilege Postgres executor is out of scope (about 2–3 days if added later). |
 | Chat platforms (2026-10-27) | Open WebUI first (Phase 2, merged). LibreChat second (section 2.1). Zulip and HuggingChat chat-ui are later options. Chainlit and Flowise are archived (as of 2026-08) and not pursued. |
 
-### 2.1 LibreChat (second platform, not yet scheduled)
+### 2.1 LibreChat (second platform, Phase 4: issue #8)
 
 - **Adapter:** a small, reusable OpenAI-compatible server around
   `RBICEngine.ask()` (one model, non-streaming is acceptable), registered
@@ -397,7 +399,7 @@ no access.
 - Larger organizations may need the policy stored in a database (a Casbin
   adapter) instead of a CSV file.
 
-### 6.6 Implementation (implemented on `feat/onboarding-toolkit`)
+### 6.6 Implementation (merged, PR #5)
 
 The toolkit proposes; the organization's policy owner (a master user)
 approves. Every security invariant applies to it: unapproved columns grant
