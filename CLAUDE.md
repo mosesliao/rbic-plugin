@@ -714,7 +714,7 @@ The toolkit **proposes**; the organization's policy owner (a master user)
   `**/onboarding/access-report.md`, `**/onboarding/.onboarding.lock`,
   `**/onboarding/*.csv` in any config dir.
 - Not yet: an optional names-only LLM suggester (off by default; never
-  values); IdP API connectors (CSV export only).
+  values; issue #16); IdP API connectors (CSV export only; issue #14).
 
 ---
 
@@ -1127,14 +1127,17 @@ LLM model for text-to-SQL / summarization: `claude-sonnet-4-6`.
 
 ## Next Steps
 
-- **Audit persistence**: `rbic.audit.configure(path)` writes JSON lines
-  today; next, structured fields (worker, role, original SQL, rewritten
-  SQL, decision, reason) and shipping to a table / SIEM
-- **IdP integration**: replace `worker_attributes.json` with session-derived
-  attributes
-- **Postgres migration**: swap SQLite for Postgres; generate `db_schema.json`
-  from `information_schema`; add a SELECT-only DB role scoped to sanctioned
-  views (strengthens invariant #3 beyond SQLite's `mode=ro`)
+- **Audit persistence** (issue #13): `rbic.audit.configure(path)` writes
+  JSON lines today; next, structured fields (worker, role, original SQL,
+  rewritten SQL, decision, reason) and shipping to a table / SIEM
+- **IdP integration** (issue #14): replace `worker_attributes.json` with
+  session-derived attributes (IdP connectors, several roles per worker)
+- **Postgres migration** (issue #15): swap SQLite for Postgres; generate
+  `db_schema.json` from `information_schema`; add a SELECT-only DB role
+  scoped to sanctioned views (strengthens invariant #3 beyond SQLite's
+  `mode=ro`)
+- **Names-only LLM suggester** (issue #16): optional, off by default, for
+  `rbic-init suggest` (never data values)
 - **Master web UI**: a web front end for `rbic.master` (same
   propose → human-confirm → apply flow; never expose an apply tool to the LLM)
 - **Gate test suite**: keep growing it with every new SQL construct
@@ -1142,8 +1145,16 @@ LLM model for text-to-SQL / summarization: `claude-sonnet-4-6`.
   `test_cli.py` and the mock-client chatbot tests in `test_engine.py`
 - **Plugin roadmap**: see `docs/plugin-plan.md` (core package → Open WebUI
   plugin with SSO → onboarding toolkit; Chainlit and master web UI deferred).
-  Phase 2 (Open WebUI Pipe, image, Keycloak test deployment) lives in
-  `integrations/openwebui/`; its manual end-to-end run against a live
-  deployment is still to do. Phase 3 (onboarding toolkit, `rbic-init`) is
-  implemented on `feat/onboarding-toolkit` (plan §6.6, guide
-  `docs/onboarding.md`); LibreChat is the second platform (plan §2.1).
+  Phases 1–3 are merged: core package (PR #3), Open WebUI plugin (PR #4,
+  `integrations/openwebui/`), onboarding toolkit `rbic-init` (PR #5, plan
+  §6.6, guide `docs/onboarding.md`); fixes from the live Open WebUI run
+  (PR #6) and the row-limited prompt rule (PR #7) are merged too. The live
+  end-to-end run (real Claude) passed: bob is denied salaries
+  and sees only his own row, carol sees only team rows 1, 2, 3, dave reads
+  invoices but not employee names, mallory is denied before the LLM, a
+  mid-chat policy change resets the chat, tasks are stubbed, no-`chat_id`,
+  temporary and shared chats and attachments are refused, and workers see
+  only the RBIC model. **Next: Phase 4, LibreChat** (issue #8, plan §2.1).
+  Follow-ups are issues #9–#12, long-term items #13–#16, on the project
+  board "RBAC plugin for chatbot"
+  (https://github.com/users/mosesliao/projects/4).
