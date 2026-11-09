@@ -1,6 +1,6 @@
 """Role-gated LLM chatbot: Casbin RBAC+ABAC enforced over text-to-SQL."""
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"
 
 from . import audit  # attaches the NullHandler to "rbic.audit" first
 from .admin import PolicyAdmin

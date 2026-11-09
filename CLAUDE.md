@@ -66,6 +66,7 @@ project/
 ├── .env                    # ANTHROPIC_API_KEY — never commit (read by rbic.cli only)
 ├── CLAUDE.md               # this file
 ├── README.md
+├── CHANGELOG.md            # release notes, one section per version
 ├── pyproject.toml          # rbic-plugin: deps, [test] extra, entry points (hatchling, src layout)
 ├── docs/RELEASING.md       # owner checklist: Trusted Publishing, environments, tagging
 ├── docs/onboarding.md      # rbic-init guide for a new organization
@@ -1119,7 +1120,7 @@ ANTHROPIC_API_KEY=sk-ant-api03-your-key-here
 Install: `pip install -e ".[test]"` (development) or, once released,
 `pip install rbic-plugin`. Releases: tag `vX.Y.Z` → `.github/workflows/release.yml`
 (TestPyPI, then PyPI after approval); see `docs/RELEASING.md`.
-`__version__` lives only in `src/rbic/__init__.py` (currently `0.1.0.dev0`).
+`__version__` lives only in `src/rbic/__init__.py` (currently `0.1.0`).
 
 LLM model for text-to-SQL / summarization: `claude-sonnet-4-6`.
 

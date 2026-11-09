@@ -77,7 +77,7 @@ docker compose up --build
    - `AUDIT_LOG_PATH` = `/app/rbic/audit/audit.jsonl` (**required**; the
      Pipe refuses every request until it is set)
    - `EXPECTED_RBIC_VERSION` = the version the image printed during the
-     build (`0.1.0.dev0` today)
+     build (`0.1.0` today)
    - Leave `CONFIG_DIR` empty. The container's `RBIC_CONFIG_DIR` is
      `/app/rbic/config`, the read-only mount of `examples/demo`.
 6. Let workers use it, and make it the only model they see. A freshly
