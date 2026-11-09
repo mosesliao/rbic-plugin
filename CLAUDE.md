@@ -293,7 +293,8 @@ logging.
   guessing or speculating why (`tests/test_prompt_rules.py`).
 - Each table / scoped grant gets a `rows:` line from the gate's `decide()`
   (`PolicySnapshot.row_limits`): attribute NAMES as plain words ("you and your
-  team", "your department", "all rows"...), never values or filter text (#10).
+  team", "your department", "all rows"...), never values or filter text; with a
+  team table, team questions (follow-ups too) must use it, never department rows (#10).
 - **The prompt carries no attribute values except the user's own
   employee_id** (`engine.SELF_IDENTITY_ATTRIBUTES`; owner decision, PR
   #7): an "About this user: their own employee_id is N …" line, so "my

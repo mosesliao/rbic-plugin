@@ -392,6 +392,22 @@ def test_carol_team_payroll_vs_department_employees(sgate):
             "  rows: your department\n") in prompt
 
 
+TEAM_RULE = ('Answer every team question, follow-ups such as "and what about my\n'
+             '  team\'s salary?" included, from the table whose rows include "you and\n'
+             '  your team", even if you queried it already.')
+
+
+@pytest.mark.parametrize("username", WORKERS)
+def test_team_rule_only_with_a_team_table(sgate, username):
+    # live: after "show me my team payslip" (payroll), the follow-up "and
+    # what about my team's salary?" went to employees (department rows)
+    _, prompt = engine.system_prompt_for(sgate, username)
+    assert (TEAM_RULE in prompt) == (username == "carol")
+    if username == "carol":
+        assert prompt.index("Rules:") < prompt.index(TEAM_RULE)
+        assert 'do not query a table limited to "your\n  department"' in prompt
+
+
 def test_alice_scoped_grant_says_own_records(sgate):
     _, prompt = engine.system_prompt_for(sgate, "alice")
     scopes = prompt.split("Row-limited scopes.")[1].split("Rules:")[0]

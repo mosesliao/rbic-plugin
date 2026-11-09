@@ -266,8 +266,10 @@ def build_system_prompt(role: str, schema: dict, scoped: dict = None,
         _table_line(t, cols, (scoped_rows.get(t) or [None] * len(grants))[i])
         for t, grants in (scoped or {}).items()
         for i, cols in enumerate(grants))
+    texts = [r for r in rows.values() if r] + [
+        r for v in scoped_rows.values() for r in v if r]
     rows_rule = ""
-    if any(rows.values()) or any(r for v in scoped_rows.values() for r in v):
+    if texts:
         rows_rule = """
 - The "rows:" line under a table says which of its rows this user sees
   ("your own records", "you and your team", "your department", "your
@@ -277,6 +279,17 @@ def build_system_prompt(role: str, schema: dict, scoped: dict = None,
   a table with their own records, filtered on their own employee_id as
   described below. Only when no such table holds the asked-for columns,
   use another one and say which rows the answer covers."""
+    if any("your team" in r for r in texts):  # TEAM or "your team"
+        rows_rule += """
+- A team or department is a set of PEOPLE, not a table: "my team's
+  salary", "my team's pay" and "my team payslip" ask for the same rows.
+  Answer every team question, follow-ups such as "and what about my
+  team's salary?" included, from the table whose rows include "you and
+  your team", even if you queried it already. While such a table holds
+  the asked-for columns, do not query a table limited to "your
+  department" for a team question, not even to look up names or to join:
+  department rows are not the user's team. If the team table has no name
+  column, identify people by the ids it has."""
     if scoped_lines:
         scoped_lines = f"""
 Row-limited scopes. Each line below lists columns of a table you may read
