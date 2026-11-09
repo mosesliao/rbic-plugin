@@ -805,6 +805,26 @@ class PolicySnapshot:
                 out.setdefault(rf.table, []).append((sub, cols))
         return out
 
+    def row_limits(self, username: str, table: str, cols) -> Optional[tuple]:
+        """The row filters whose OR the gate ANDs into a query on `table`
+        reading `cols`: decide()'s covering scopes at the role and user
+        level. () = such a query reads every row; None = nothing covers it
+        (or the user is unknown). Row denies (p4) are not included.
+
+        UX only (the worker prompt describes rows with it); the gate
+        itself always calls decide().
+        """
+        subj = self.subjects_for(username)
+        if subj is None:
+            return None
+        d = self.decide(subj, table, list(cols))
+        if not d.covered:
+            return None
+        scopes = d.role_cov + d.user_cov
+        if any(rf is None for _, rf in scopes):
+            return ()
+        return tuple(rf for _, rf in scopes)
+
     def denied_columns(self, username: str, schema: dict) -> dict:
         """table -> [columns] a column deny takes away from this user (user
         denies always; role denies unless a user allow overrides)."""
