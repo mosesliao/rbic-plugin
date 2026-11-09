@@ -6,7 +6,8 @@ All notable changes to `rbic-plugin` (import name `rbic`). Versions follow
 
 ## 0.1.0 — first release
 
-First public release on PyPI. Python 3.10–3.12.
+First public release on PyPI. Python 3.10–3.12. Licensed under the MIT
+licence (`LICENSE`).
 
 ### SQL gate (`rbic.gate.SQLGate`)
 - Casbin RBAC + ABAC enforced over LLM-generated SQL, before any data reaches

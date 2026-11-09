@@ -1,5 +1,6 @@
 [build-system]
-requires = ["hatchling"]
+# PEP 639 license / license-files (License-Expression, Metadata 2.4): hatchling >= 1.27.
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,6 +9,20 @@ dynamic = ["version"]
 description = "Role-gated LLM chatbot: Casbin RBAC+ABAC enforced over text-to-SQL"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+# No "License ::" classifier: PEP 639 forbids it next to an SPDX license.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Security",
+]
 dependencies = [
     "anthropic>=0.86,<2",
     "casbin>=1.43,<2",
@@ -15,6 +30,12 @@ dependencies = [
     # The parser is the security boundary (invariant #2): one major version.
     "sqlglot>=30.12,<31",
 ]
+
+[project.urls]
+Homepage = "https://github.com/mosesliao/rbic-plugin"
+Repository = "https://github.com/mosesliao/rbic-plugin"
+Issues = "https://github.com/mosesliao/rbic-plugin/issues"
+Changelog = "https://github.com/mosesliao/rbic-plugin/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # build: tests/test_wheel_contents.py builds the wheel it inspects.
@@ -36,7 +57,7 @@ path = "src/rbic/__init__.py"
 packages = ["src/rbic"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src/rbic", "/tests", "/examples", "/integrations", "/README.md", "/CHANGELOG.md", "/pyproject.toml"]
+include = ["/src/rbic", "/tests", "/examples", "/integrations", "/README.md", "/CHANGELOG.md", "/LICENSE", "/pyproject.toml"]
 exclude = ["company.db", "policy_changes.jsonl", ".policy.lock", ".onboarding.lock", "access-report.md", ".env"]
 
 [tool.pytest.ini_options]

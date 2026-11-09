@@ -67,6 +67,7 @@ project/
 ├── CLAUDE.md               # this file
 ├── README.md
 ├── CHANGELOG.md            # release notes, one section per version
+├── LICENSE                 # MIT (pyproject: license = "MIT", license-files)
 ├── pyproject.toml          # rbic-plugin: deps, [test] extra, entry points (hatchling, src layout)
 ├── docs/RELEASING.md       # owner checklist: Trusted Publishing, environments, tagging
 ├── docs/onboarding.md      # rbic-init guide for a new organization
