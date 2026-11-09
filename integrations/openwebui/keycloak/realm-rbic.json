@@ -71,6 +71,7 @@
   ],
   "users": [
     {
+      "id": "1735f9d1-87d7-5ba0-a470-771483250b16",
       "username": "owui-admin",
       "enabled": true,
       "email": "owui-admin@example.test",
@@ -92,6 +93,7 @@
       }
     },
     {
+      "id": "7b1ba113-ee44-5f29-abc5-0b1bcfb99775",
       "username": "bob",
       "enabled": true,
       "email": "bob@example.test",
@@ -113,6 +115,7 @@
       }
     },
     {
+      "id": "722df4a9-f784-58c3-af62-77474178ccde",
       "username": "carol",
       "enabled": true,
       "email": "carol@example.test",
@@ -134,6 +137,7 @@
       }
     },
     {
+      "id": "dca34982-06c6-5a96-82b6-8e8f52e2f8d3",
       "username": "dave",
       "enabled": true,
       "email": "dave@example.test",
@@ -155,6 +159,7 @@
       }
     },
     {
+      "id": "e8f69d80-f540-5af0-beb1-80de0c066fa4",
       "username": "mallory",
       "enabled": true,
       "email": "mallory@example.test",
