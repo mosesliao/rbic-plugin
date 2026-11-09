@@ -461,11 +461,32 @@ def test_unknown_attribute_and_static_filters(demo_dir):
                carol={"cost_center": "cc-zz-9"})
     gate = make_gate(demo_dir, "sqlite")
     _, bob = engine.system_prompt_for(gate, "bob")
-    assert rows_of(bob)["trainings"] == "your cost_center"
+    assert rows_of(bob)["trainings"] == "rows limited by your profile"
+    # neither the unknown attribute's value nor its NAME reaches the prompt
     assert "cc-zz-9" not in bob
+    assert "cost_center" not in bob and "cost" not in bob
     _, dave = engine.system_prompt_for(gate, "dave")
     assert rows_of(dave)["invoices"] == "a fixed subset"
     assert "unpaid" not in dave and "status =" not in dave
+
+
+@pytest.mark.parametrize("name", ["is_executive", "clearance_level", "cohort",
+                                  "region", "x"])
+def test_unknown_attribute_names_never_reach_the_prompt(demo_dir, name):
+    write_policy(demo_dir,
+                 f"p2, hr_staff, trainings, title = '{{{name}}}'",
+                 f"p2, employee, payroll, employee_id = {{{name}}}")
+    edit_attrs(demo_dir, bob={name: "4"}, carol={name: "4"},
+               alice={name: "4"}, dave={name: "4"})
+    gate = make_gate(demo_dir, "sqlite")
+    for username in WORKERS:
+        _, prompt = engine.system_prompt_for(gate, username)
+        assert not re.search(rf"\b{name}\b", prompt), (username, name)
+        assert "rows limited by your profile" in rows_of(prompt)["payroll"]
+    _, bob = engine.system_prompt_for(gate, "bob")
+    assert rows_of(bob)["trainings"] == "rows limited by your profile"
+    assert rows_of(bob)["payroll"] == (
+        "your own records or rows limited by your profile")
 
 
 def test_user_level_rows_are_described_per_column(demo_dir):
@@ -500,8 +521,9 @@ def test_personal_grant_without_row_filters_reads_all_rows(demo_dir):
     ("home_dept", "your department"),
     ("site", "your site"),
     ("warehouse_id", "your site"),
-    ("cost_center", "your cost_center"),
-    ("region", "your region"),
+    ("cost_center", "rows limited by your profile"),
+    ("region", "rows limited by your profile"),
+    ("is_executive", "rows limited by your profile"),
 ])
 def test_attribute_phrases(name, phrase):
     assert engine.attribute_phrase(name) == phrase
@@ -510,12 +532,15 @@ def test_attribute_phrases(name, phrase):
 @pytest.mark.parametrize("template, phrase", [
     ("dept = '{dept}'", "your department"),
     ("name = 'x'", "a fixed subset"),
+    ("dept = '{dept}' AND name = '{site}'",
+     "your department and your site"),
+    ("dept = '{dept}' OR name = '{site}'",
+     "your department or your site"),
+    ("(dept = '{dept}' OR name = '{site}') AND id = {employee_id}",
+     "a combination of your department and your site and your own records"),
     ("dept = '{dept}' AND name = '{region}'",
-     "your department and your region"),
-    ("dept = '{dept}' OR name = '{region}'",
-     "your department or your region"),
-    ("(dept = '{dept}' OR name = '{region}') AND id = {employee_id}",
-     "a combination of your department and your region and your own records"),
+     "your department and rows limited by your profile"),
+    ("name = '{region}' OR name = '{cohort}'", "rows limited by your profile"),
     ("dept = '{dept}' OR dept = '{home_dept}'", "your department"),
 ])
 def test_filter_phrases(demo_dir, template, phrase):

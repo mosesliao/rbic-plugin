@@ -116,14 +116,16 @@ def scoped_schema(gate: SQLGate, username: str, snapshot=None) -> dict:
     return out
 
 
-# How a row filter's placeholders read in the prompt. Attribute NAMES only
-# (policy structure): never filter text, operators, literals or values.
+# How a row filter's placeholders read in the prompt: fixed phrases chosen
+# from the attribute NAME. Never filter text, operators, literals, values -
+# nor the raw name of an attribute the mapping doesn't recognise.
 OWN_RECORDS = "your own records"
 TEAM = "you and your team"
 DEPARTMENT = "your department"
 SITE = "your site"
 ALL_ROWS = "all rows"
 FIXED_SUBSET = "a fixed subset"
+PROFILE = "rows limited by your profile"  # any other attribute
 _TEAM_TOKENS = frozenset({"team", "teams", "subordinate", "subordinates",
                           "reports"})
 _DEPT_TOKENS = frozenset({"dept", "depts", "department", "departments"})
@@ -132,8 +134,8 @@ _SITE_TOKENS = frozenset({"site", "sites", "warehouse", "warehouses",
 
 
 def attribute_phrase(name: str) -> str:
-    """Plain words for a row filter bound from the user's attribute `name`
-    (a placeholder name: [a-z][a-z0-9_]*, so safe to show)."""
+    """Fixed plain words for a row filter bound from the user's attribute
+    `name`; an unrecognised name gives PROFILE, never the name itself."""
     if name == "employee_id":
         return OWN_RECORDS
     tokens = set(name.split("_"))
@@ -143,7 +145,7 @@ def attribute_phrase(name: str) -> str:
         return DEPARTMENT
     if tokens & _SITE_TOKENS:
         return SITE
-    return f"your {name}"
+    return PROFILE
 
 
 def _filter_phrase(rf) -> str:
