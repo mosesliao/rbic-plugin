@@ -55,7 +55,8 @@ reviewer is the second gate.
 ## Cutting a release
 
 1. Open a PR that bumps `__version__` in `src/rbic/__init__.py` (the only
-   place the version lives), e.g. `0.1.0.dev0` → `0.1.0`. Merge it once the
+   place the version lives), e.g. `0.1.0.dev0` → `0.1.0`, and adds the
+   release's section to `CHANGELOG.md`. Merge it once the
    required `pytest (3.10)`, `pytest (3.11)` and `pytest (3.12)` checks pass.
 2. Tag the merge commit on `main` and push the tag:
 

@@ -47,6 +47,8 @@ The wheel contains only the `rbic` package. The demo configuration
 (`examples/demo/`) lives in this repository (and the sdist), so for the
 quickstart below clone the repository.
 
+Licensed under the MIT licence; see [LICENSE](LICENSE).
+
 For development (editable, with test dependencies):
 
 ```bash
