@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 import anthropic
+from sqlglot import exp
 
 from . import audit
 from .audit import logger
@@ -115,6 +116,97 @@ def scoped_schema(gate: SQLGate, username: str, snapshot=None) -> dict:
     return out
 
 
+# How a row filter's placeholders read in the prompt: fixed phrases chosen
+# from the attribute NAME. Never filter text, operators, literals, values -
+# nor the raw name of an attribute the mapping doesn't recognise.
+OWN_RECORDS = "your own records"
+TEAM = "you and your team"
+DEPARTMENT = "your department"
+SITE = "your site"
+ALL_ROWS = "all rows"
+FIXED_SUBSET = "a fixed subset"
+PROFILE = "rows limited by your profile"  # any other attribute
+_TEAM_TOKENS = frozenset({"team", "teams", "subordinate", "subordinates",
+                          "reports"})
+_DEPT_TOKENS = frozenset({"dept", "depts", "department", "departments"})
+_SITE_TOKENS = frozenset({"site", "sites", "warehouse", "warehouses",
+                          "location", "locations", "branch", "store"})
+
+
+def attribute_phrase(name: str) -> str:
+    """Fixed plain words for a row filter bound from the user's attribute
+    `name`; an unrecognised name gives PROFILE, never the name itself."""
+    if name == "employee_id":
+        return OWN_RECORDS
+    tokens = set(name.split("_"))
+    if tokens & _TEAM_TOKENS:
+        return TEAM if "self" in tokens else "your team"
+    if tokens & _DEPT_TOKENS:
+        return DEPARTMENT
+    if tokens & _SITE_TOKENS:
+        return SITE
+    return PROFILE
+
+
+def _filter_phrase(rf) -> str:
+    phrases = list(dict.fromkeys(attribute_phrase(n) for n in rf.placeholders))
+    if not phrases:
+        return FIXED_SUBSET
+    if len(phrases) == 1:
+        return phrases[0]
+    has_or = any(True for _ in rf.tree.find_all(exp.Or))
+    has_and = any(True for _ in rf.tree.find_all(exp.And))
+    if has_or and has_and:
+        return "a combination of " + " and ".join(phrases)
+    return (" or " if has_or else " and ").join(phrases)
+
+
+def row_limit_phrase(filters) -> Optional[str]:
+    """Plain words for the rows a query sees, from the filters the gate
+    would OR together (PolicySnapshot.row_limits): () -> "all rows",
+    None -> None (not readable)."""
+    if filters is None:
+        return None
+    if not filters:
+        return ALL_ROWS
+    return " or ".join(dict.fromkeys(_filter_phrase(rf) for rf in filters))
+
+
+def _rows_text(snapshot, username: str, table: str, cols) -> Optional[str]:
+    """How the rows of a query reading `cols` of `table` are limited. When
+    the columns together are not covered by one level (user-only and
+    role-only columns mixed), each column is described on its own."""
+    phrase = row_limit_phrase(snapshot.row_limits(username, table, cols))
+    if phrase is not None:
+        return phrase
+    groups: dict = {}
+    for col in cols:
+        p = row_limit_phrase(snapshot.row_limits(username, table, [col]))
+        if p is not None:
+            groups.setdefault(p, []).append(col)
+    if len(groups) <= 1:
+        return next(iter(groups), None)
+    return "; ".join(f"{p} (for {', '.join(c)})" for p, c in groups.items())
+
+
+def row_limits(gate: SQLGate, username: str, snapshot=None,
+               schema: dict = None, scoped: dict = None) -> tuple:
+    """({table: rows text}, {table: [rows text per scoped grant]}) for the
+    prompt: how the rows of each listed table / scoped grant are limited
+    for this worker, from the same decide() the gate runs. UX only."""
+    snapshot = snapshot or gate.snapshot
+    if schema is None:
+        schema = allowed_schema(gate, username, snapshot)
+    if scoped is None:
+        scoped = scoped_schema(gate, username, snapshot)
+    rows = {t: _rows_text(snapshot, username, t, cols)
+            for t, cols in schema.items()}
+    scoped_rows = {t: [_rows_text(snapshot, username, t, cols)
+                       for cols in grants]
+                   for t, grants in scoped.items()}
+    return rows, scoped_rows
+
+
 # The only worker attributes whose values may ever appear in the prompt:
 # the user's OWN employee id, so the model can pick out their own row when a
 # result also holds team rows. Never emails, dept/site, team id lists,
@@ -154,17 +246,52 @@ def self_identity_line(worker) -> str:
             "they may see.\n")
 
 
+def _table_line(table: str, cols, rows: Optional[str]) -> str:
+    line = f"- {table}({', '.join(cols)})"
+    return f"{line}\n  rows: {rows}" if rows else line
+
+
 def build_system_prompt(role: str, schema: dict, scoped: dict = None,
-                        worker=None) -> str:
+                        worker=None, rows: dict = None,
+                        scoped_rows: dict = None) -> str:
     """worker: the user's own attribute record; only self_identity() of it
-    reaches the prompt."""
+    reaches the prompt. rows / scoped_rows: row_limits() - plain words
+    (attribute names at most) under each table / scoped grant line."""
     about = self_identity_line(worker)
     if about:
         about = f"\n{about}"
-    tables = "\n".join(f"- {t}({', '.join(cols)})" for t, cols in schema.items())
+    rows = rows or {}
+    scoped_rows = scoped_rows or {}
+    tables = "\n".join(_table_line(t, cols, rows.get(t))
+                       for t, cols in schema.items())
     scoped_lines = "\n".join(
-        f"- {t}({', '.join(cols)})"
-        for t, grants in (scoped or {}).items() for cols in grants)
+        _table_line(t, cols, (scoped_rows.get(t) or [None] * len(grants))[i])
+        for t, grants in (scoped or {}).items()
+        for i, cols in enumerate(grants))
+    texts = [r for r in rows.values() if r] + [
+        r for v in scoped_rows.values() for r in v if r]
+    rows_rule = ""
+    if texts:
+        rows_rule = """
+- The "rows:" line under a table says which of its rows this user sees
+  ("your own records", "you and your team", "your department", "your
+  site", "all rows", ...). For "my team ..." questions, query a table whose
+  rows include "you and your team"; for "my department ..." questions, one
+  whose rows are "your department"; for questions about the user alone,
+  a table with their own records, filtered on their own employee_id as
+  described below. Only when no such table holds the asked-for columns,
+  use another one and say which rows the answer covers."""
+    if any("your team" in r for r in texts):  # TEAM or "your team"
+        rows_rule += """
+- A team or department is a set of PEOPLE, not a table: "my team's
+  salary", "my team's pay" and "my team payslip" ask for the same rows.
+  Answer every team question, follow-ups such as "and what about my
+  team's salary?" included, from the table whose rows include "you and
+  your team", even if you queried it already. While such a table holds
+  the asked-for columns, do not query a table limited to "your
+  department" for a team question, not even to look up names or to join:
+  department rows are not the user's team. If the team table has no name
+  column, identify people by the ids it has."""
     if scoped_lines:
         scoped_lines = f"""
 Row-limited scopes. Each line below lists columns of a table you may read
@@ -185,7 +312,7 @@ Rules:
   (their own records, their team or their department, as the access
   policy allows); the limit is applied automatically. For questions about
   "my team ..." or "my department ...", query the relevant table directly.
-  Do NOT add filters on the user's name, email, department or team.
+  Do NOT add filters on the user's name, email, department or team.{rows_rule}
 - Never ask the user, or invite them, to provide their name, id, email or
   any other identity detail (not even "if you know your employee ID ...").
 - Results can also hold other people's rows that the user may see (for
@@ -224,10 +351,12 @@ def system_prompt_for(gate: SQLGate, username: str,
     subj = snap.subjects_for(username)
     if subj is None:
         return None, build_system_prompt(None, {}, {})
+    schema = allowed_schema(gate, username, snap)
+    scoped = scoped_schema(gate, username, snap)
+    rows, scoped_rows = row_limits(gate, username, snap, schema, scoped)
     return subj.role, build_system_prompt(
-        subj.role, allowed_schema(gate, username, snap),
-        scoped_schema(gate, username, snap),
-        snap.attributes.get(username))
+        subj.role, schema, scoped, snap.attributes.get(username),
+        rows, scoped_rows)
 
 
 # ---------------------------------------------------------------------------

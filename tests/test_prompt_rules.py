@@ -328,3 +328,245 @@ def test_id_filter_cannot_widen_rows(sgate, demo_dir, username):
     _, got = run(sgate, demo_dir, username,
                  "SELECT salary FROM payroll WHERE employee_id = 2")
     assert got == []
+
+
+# ---- how each table's rows are limited ("rows:" lines, issue #10) -------------
+# Live regression: carol asked "what about my team's salary?" and the model
+# read employees (her department) instead of payroll (self + team). The
+# prompt now says, per table, whose rows it holds - in plain words from the
+# gate's own decide(), never the filter text or an attribute value.
+
+DEMO_ROWS = {
+    "alice": {"inventory": "your site", "shipments": "your site",
+              "safety_incidents": "all rows", "payroll": "your own records"},
+    "bob": {"payroll": "your own records", "employees": "your department",
+            "leave_requests": "your department", "trainings": "all rows"},
+    "carol": {"payroll": "your own records or you and your team",
+              "employees": "your department",
+              "leave_requests": "your department", "trainings": "all rows"},
+    "dave": {"payroll": "your own records", "budgets": "all rows",
+             "expenses": "your department", "invoices": "all rows"},
+}
+ROWS_RULE = ('For "my team ..." questions, query a table whose\n'
+             '  rows include "you and your team"; for "my department ..." '
+             'questions, one\n  whose rows are "your department"')
+ROWS_LINE_RE = re.compile(r"^- (\w+)\((.*)\)\n  rows: (.*)$", re.M)
+
+
+def rows_of(prompt) -> dict:
+    """{table: rows text} of the regular table list (before the scopes)."""
+    head = prompt.split("Row-limited scopes.")[0].split("Rules:")[0]
+    return {t: r for t, _, r in ROWS_LINE_RE.findall(head)}
+
+
+def write_policy(root, *lines):
+    path = root / "casbin" / "policy.csv"
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        f.write("".join(line + "\n" for line in lines))
+
+
+def edit_attrs(root, **changes):
+    path = root / "worker_attributes.json"
+    attrs = json.loads(path.read_text(encoding="utf-8"))
+    for user, values in changes.items():
+        attrs[user].update(values)
+    path.write_text(json.dumps(attrs, indent=2) + "\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("username", WORKERS)
+def test_every_demo_table_says_how_its_rows_are_limited(gate, username):
+    _, prompt = engine.system_prompt_for(gate, username)
+    assert rows_of(prompt) == DEMO_ROWS[username]
+    assert ROWS_RULE in prompt
+    # the new rule sits with the other rules, the old ones are unchanged
+    assert prompt.index("Rules:") < prompt.index(ROWS_RULE)
+    for rule in ROW_RULES + KEPT_RULES:
+        assert rule in prompt
+
+
+def test_carol_team_payroll_vs_department_employees(sgate):
+    _, prompt = engine.system_prompt_for(sgate, "carol")
+    assert ("- payroll(id, employee_id, salary, effective_date)\n"
+            "  rows: your own records or you and your team\n") in prompt
+    assert ("- employees(id, name, dept, start_date, salary)\n"
+            "  rows: your department\n") in prompt
+
+
+TEAM_RULE = ('Answer every team question, follow-ups such as "and what about my\n'
+             '  team\'s salary?" included, from the table whose rows include "you and\n'
+             '  your team", even if you queried it already.')
+
+
+@pytest.mark.parametrize("username", WORKERS)
+def test_team_rule_only_with_a_team_table(sgate, username):
+    # live: after "show me my team payslip" (payroll), the follow-up "and
+    # what about my team's salary?" went to employees (department rows)
+    _, prompt = engine.system_prompt_for(sgate, username)
+    assert (TEAM_RULE in prompt) == (username == "carol")
+    if username == "carol":
+        assert prompt.index("Rules:") < prompt.index(TEAM_RULE)
+        assert 'do not query a table limited to "your\n  department"' in prompt
+
+
+def test_alice_scoped_grant_says_own_records(sgate):
+    _, prompt = engine.system_prompt_for(sgate, "alice")
+    scopes = prompt.split("Row-limited scopes.")[1].split("Rules:")[0]
+    assert "- employees(id, name, salary)\n  rows: your own records\n" in scopes
+
+
+@pytest.mark.parametrize("username", WORKERS)
+def test_rows_lines_hold_no_filter_text_or_values(sgate, demo_dir, username):
+    _, prompt = engine.system_prompt_for(sgate, username)
+    lines = re.findall(r"^  rows: (.*)$", prompt, re.M)
+    assert lines
+    for text in lines:
+        # plain words only: no operators, quotes, digits, braces, emails
+        assert re.fullmatch(r"[a-z_ ,;()]+", text), text
+    tables = prompt.split("against these tables:")[1].split("About this user:")[0]
+    for bad in ("=", "IN (", "'", "{", "}", "@", "<", ">", "LIKE"):
+        assert bad not in tables, bad
+    assert "{" not in prompt and "}" not in prompt and "@" not in prompt
+    for line in (demo_dir / "casbin" / "policy.csv").read_text(
+            encoding="utf-8").splitlines():
+        fields = [f.strip() for f in line.split(",")]
+        if fields[0] == "p2":
+            assert fields[3] not in prompt
+
+
+def test_team_differs_from_department(demo_dir):
+    # carol's team spans departments: the prompt tells the two scopes apart,
+    # and they really are different rows
+    edit_attrs(demo_dir, carol={"self_and_subordinate_ids": "2, 4, 5"})
+    gate = make_gate(demo_dir, "sqlite")
+    _, prompt = engine.system_prompt_for(gate, "carol")
+    rows = rows_of(prompt)
+    assert rows["payroll"] == "your own records or you and your team"
+    assert rows["employees"] == "your department"
+    rest = prompt.replace(self_line("2"), "")
+    for value in ("2", "4", "5", "2, 4, 5", "engineering"):
+        assert not re.search(rf"(?<![\w-]){re.escape(value)}(?![\w-])",
+                             rest), value
+    _, team = run(gate, demo_dir, "carol",
+                  "SELECT employee_id FROM payroll ORDER BY employee_id")
+    _, dept = run(gate, demo_dir, "carol", "SELECT id FROM employees ORDER BY id")
+    assert [r[0] for r in team] == [2, 4, 5]
+    assert [r[0] for r in dept] == [1, 2, 3]
+
+
+def test_unknown_attribute_and_static_filters(demo_dir):
+    write_policy(demo_dir,
+                 "p2, hr_staff, trainings, dept = '{cost_center}'",
+                 "p2, finance_analyst, invoices, status = 'unpaid'")
+    edit_attrs(demo_dir, bob={"cost_center": "cc-zz-9"},
+               carol={"cost_center": "cc-zz-9"})
+    gate = make_gate(demo_dir, "sqlite")
+    _, bob = engine.system_prompt_for(gate, "bob")
+    assert rows_of(bob)["trainings"] == "rows limited by your profile"
+    # neither the unknown attribute's value nor its NAME reaches the prompt
+    assert "cc-zz-9" not in bob
+    assert "cost_center" not in bob and "cost" not in bob
+    _, dave = engine.system_prompt_for(gate, "dave")
+    assert rows_of(dave)["invoices"] == "a fixed subset"
+    assert "unpaid" not in dave and "status =" not in dave
+
+
+@pytest.mark.parametrize("name", ["is_executive", "clearance_level", "cohort",
+                                  "region", "x"])
+def test_unknown_attribute_names_never_reach_the_prompt(demo_dir, name):
+    write_policy(demo_dir,
+                 f"p2, hr_staff, trainings, title = '{{{name}}}'",
+                 f"p2, employee, payroll, employee_id = {{{name}}}")
+    edit_attrs(demo_dir, bob={name: "4"}, carol={name: "4"},
+               alice={name: "4"}, dave={name: "4"})
+    gate = make_gate(demo_dir, "sqlite")
+    for username in WORKERS:
+        _, prompt = engine.system_prompt_for(gate, username)
+        assert not re.search(rf"\b{name}\b", prompt), (username, name)
+        assert "rows limited by your profile" in rows_of(prompt)["payroll"]
+    _, bob = engine.system_prompt_for(gate, "bob")
+    assert rows_of(bob)["trainings"] == "rows limited by your profile"
+    assert rows_of(bob)["payroll"] == (
+        "your own records or rows limited by your profile")
+
+
+def test_user_level_rows_are_described_per_column(demo_dir):
+    # a personal grant with its own row scope: bob reads employees.salary
+    # for his own row only, the other columns for his department
+    write_policy(demo_dir, "p, user:bob, employees.salary, read",
+                 "p2, user:bob, employees, id = '{employee_id}'")
+    gate = make_gate(demo_dir, "sqlite")
+    _, prompt = engine.system_prompt_for(gate, "bob")
+    assert rows_of(prompt)["employees"] == (
+        "your department (for id, name, dept, start_date); "
+        "your own records (for salary)")
+
+
+def test_personal_grant_without_row_filters_reads_all_rows(demo_dir):
+    # dave's personal grant on a table no role of his filters: every row
+    write_policy(demo_dir, "p, user:dave, trainings.title, read")
+    gate = make_gate(demo_dir, "sqlite")
+    _, prompt = engine.system_prompt_for(gate, "dave")
+    assert rows_of(prompt)["trainings"] == "all rows"
+    assert gate.snapshot.row_limits("dave", "trainings", ["title"]) == ()
+    assert gate.snapshot.row_limits("dave", "trainings", ["dept"]) is None
+
+
+@pytest.mark.parametrize("name, phrase", [
+    ("employee_id", "your own records"),
+    ("self_and_subordinate_ids", "you and your team"),
+    ("subordinate_ids", "your team"),
+    ("team_ids", "your team"),
+    ("dept", "your department"),
+    ("department", "your department"),
+    ("home_dept", "your department"),
+    ("site", "your site"),
+    ("warehouse_id", "your site"),
+    ("cost_center", "rows limited by your profile"),
+    ("region", "rows limited by your profile"),
+    ("is_executive", "rows limited by your profile"),
+])
+def test_attribute_phrases(name, phrase):
+    assert engine.attribute_phrase(name) == phrase
+
+
+@pytest.mark.parametrize("template, phrase", [
+    ("dept = '{dept}'", "your department"),
+    ("name = 'x'", "a fixed subset"),
+    ("dept = '{dept}' AND name = '{site}'",
+     "your department and your site"),
+    ("dept = '{dept}' OR name = '{site}'",
+     "your department or your site"),
+    ("(dept = '{dept}' OR name = '{site}') AND id = {employee_id}",
+     "a combination of your department and your site and your own records"),
+    ("dept = '{dept}' AND name = '{region}'",
+     "your department and rows limited by your profile"),
+    ("name = '{region}' OR name = '{cohort}'", "rows limited by your profile"),
+    ("dept = '{dept}' OR dept = '{home_dept}'", "your department"),
+])
+def test_filter_phrases(demo_dir, template, phrase):
+    from rbic.gate import compile_row_filter
+    schema = json.loads((demo_dir / "db_schema.json").read_text(encoding="utf-8"))
+    for dialect in DIALECTS:
+        rf = compile_row_filter("employees", template, schema, dialect=dialect)
+        assert engine.row_limit_phrase((rf,)) == phrase
+        assert engine.row_limit_phrase((rf, rf)) == phrase  # deduplicated
+    assert engine.row_limit_phrase(()) == "all rows"
+    assert engine.row_limit_phrase(None) is None
+
+
+def test_no_rows_lines_or_rule_without_tables():
+    prompt = engine.build_system_prompt(None, {}, {})
+    assert "rows:" not in prompt and ROWS_RULE not in prompt
+    # callers that pass no row descriptions get the old table lines
+    prompt = engine.build_system_prompt("x", {"t": ["a"]}, {"t": [["a"]]})
+    assert "- t(a)\n" in prompt and "rows:" not in prompt
+
+
+def test_rows_come_from_the_given_snapshot(demo_dir):
+    gate = make_gate(demo_dir, "sqlite")
+    snap = gate.refreshed_snapshot()
+    write_policy(demo_dir, "p2, hr_staff, trainings, dept = '{dept}'")
+    _, old = engine.system_prompt_for(gate, "bob", snap)
+    assert rows_of(old)["trainings"] == "all rows"
+    _, new = engine.system_prompt_for(gate, "bob")
+    assert rows_of(new)["trainings"] == "your department"

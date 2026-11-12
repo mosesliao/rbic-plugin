@@ -293,6 +293,11 @@ logging.
   details), pick the table dedicated to the subject, compare text
   case-insensitively, and report empty or partial results without
   guessing or speculating why (`tests/test_prompt_rules.py`).
+- Each table / scoped grant gets a `rows:` line from the gate's `decide()`
+  (`PolicySnapshot.row_limits`): fixed phrases picked by attribute name ("you and
+  your team", "your department", "all rows"; any other name "rows limited by your
+  profile"), never the raw name, values or filter text; with a
+  team table, team questions (follow-ups too) must use it, never department rows (#10).
 - **The prompt carries no attribute values except the user's own
   employee_id** (`engine.SELF_IDENTITY_ATTRIBUTES`; owner decision, PR
   #7): an "About this user: their own employee_id is N …" line, so "my
