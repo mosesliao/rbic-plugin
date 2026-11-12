@@ -131,13 +131,14 @@ project/
 │   ├── test_cli_init.py           # pytest: rbic-init end to end (yes/no, audit, no values leak)
 │   ├── test_onboarding_users.py   # pytest: import-users (CSV, group map, refusals, undo, no emails)
 │   ├── test_onboarding_drift.py   # pytest: drift checks/exit codes, block state, all-rows acks
-│   └── test_openwebui_pipe.py     # pytest: the Open WebUI Pipe (importlib-loaded, fake client)
+│   ├── test_openwebui_pipe.py     # pytest: the Open WebUI Pipe (importlib-loaded, fake client)
+│   └── test_openwebui_realm.py    # pytest: Keycloak test realm: fixed unique user ids, no merge-by-email
 ├── integrations/openwebui/ # Open WebUI plugin (sdist only, not in the wheel)
 │   ├── rbic_pipe.py        # the Pipe function admins import (needs only pydantic + rbic)
 │   ├── Dockerfile          # Open WebUI v0.12.4 (digest-pinned) + rbic wheel built from src/
 │   ├── requirements-*.txt  # hash-pinned casbin/simpleeval/sqlglot + wheel build tooling
 │   ├── docker-compose.yml  # test deployment: Open WebUI + Keycloak OIDC, hardening env
-│   ├── keycloak/realm-rbic.json  # test realm: open-webui client + owui-admin/owui-user roles claim; owui-admin/bob/carol/dave/mallory
+│   ├── keycloak/realm-rbic.json  # test realm: open-webui client + owui-admin/owui-user roles claim; owui-admin/bob/carol/dave/mallory (fixed ids)
 │   └── README.md           # quickstart, Valves, SSO recipes, hardening checklist, e2e script
 └── scripts/demo/           # drive.py + record.ps1: re-record docs/master-bot-demo.gif
 ```
